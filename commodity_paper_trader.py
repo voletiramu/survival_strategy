@@ -668,17 +668,42 @@ class CommodityPaperTrader:
         if not self.portfolio.positions:
             return
         for pos in list(self.portfolio.positions):
+            # Skip positions opened less than 5 minutes ago (grace period)
+            entry_time = datetime.fromisoformat(pos['timestamp'])
+            if (datetime.now() - entry_time).total_seconds() < 300:
+                continue
+
             commodity = pos['commodity']
             spot = self.get_spot(commodity)
             if not spot:
                 continue
+
+            # Use the same IV that was used at entry for consistency
             T = max(pos['dte'] - 0.5, 0.01) / 365
             spec = COMMODITIES[commodity]
-            iv = spec['vol_adj'] * 0.15
+            # Compute IV from historical data (same as entry)
+            df = self.engine.historical_data.get(commodity)
+            if df is not None and len(df) > 20:
+                log_ret = np.log(df['Close'] / df['Close'].shift(1))
+                hv = log_ret.tail(20).std() * np.sqrt(252)
+                iv = max(min(hv * 1.15 * spec['vol_adj'], 0.80), 0.08)
+            else:
+                iv = 0.20 * spec['vol_adj']
+
             opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
             g = black76_greeks(spot, pos['strike'], T, RISK_FREE_RATE, iv, opt_type)
             current = g['price']
             pos['current_premium'] = round(current, 2)
+
+            # Update unrealized PnL
+            mult = spec['multiplier']
+            lot = spec['lot_size']
+            if pos['is_sell']:
+                pos['unrealized_pnl'] = round(
+                    (pos['entry_premium'] - current) * lot * mult - pos['entry_cost'], 2)
+            else:
+                pos['unrealized_pnl'] = round(
+                    (current - pos['entry_premium']) * lot * mult - pos['entry_cost'], 2)
 
             details = pos.get('details', {})
             target = details.get('target', pos['entry_premium'] * 2)

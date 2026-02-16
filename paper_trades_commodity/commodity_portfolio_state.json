@@ -1,0 +1,60 @@
+{
+  "capital": 300000,
+  "positions": [
+    {
+      "id": "CPR_SILVERM_153228",
+      "timestamp": "2026-02-16T15:32:28.537839",
+      "strategy": "CPR",
+      "commodity": "SILVERM",
+      "signal_type": "BUY_PE_CPR",
+      "strike": 244500,
+      "entry_premium": 9217.18,
+      "current_premium": 9217.18,
+      "lot_size": 5,
+      "multiplier": 5,
+      "is_sell": false,
+      "entry_cost": 107.11,
+      "delta": -0.4843,
+      "gamma": 1.7e-05,
+      "theta": -911.09,
+      "dte": 5,
+      "unrealized_pnl": 0,
+      "status": "OPEN",
+      "details": {
+        "reason": "Narrow CPR (0.063%) bearish breakout",
+        "target": 16590.930182787415,
+        "sl": 3686.8733739527593,
+        "spot": 244302.0
+      }
+    },
+    {
+      "id": "CPR_CRUDEOILM_153228",
+      "timestamp": "2026-02-16T15:32:28.537839",
+      "strategy": "CPR",
+      "commodity": "CRUDEOILM",
+      "signal_type": "BUY_PE_CPR",
+      "strike": 5700,
+      "entry_premium": 182.11,
+      "current_premium": 182.11,
+      "lot_size": 10,
+      "multiplier": 10,
+      "is_sell": false,
+      "entry_cost": 51.93,
+      "delta": -0.506,
+      "gamma": 0.000934,
+      "theta": -17.0,
+      "dte": 5,
+      "unrealized_pnl": 0,
+      "status": "OPEN",
+      "details": {
+        "reason": "Narrow CPR (0.373%) bearish breakout",
+        "target": 327.79635680708367,
+        "sl": 72.8436348460186,
+        "spot": 5677.0
+      }
+    }
+  ],
+  "closed_trades": [],
+  "daily_pnl": {},
+  "last_updated": "2026-02-16T15:32:28.537839"
+}

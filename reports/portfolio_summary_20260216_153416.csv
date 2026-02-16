@@ -1,0 +1,14 @@
+Metric,Equity,Commodity,Combined
+Initial Capital,"Rs 300,000","Rs 300,000","Rs 600,000"
+Current Capital,"Rs 301,331","Rs 300,000","Rs 601,331"
+Total Return,0.44%,0.00%,0.22%
+Realized PnL,"Rs 1,331.03",Rs 0.00,"Rs 1,331.03"
+Unrealized PnL,"Rs 1,567.68",Rs 0.00,"Rs 1,567.68"
+Open Positions,12,2,14
+Closed Trades,1,0,1
+Win Rate,100.0%,N/A,100.0%
+Total Wins,1,0,1
+Total Losses,0,0,0
+Strategies Active,"CPR, Ghost Zone",CPR,
+Symbols Active,"BANKNIFTY, NIFTY, SENSEX","CRUDEOILM, SILVERM",
+Last Updated,2026-02-16T15:32:25.149565,2026-02-16T15:32:28.537839,2026-02-16T15:34:16.419465

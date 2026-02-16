@@ -1,0 +1,3 @@
+Strategy,Total_Trades,Wins,Losses,Win_Rate_Pct,Total_PnL,Avg_PnL,Max_Win,Max_Loss,Avg_Win,Avg_Loss,Profit_Factor,Win_Loss_Ratio,Std_PnL,Sharpe_Approx,Symbols_Traded
+Survivor,1,1,0,100.0,1331.03,1331.03,1331.03,1331.03,1331.03,0,inf,inf,0,0,BANKNIFTY
+** OVERALL **,1,1,0,100.0,1331.03,1331.03,1331.03,1331.03,1331.03,0,inf,inf,0,0,ALL
