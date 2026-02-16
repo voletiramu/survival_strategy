@@ -1017,6 +1017,14 @@ class PaperTrader:
             return {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0}
         return None
 
+    def is_market_open(self):
+        """Check if equity market is currently open (9:15 AM - 3:30 PM IST, Mon-Fri)."""
+        now = datetime.now()
+        if now.weekday() > 4:  # Saturday/Sunday
+            return False
+        current_time = now.time()
+        return MARKET_OPEN <= current_time <= MARKET_CLOSE
+
     def scan_all_strategies(self):
         """Scan all 5 strategies across all 3 indices."""
         logger.info("\n" + "=" * 70)
@@ -1026,6 +1034,13 @@ class PaperTrader:
         now = datetime.now()
         dow = now.weekday()
         all_signals = []
+
+        # CRITICAL: Block trading outside market hours
+        if not self.is_market_open():
+            logger.warning(f"  EQUITY MARKET CLOSED (current: {now.strftime('%H:%M:%S')})")
+            logger.warning(f"  Market hours: {MARKET_OPEN} - {MARKET_CLOSE}, Mon-Fri")
+            logger.warning(f"  Signals will be logged but NOT executed.")
+            return all_signals  # Return empty - no trades outside hours
 
         for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
             logger.info(f"\n--- {symbol} ---")
@@ -1086,9 +1101,27 @@ class PaperTrader:
             logger.info("\n  No signals generated this scan.")
             return
 
+        # CRITICAL: Block execution outside market hours
+        if not self.is_market_open():
+            logger.warning(f"  {len(signals)} signals found but MARKET CLOSED - NOT executing")
+            return
+
         logger.info(f"\n  {len(signals)} SIGNALS TO EXECUTE (PAPER MODE):")
 
+        executed = 0
+        skipped = 0
         for sig in signals:
+            # Check for duplicate: same strategy + symbol + strike already open
+            existing = [p for p in self.portfolio.positions
+                        if p['strategy'] == sig['strategy']
+                        and p['symbol'] == sig['symbol']
+                        and p['strike'] == sig['strike']]
+            if existing:
+                logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['symbol']} "
+                           f"{sig['strike']} already open")
+                skipped += 1
+                continue
+
             g = sig['greeks']
             self.portfolio.add_signal(
                 strategy=sig['strategy'],
@@ -1108,6 +1141,10 @@ class PaperTrader:
                     'spot': sig.get('spot'),
                 }
             )
+            executed += 1
+
+        if skipped:
+            logger.info(f"  Executed: {executed} | Skipped (duplicates): {skipped}")
 
     def check_exits(self):
         """Check if any open positions should be exited."""
@@ -1117,15 +1154,31 @@ class PaperTrader:
         logger.info("\n  Checking exits for open positions...")
 
         for pos in list(self.portfolio.positions):
+            # Skip positions opened less than 5 minutes ago (grace period)
+            entry_time = datetime.fromisoformat(pos['timestamp'])
+            if (datetime.now() - entry_time).total_seconds() < 300:
+                logger.info(f"  GRACE: {pos['id']} opened {int((datetime.now() - entry_time).total_seconds())}s ago, skipping")
+                continue
+
             symbol = pos['symbol']
             spot = self.get_index_spot(symbol)
             if not spot:
                 continue
 
             T = max(pos['dte'] - 0.5, 0.01) / 365
-            iv = pos['iv'] / 100
 
-            # Recalculate premium
+            # FIX: Compute IV from historical data (same method as entry)
+            # pos['iv'] was stored as percentage (15.0) but that's just BS default,
+            # not the actual IV used in signal generation. Use historical HV instead.
+            df = self.engine.historical_data.get(symbol)
+            if df is not None and len(df) > 20:
+                log_ret = np.log(df['Close'] / df['Close'].shift(1))
+                hv = log_ret.tail(20).std() * np.sqrt(252)
+                iv = max(min(hv * 1.15, 0.60), 0.08)
+            else:
+                iv = pos['iv'] / 100  # fallback
+
+            # Recalculate premium with proper IV
             opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
             current_g = bs_greeks(spot, pos['strike'], T, RISK_FREE_RATE, iv, opt_type)
             current_premium = current_g['price']

@@ -310,10 +310,26 @@ def main():
         return
 
     if args.once:
+        now = datetime.now()
+        current_time = now.time()
+        is_weekend = now.weekday() > 4
+
         if not args.commodity_only:
-            run_equity_scan(args.offline)
+            equity_open = EQUITY_OPEN <= current_time <= EQUITY_CLOSE and not is_weekend
+            if equity_open:
+                run_equity_scan(args.offline)
+            else:
+                logger.warning(f"EQUITY market CLOSED ({current_time.strftime('%H:%M')}). "
+                             f"Hours: {EQUITY_OPEN}-{EQUITY_CLOSE}, Mon-Fri. Skipping equity scan.")
+
         if not args.equity_only:
-            run_commodity_scan(args.offline)
+            mcx_open = MCX_OPEN <= current_time <= MCX_CLOSE and not is_weekend
+            if mcx_open:
+                run_commodity_scan(args.offline)
+            else:
+                logger.warning(f"MCX market CLOSED ({current_time.strftime('%H:%M')}). "
+                             f"Hours: {MCX_OPEN}-{MCX_CLOSE}, Mon-Fri. Skipping commodity scan.")
+
         show_combined_status()
         return
 

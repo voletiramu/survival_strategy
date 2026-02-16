@@ -2,59 +2,59 @@
   "capital": 300000,
   "positions": [
     {
-      "id": "CPR_SILVERM_153228",
-      "timestamp": "2026-02-16T15:32:28.537839",
+      "id": "CPR_SILVERM_183907",
+      "timestamp": "2026-02-16T18:39:07.754715",
       "strategy": "CPR",
       "commodity": "SILVERM",
       "signal_type": "BUY_PE_CPR",
       "strike": 244500,
-      "entry_premium": 9217.18,
-      "current_premium": 9217.18,
+      "entry_premium": 9156.78,
+      "current_premium": 9156.78,
       "lot_size": 5,
       "multiplier": 5,
       "is_sell": false,
-      "entry_cost": 107.11,
-      "delta": -0.4843,
+      "entry_cost": 106.72,
+      "delta": -0.4822,
       "gamma": 1.7e-05,
-      "theta": -911.09,
+      "theta": -911.36,
       "dte": 5,
       "unrealized_pnl": 0,
       "status": "OPEN",
       "details": {
         "reason": "Narrow CPR (0.063%) bearish breakout",
-        "target": 16590.930182787415,
-        "sl": 3686.8733739527593,
-        "spot": 244302.0
+        "target": 16482.19691630137,
+        "sl": 3662.7104258447494,
+        "spot": 244427.0
       }
     },
     {
-      "id": "CPR_CRUDEOILM_153228",
-      "timestamp": "2026-02-16T15:32:28.537839",
+      "id": "CPR_CRUDEOILM_183907",
+      "timestamp": "2026-02-16T18:39:07.757329",
       "strategy": "CPR",
       "commodity": "CRUDEOILM",
-      "signal_type": "BUY_PE_CPR",
+      "signal_type": "BUY_CE_CPR",
       "strike": 5700,
-      "entry_premium": 182.11,
-      "current_premium": 182.11,
+      "entry_premium": 182.57,
+      "current_premium": 182.57,
       "lot_size": 10,
       "multiplier": 10,
       "is_sell": false,
-      "entry_cost": 51.93,
-      "delta": -0.506,
-      "gamma": 0.000934,
+      "entry_cost": 51.95,
+      "delta": 0.5368,
+      "gamma": 0.000927,
       "theta": -17.0,
       "dte": 5,
       "unrealized_pnl": 0,
       "status": "OPEN",
       "details": {
-        "reason": "Narrow CPR (0.373%) bearish breakout",
-        "target": 327.79635680708367,
-        "sl": 72.8436348460186,
-        "spot": 5677.0
+        "reason": "Narrow CPR (0.373%) bullish breakout",
+        "target": 328.6339462985833,
+        "sl": 73.02976584412963,
+        "spot": 5724.0
       }
     }
   ],
   "closed_trades": [],
   "daily_pnl": {},
-  "last_updated": "2026-02-16T15:32:28.537839"
+  "last_updated": "2026-02-16T18:39:07.757329"
 }

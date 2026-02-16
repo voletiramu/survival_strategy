@@ -592,6 +592,13 @@ class CommodityPaperTrader:
             return df['Close'].iloc[-1]
         return None
 
+    def is_mcx_open(self):
+        """Check if MCX market is open (9:00 AM - 11:30 PM IST, Mon-Fri)."""
+        now = datetime.now()
+        if now.weekday() > 4:  # Saturday/Sunday
+            return False
+        return MCX_OPEN <= now.time() <= MCX_CLOSE
+
     def scan_all(self):
         logger.info("\n" + "=" * 70)
         logger.info("SCANNING COMMODITY STRATEGIES...")
@@ -600,6 +607,13 @@ class CommodityPaperTrader:
         now = datetime.now()
         dow = now.weekday()
         all_signals = []
+
+        # CRITICAL: Block trading outside MCX hours
+        if not self.is_mcx_open():
+            logger.warning(f"  MCX MARKET CLOSED (current: {now.strftime('%H:%M:%S')})")
+            logger.warning(f"  MCX hours: {MCX_OPEN} - {MCX_CLOSE}, Mon-Fri")
+            logger.warning(f"  No signals will be generated.")
+            return all_signals
 
         for commodity in PAPER_TRADE_COMMODITIES:
             spec = COMMODITIES[commodity]
@@ -650,8 +664,26 @@ class CommodityPaperTrader:
             logger.info("\n  No commodity signals this scan.")
             return
 
+        # CRITICAL: Block execution outside MCX hours
+        if not self.is_mcx_open():
+            logger.warning(f"  {len(signals)} signals found but MCX CLOSED - NOT executing")
+            return
+
         logger.info(f"\n  {len(signals)} COMMODITY SIGNALS (PAPER):")
+        executed = 0
+        skipped = 0
         for sig in signals:
+            # Check for duplicate: same strategy + commodity + strike already open
+            existing = [p for p in self.portfolio.positions
+                        if p['strategy'] == sig['strategy']
+                        and p['commodity'] == sig['commodity']
+                        and p['strike'] == sig['strike']]
+            if existing:
+                logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['commodity']} "
+                           f"{sig['strike']} already open")
+                skipped += 1
+                continue
+
             self.portfolio.add_signal(
                 strategy=sig['strategy'],
                 commodity=sig['commodity'],
@@ -663,6 +695,10 @@ class CommodityPaperTrader:
                 details={'reason': sig['reason'], 'target': sig.get('target'),
                          'sl': sig.get('sl'), 'spot': sig.get('spot')},
             )
+            executed += 1
+
+        if skipped:
+            logger.info(f"  Executed: {executed} | Skipped (duplicates): {skipped}")
 
     def check_exits(self):
         if not self.portfolio.positions:
