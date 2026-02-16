@@ -1,0 +1,119 @@
+//@version=5
+// ============================================================================
+// Survivor Strategy (Raahi Bhushan) - Option Selling Algo
+// Trend-following option selling when market breaks support/resistance
+// ============================================================================
+// DISCLAIMER: Educational purposes only. Not financial advice.
+// ============================================================================
+
+indicator("Survivor Strategy - Raahi Bhushan", overlay=true)
+
+// === INPUTS ===
+peGap       = input.int(30, "PE Sell Gap (pts)", minval=5, step=5,
+              tooltip="Points up to trigger PE sell")
+ceGap       = input.int(30, "CE Sell Gap (pts)", minval=5, step=5,
+              tooltip="Points down to trigger CE sell")
+resetGap    = input.int(90, "Reset Gap (pts)", minval=20, step=10,
+              tooltip="Retracement points to reset reference")
+maxPos      = input.int(3, "Max Positions Per Side", minval=1, maxval=10)
+tradeDays   = input.string("Mon-Wed", "Trading Days",
+              options=["Mon-Wed", "Mon-Thu", "Mon-Fri"])
+showRef     = input.bool(true, "Show Reference Levels")
+showSignals = input.bool(true, "Show Trade Signals")
+
+// === DAY OF WEEK FILTER ===
+dow = dayofweek
+maxDow = tradeDays == "Mon-Wed" ? dayofweek.wednesday :
+         tradeDays == "Mon-Thu" ? dayofweek.thursday : dayofweek.friday
+isTradingDay = dow >= dayofweek.monday and dow <= maxDow
+
+// === PREVIOUS DAY LEVELS ===
+prevH = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+prevL = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+
+// === REFERENCE TRACKING ===
+var float peRef = na
+var float ceRef = na
+var int peCount = 0
+var int ceCount = 0
+
+// Initialize on new day
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    peRef := prevH
+    ceRef := prevL
+    peCount := 0
+    ceCount := 0
+
+// === SIGNAL DETECTION ===
+peSellSignal = false
+ceSellSignal = false
+peResetSignal = false
+ceResetSignal = false
+
+if isTradingDay and not na(peRef) and not na(ceRef)
+    // PE Selling (market going UP past resistance)
+    if high > peRef + peGap and peCount < maxPos
+        peSellSignal := true
+        peRef := peRef + peGap
+        peCount := peCount + 1
+
+    // CE Selling (market going DOWN past support)
+    if low < ceRef - ceGap and ceCount < maxPos
+        ceSellSignal := true
+        ceRef := ceRef - ceGap
+        ceCount := ceCount + 1
+
+    // Reset logic
+    if not na(peRef) and (peRef - low) > resetGap
+        peRef := low + resetGap
+        peCount := 0
+        peResetSignal := true
+
+    if not na(ceRef) and (high - ceRef) > resetGap
+        ceRef := high - resetGap
+        ceCount := 0
+        ceResetSignal := true
+
+// === PLOTTING ===
+plot(showRef ? peRef : na, "PE Reference", color.new(color.green, 30), 2,
+     plot.style_stepline)
+plot(showRef ? ceRef : na, "CE Reference", color.new(color.red, 30), 2,
+     plot.style_stepline)
+
+// Signals
+plotshape(showSignals and peSellSignal, "SELL PE", shape.triangleup,
+          location.belowbar, color.new(color.green, 0), size=size.small,
+          text="SELL PE")
+plotshape(showSignals and ceSellSignal, "SELL CE", shape.triangledown,
+          location.abovebar, color.new(color.red, 0), size=size.small,
+          text="SELL CE")
+
+// Reset markers
+plotshape(peResetSignal, "PE Reset", shape.xcross, location.belowbar,
+          color.new(color.yellow, 0), size=size.tiny)
+plotshape(ceResetSignal, "CE Reset", shape.xcross, location.abovebar,
+          color.new(color.yellow, 0), size=size.tiny)
+
+// === INFO TABLE ===
+var table infoTbl = table.new(position.top_right, 2, 5, border_width=1)
+if barstate.islast
+    table.cell(infoTbl, 0, 0, "Strategy", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 0, "Survivor (Sell)", bgcolor=color.new(color.orange, 80))
+    table.cell(infoTbl, 0, 1, "PE Ref", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 1, str.tostring(peRef, "#.#"))
+    table.cell(infoTbl, 0, 2, "CE Ref", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 2, str.tostring(ceRef, "#.#"))
+    table.cell(infoTbl, 0, 3, "PE Positions", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 3, str.tostring(peCount) + "/" + str.tostring(maxPos))
+    table.cell(infoTbl, 0, 4, "Trading Day?", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 4, isTradingDay ? "YES" : "NO",
+               bgcolor=isTradingDay ? color.new(color.green, 80) : color.new(color.red, 80))
+
+// === BACKGROUND ===
+bgcolor(isTradingDay ? na : color.new(color.gray, 95), title="Non-trading day")
+
+// === ALERTS ===
+alertcondition(peSellSignal, "Sell PE Signal", "Survivor: SELL PUT - Market broke above resistance")
+alertcondition(ceSellSignal, "Sell CE Signal", "Survivor: SELL CALL - Market broke below support")
+alertcondition(peResetSignal or ceResetSignal, "Reference Reset", "Survivor: Reference level reset")

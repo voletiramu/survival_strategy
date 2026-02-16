@@ -1,0 +1,119 @@
+//@version=5
+// ============================================================================
+// Ghost Trade Zone (GTZ) Strategy - Ghost Traders
+// Demand/Supply zone based option buying
+// ============================================================================
+// DISCLAIMER: Educational purposes only. Not financial advice.
+// ============================================================================
+
+indicator("Ghost Trade Zone (GTZ)", overlay=true, max_boxes_count=500)
+
+// === INPUTS ===
+zoneLookback    = input.int(20, "Zone Lookback", minval=5)
+volThreshold    = input.float(1.5, "Volume Threshold (x avg)", step=0.1)
+impulseATRMult  = input.float(1.5, "Min Impulse (ATR mult)", step=0.1)
+zoneWidthMult   = input.float(0.5, "Zone Width (ATR mult)", step=0.1)
+targetRR        = input.float(2.0, "Target R:R", step=0.5)
+showDemand      = input.bool(true, "Show Demand Zones")
+showSupply      = input.bool(true, "Show Supply Zones")
+showSignals     = input.bool(true, "Show Signals")
+maxZones        = input.int(5, "Max Zones to Show", minval=1, maxval=20)
+
+// === CALCULATIONS ===
+atr = ta.atr(14)
+avgVol = ta.sma(volume, 20)
+
+bodySize = math.abs(close - open)
+isSmallBody = bodySize < atr * 0.5
+isHighVol = volume > avgVol * volThreshold
+
+// Impulse detection
+bullishImpulse = close > open and (close - open) > atr * impulseATRMult
+bearishImpulse = open > close and (open - close) > atr * impulseATRMult
+
+// === ZONE DETECTION ===
+// Demand zone: small candle + high volume FOLLOWED by bullish impulse
+demandZone = isSmallBody[1] and isHighVol[1] and bullishImpulse
+supplyZone = isSmallBody[1] and isHighVol[1] and bearishImpulse
+
+// Zone levels
+demandLow  = demandZone ? math.min(low[1], low[2]) : na
+demandHigh = demandZone ? demandLow + atr * zoneWidthMult : na
+supplyHigh = supplyZone ? math.max(high[1], high[2]) : na
+supplyLow  = supplyZone ? supplyHigh - atr * zoneWidthMult : na
+
+// === PLOT ZONES AS BOXES ===
+if showDemand and demandZone
+    box.new(bar_index - 2, demandHigh, bar_index + 50, demandLow,
+            border_color=color.new(color.green, 50),
+            bgcolor=color.new(color.green, 85),
+            text="DEMAND", text_color=color.green)
+
+if showSupply and supplyZone
+    box.new(bar_index - 2, supplyHigh, bar_index + 50, supplyLow,
+            border_color=color.new(color.red, 50),
+            bgcolor=color.new(color.red, 85),
+            text="SUPPLY", text_color=color.red)
+
+// === RETEST SIGNALS ===
+// Check if current bar retests a recent demand zone
+var float lastDemandLow = na
+var float lastDemandHigh = na
+var float lastSupplyLow = na
+var float lastSupplyHigh = na
+
+if demandZone
+    lastDemandLow := demandLow
+    lastDemandHigh := demandHigh
+
+if supplyZone
+    lastSupplyLow := supplyLow
+    lastSupplyHigh := supplyHigh
+
+// Buy CE: price retests demand zone and bounces
+buyCE = not na(lastDemandLow) and low <= lastDemandHigh and low >= lastDemandLow and
+        close > lastDemandHigh and showSignals
+// Buy PE: price retests supply zone and rejects
+buyPE = not na(lastSupplyLow) and high >= lastSupplyLow and high <= lastSupplyHigh and
+        close < lastSupplyLow and showSignals
+
+// === PLOT SIGNALS ===
+plotshape(buyCE, "Buy CE (Demand Retest)", shape.labelup, location.belowbar,
+          color.new(color.green, 0), size=size.normal,
+          text="BUY CE\n(Demand)")
+plotshape(buyPE, "Buy PE (Supply Retest)", shape.labeldown, location.abovebar,
+          color.new(color.red, 0), size=size.normal,
+          text="BUY PE\n(Supply)")
+
+// SL and Target
+if buyCE
+    slLevel = lastDemandLow - atr * 0.5
+    risk = close - slLevel
+    tgtLevel = close + risk * targetRR
+    // line.new(bar_index, slLevel, bar_index + 10, slLevel, color=color.red, width=1)
+    // line.new(bar_index, tgtLevel, bar_index + 10, tgtLevel, color=color.green, width=1)
+
+if buyPE
+    slLevel = lastSupplyHigh + atr * 0.5
+    risk = slLevel - close
+    tgtLevel = close - risk * targetRR
+
+// === INFO TABLE ===
+var table infoTbl = table.new(position.top_right, 2, 4, border_width=1)
+if barstate.islast
+    table.cell(infoTbl, 0, 0, "Strategy", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 0, "Ghost Trade Zone", bgcolor=color.new(color.purple, 80))
+    table.cell(infoTbl, 0, 1, "ATR (14)", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 1, str.tostring(atr, "#.#"))
+    table.cell(infoTbl, 0, 2, "Last Demand", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 2, not na(lastDemandLow) ?
+               str.tostring(lastDemandLow, "#") + "-" + str.tostring(lastDemandHigh, "#") : "None")
+    table.cell(infoTbl, 0, 3, "Last Supply", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 3, not na(lastSupplyLow) ?
+               str.tostring(lastSupplyLow, "#") + "-" + str.tostring(lastSupplyHigh, "#") : "None")
+
+// === ALERTS ===
+alertcondition(buyCE, "GTZ Buy CE", "Ghost Zone: BUY CALL - Demand zone retest bounce")
+alertcondition(buyPE, "GTZ Buy PE", "Ghost Zone: BUY PUT - Supply zone retest rejection")
+alertcondition(demandZone, "New Demand Zone", "Ghost Zone: New DEMAND zone formed")
+alertcondition(supplyZone, "New Supply Zone", "Ghost Zone: New SUPPLY zone formed")

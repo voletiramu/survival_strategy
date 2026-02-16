@@ -1,0 +1,109 @@
+//@version=5
+// ============================================================================
+// Wave Extractor Strategy (Raahi Bhushan) - Option Selling in Range
+// Captures oscillations in sideways markets
+// ============================================================================
+// DISCLAIMER: Educational purposes only. Not financial advice.
+// ============================================================================
+
+indicator("Wave Extractor - Raahi Bhushan", overlay=true)
+
+// === INPUTS ===
+baseGap      = input.int(25, "Base Gap (pts)", minval=5, step=5)
+multUp       = input.float(1.5, "Multiplier (Up trend)", step=0.1)
+multDown     = input.float(1.5, "Multiplier (Down trend)", step=0.1)
+maxTrades    = input.int(6, "Max Trades/Day", minval=1, maxval=15)
+atrPeriod    = input.int(14, "ATR Period", minval=5)
+trendPeriod  = input.int(20, "Trend Filter Period", minval=5)
+useAdaptive  = input.bool(true, "Adaptive Gap (ATR-based)")
+showZones    = input.bool(true, "Show Trading Zones")
+showSignals  = input.bool(true, "Show Signals")
+
+// === ATR & TREND FILTER ===
+atr = ta.atr(atrPeriod)
+rangePct = (high - low) / close * 100
+avgRange = ta.sma(rangePct, trendPeriod)
+isRanging = rangePct < avgRange * 1.5
+
+// Adaptive gap
+adaptiveGap = useAdaptive ? math.max(baseGap, atr * 0.3) : baseGap
+
+// === REFERENCE TRACKING ===
+var float dayOpen = na
+var int netPos = 0
+var int tradeCount = 0
+
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    dayOpen := open
+    netPos := 0
+    tradeCount := 0
+
+// Effective gaps with multiplier
+effUpGap   = netPos > 0 ? adaptiveGap * multUp : adaptiveGap
+effDownGap = netPos < 0 ? adaptiveGap * multDown : adaptiveGap
+
+// === ZONE PLOTTING ===
+upperZone = not na(dayOpen) ? dayOpen + effUpGap : na
+lowerZone = not na(dayOpen) ? dayOpen - effDownGap : na
+
+plot(showZones ? upperZone : na, "Upper Sell Zone", color.new(color.red, 40), 1,
+     plot.style_stepline)
+plot(showZones ? lowerZone : na, "Lower Sell Zone", color.new(color.green, 40), 1,
+     plot.style_stepline)
+plot(showZones ? dayOpen : na, "Day Open", color.new(color.gray, 50), 1,
+     plot.style_stepline)
+
+// === SIGNAL GENERATION ===
+sellCE = false
+sellPE = false
+
+if not na(dayOpen) and tradeCount < maxTrades
+    // Sell CE when price reaches upper zone (in range market)
+    if high >= upperZone and isRanging
+        sellCE := true
+        netPos := netPos + 1
+        tradeCount := tradeCount + 1
+
+    // Sell PE when price reaches lower zone (in range market)
+    if low <= lowerZone and isRanging
+        sellPE := true
+        netPos := netPos - 1
+        tradeCount := tradeCount + 1
+
+// === PLOT SIGNALS ===
+plotshape(showSignals and sellCE, "SELL CE", shape.triangledown, location.abovebar,
+          color.new(color.red, 0), size=size.small, text="SELL CE")
+plotshape(showSignals and sellPE, "SELL PE", shape.triangleup, location.belowbar,
+          color.new(color.green, 0), size=size.small, text="SELL PE")
+
+// Warning for trending days
+trendWarning = not isRanging and rangePct > avgRange * 2
+plotshape(trendWarning and isNewDay, "Trend Warning", shape.flag,
+          location.abovebar, color.orange, size=size.tiny, text="TRENDING!")
+
+// Background
+bgcolor(isRanging ? color.new(color.blue, 95) : color.new(color.orange, 95),
+        title="Market Type")
+
+// === INFO TABLE ===
+var table infoTbl = table.new(position.top_right, 2, 6, border_width=1)
+if barstate.islast
+    table.cell(infoTbl, 0, 0, "Strategy", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 0, "Wave Extractor", bgcolor=color.new(color.blue, 80))
+    table.cell(infoTbl, 0, 1, "Market", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 1, isRanging ? "RANGING" : "TRENDING",
+               bgcolor=isRanging ? color.new(color.green, 80) : color.new(color.red, 80))
+    table.cell(infoTbl, 0, 2, "ATR", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 2, str.tostring(atr, "#.#"))
+    table.cell(infoTbl, 0, 3, "Eff Gap Up", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 3, str.tostring(effUpGap, "#.#"))
+    table.cell(infoTbl, 0, 4, "Eff Gap Down", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 4, str.tostring(effDownGap, "#.#"))
+    table.cell(infoTbl, 0, 5, "Trades Today", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTbl, 1, 5, str.tostring(tradeCount) + "/" + str.tostring(maxTrades))
+
+// === ALERTS ===
+alertcondition(sellCE, "Sell CE Signal", "Wave: SELL CALL - Price at upper zone in range")
+alertcondition(sellPE, "Sell PE Signal", "Wave: SELL PUT - Price at lower zone in range")
+alertcondition(trendWarning, "Trend Warning", "Wave: TRENDING DAY - Reduce position size!")

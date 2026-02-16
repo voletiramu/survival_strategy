@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data files (too large for GitHub)
+data/options/instrument_master.csv
+data/options/*.csv
+data/*.csv
+
+# Credentials - NEVER commit
+Angel/
+*.secret
+*.key
+
+# Logs
+logs/
+*.log
+
+# Paper trading state (local only)
+paper_trades/portfolio_state.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
