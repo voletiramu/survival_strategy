@@ -45,6 +45,7 @@ EQUITY_OPEN = dtime(9, 15)
 EQUITY_CLOSE = dtime(15, 30)
 MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)
+COMMODITY_TRADE_START = dtime(15, 30)  # Commodity trades only after 3:30 PM (equity close)
 
 
 def print_banner():
@@ -246,10 +247,13 @@ def run_continuous(interval=5, offline=False):
         else:
             logger.info(f"  Equity market: CLOSED ({EQUITY_OPEN}-{EQUITY_CLOSE})")
 
-        # Run commodity scan if MCX open
-        if mcx_open:
-            logger.info(f"  MCX market: OPEN")
+        # Run commodity scan if MCX open AND after 14:30
+        commodity_trade_ok = current_time >= COMMODITY_TRADE_START
+        if mcx_open and commodity_trade_ok:
+            logger.info(f"  MCX market: OPEN (trades active after {COMMODITY_TRADE_START})")
             run_commodity_scan(offline)
+        elif mcx_open and not commodity_trade_ok:
+            logger.info(f"  MCX: OPEN but trades blocked until {COMMODITY_TRADE_START}")
         else:
             logger.info(f"  MCX market: CLOSED ({MCX_OPEN}-{MCX_CLOSE})")
 
@@ -324,8 +328,12 @@ def main():
 
         if not args.equity_only:
             mcx_open = MCX_OPEN <= current_time <= MCX_CLOSE and not is_weekend
-            if mcx_open:
+            commodity_trade_ok = current_time >= COMMODITY_TRADE_START
+            if mcx_open and commodity_trade_ok:
                 run_commodity_scan(args.offline)
+            elif mcx_open and not commodity_trade_ok:
+                logger.warning(f"MCX OPEN but commodity trades blocked until {COMMODITY_TRADE_START}. "
+                             f"Current: {current_time.strftime('%H:%M')}")
             else:
                 logger.warning(f"MCX market CLOSED ({current_time.strftime('%H:%M')}). "
                              f"Hours: {MCX_OPEN}-{MCX_CLOSE}, Mon-Fri. Skipping commodity scan.")

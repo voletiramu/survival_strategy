@@ -157,7 +157,12 @@ def main():
     csv_path = os.path.join(REPORT_DIR, f'all_trades_{timestamp}.csv')
     latest_path = os.path.join(REPORT_DIR, 'all_trades_latest.csv')
     df.to_csv(csv_path, index=False)
-    df.to_csv(latest_path, index=False)
+    try:
+        df.to_csv(latest_path, index=False)
+    except PermissionError:
+        alt_path = os.path.join(REPORT_DIR, 'all_trades_current.csv')
+        df.to_csv(alt_path, index=False)
+        print(f"  (latest.csv locked, saved to {alt_path})")
 
     # Print to console as table
     print("\n" + "=" * 140)

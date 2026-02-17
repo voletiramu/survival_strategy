@@ -102,6 +102,7 @@ MCX_GST = 0.18
 # MCX Market hours (extended)
 MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)  # 11:30 PM
+COMMODITY_TRADE_START = dtime(15, 30)  # Trade only after 3:30 PM (equity close)
 
 ANGEL_CRED_FILE = r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt"
 
@@ -593,11 +594,11 @@ class CommodityPaperTrader:
         return None
 
     def is_mcx_open(self):
-        """Check if MCX market is open (9:00 AM - 11:30 PM IST, Mon-Fri)."""
+        """Check if MCX trading is allowed (after 3:30 PM until 11:30 PM, Mon-Fri)."""
         now = datetime.now()
         if now.weekday() > 4:  # Saturday/Sunday
             return False
-        return MCX_OPEN <= now.time() <= MCX_CLOSE
+        return COMMODITY_TRADE_START <= now.time() <= MCX_CLOSE
 
     def scan_all(self):
         logger.info("\n" + "=" * 70)
