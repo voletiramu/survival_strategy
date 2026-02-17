@@ -219,6 +219,13 @@ def run_continuous(interval=5, offline=False):
     logger.info(f"Commodity hours: 9:00 AM - 11:30 PM")
     logger.info(f"Press Ctrl+C to stop\n")
 
+    # Send Telegram startup notification
+    try:
+        from trade_notifier import notify_scanner_start
+        notify_scanner_start()
+    except Exception as e:
+        logger.warning(f"Telegram startup notify failed: {e}")
+
     scan_count = 0
 
     while running:

@@ -698,6 +698,23 @@ class CommodityPaperTrader:
             )
             executed += 1
 
+            # Send Telegram notification
+            try:
+                from trade_notifier import notify_trade_entry
+                spec = COMMODITIES[sig['commodity']]
+                capital = sig['premium'] * spec['lot_size'] * spec['multiplier']
+                notify_trade_entry(
+                    market="COMMODITY", strategy=sig['strategy'],
+                    symbol=sig['commodity'], signal_type=sig['type'],
+                    strike=sig['strike'], entry_price=sig['premium'],
+                    spot=sig.get('spot', 0), lot_size=spec['lot_size'],
+                    multiplier=spec['multiplier'], delta=sig['greeks'].get('delta', 0),
+                    target=sig.get('target', 0), sl=sig.get('sl', 0),
+                    capital_used=capital, reason=sig['reason'],
+                )
+            except Exception as e:
+                logger.warning(f"  Telegram notify failed: {e}")
+
         if skipped:
             logger.info(f"  Executed: {executed} | Skipped (duplicates): {skipped}")
 
@@ -756,6 +773,21 @@ class CommodityPaperTrader:
 
             if exit_reason:
                 self.portfolio.close_position(pos['id'], current, exit_reason)
+                # Send Telegram exit notification
+                try:
+                    from trade_notifier import notify_trade_exit
+                    spec = COMMODITIES[commodity]
+                    capital = pos['entry_premium'] * spec['lot_size'] * spec['multiplier']
+                    notify_trade_exit(
+                        market="COMMODITY", strategy=pos['strategy'],
+                        symbol=commodity, signal_type=pos['signal_type'],
+                        strike=pos['strike'], entry_price=pos['entry_premium'],
+                        exit_price=current, entry_time=pos['timestamp'],
+                        pnl=pos['unrealized_pnl'], capital_used=capital,
+                        exit_reason=exit_reason,
+                    )
+                except Exception as e:
+                    logger.warning(f"  Telegram exit notify failed: {e}")
 
     def run_once(self):
         signals = self.scan_all()
