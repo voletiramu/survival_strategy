@@ -50,9 +50,9 @@ COMMODITY_TRADE_START = dtime(15, 30)   # Commodity trades only after 3:30 PM (e
 RISK_FREE_RATE = 0.065
 
 INDEX_TOKENS = {
-    'NIFTY':     {'exchange': 'NSE', 'token': '99926000', 'strike_int': 50,  'lot': 25},
-    'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009', 'strike_int': 100, 'lot': 15},
-    'SENSEX':    {'exchange': 'BSE', 'token': '99919000', 'strike_int': 100, 'lot': 10},
+    'NIFTY':     {'exchange': 'NSE', 'token': '99926000', 'strike_int': 50,  'lot': 65},   # NSE revised Jan 2026
+    'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009', 'strike_int': 100, 'lot': 30},  # NSE revised Jan 2026
+    'SENSEX':    {'exchange': 'BSE', 'token': '99919000', 'strike_int': 100, 'lot': 20},  # NSE revised Jan 2026
 }
 
 MCX_COMMODITIES = {
@@ -247,7 +247,11 @@ class LiveScanner:
     def get_option_greeks_api(self, symbol, expiry_date):
         """Fetch Greeks from optionGreek API (all strikes in one call)."""
         try:
-            exp_dt = datetime.strptime(expiry_date, '%Y-%m-%d')
+            # Parse expiry in various formats
+            try:
+                exp_dt = datetime.strptime(expiry_date, '%Y-%m-%d')
+            except ValueError:
+                exp_dt = datetime.strptime(expiry_date.upper(), '%d%b%Y')
             exp_str = exp_dt.strftime('%d%b%Y').upper()
             data = self.obj.optionGreek({"name": symbol, "expirydate": exp_str})
             if data and data.get('data'):
@@ -284,9 +288,26 @@ class LiveScanner:
         ]
         if len(opts) == 0:
             return None
-        today = datetime.now().strftime('%Y-%m-%d')
-        expiries = sorted([e for e in opts['expiry'].dropna().unique() if e >= today])
-        return expiries[0] if expiries else None
+        today = datetime.now()
+        raw_expiries = opts['expiry'].dropna().unique()
+        # Parse expiries in various formats
+        parsed = []
+        for e in raw_expiries:
+            try:
+                dt = datetime.strptime(str(e), '%Y-%m-%d')
+                parsed.append((dt, str(e)))
+            except ValueError:
+                try:
+                    dt = datetime.strptime(str(e).upper(), '%d%b%Y')
+                    parsed.append((dt, str(e)))
+                except ValueError:
+                    continue
+        # Filter future expiries and sort
+        future = [(dt, raw) for dt, raw in parsed if dt >= today.replace(hour=0, minute=0, second=0)]
+        if not future:
+            return None
+        future.sort(key=lambda x: x[0])
+        return future[0][1]  # Return original string format
 
     def find_token(self, symbol, expiry, strike, opt_type):
         """Fast token lookup from cached maps."""
@@ -399,7 +420,19 @@ class LiveScanner:
         if not expiry:
             logger.warning(f"  No expiry found")
             return rows, signals
-        dte = max(0, (datetime.strptime(expiry, '%Y-%m-%d') - datetime.now()).days)
+        # Parse expiry — handle multiple formats (YYYY-MM-DD, DDMMMYYYY, etc.)
+        try:
+            exp_dt = datetime.strptime(expiry, '%Y-%m-%d')
+        except ValueError:
+            try:
+                exp_dt = datetime.strptime(expiry, '%d%b%Y')
+            except ValueError:
+                try:
+                    exp_dt = datetime.strptime(expiry.upper(), '%d%b%Y')
+                except ValueError:
+                    logger.warning(f"  Cannot parse expiry: {expiry}")
+                    return rows, signals
+        dte = max(0, (exp_dt - datetime.now()).days)
         logger.info(f"  Expiry: {expiry} (DTE={dte})")
 
         # 3. Indicators

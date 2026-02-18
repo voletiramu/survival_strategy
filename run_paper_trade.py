@@ -217,6 +217,7 @@ def run_continuous(interval=5, offline=False):
     logger.info(f"Scanning every {interval} minutes")
     logger.info(f"Equity hours:    9:15 AM - 3:30 PM")
     logger.info(f"Commodity hours: 9:00 AM - 11:30 PM")
+    logger.info(f"Crypto:          24/7 (BTCUSDT, ETHUSDT, SOLUSDT)")
     logger.info(f"Press Ctrl+C to stop\n")
 
     # Send Telegram startup notification
@@ -263,6 +264,24 @@ def run_continuous(interval=5, offline=False):
             logger.info(f"  MCX: OPEN but trades blocked until {COMMODITY_TRADE_START}")
         else:
             logger.info(f"  MCX market: CLOSED ({MCX_OPEN}-{MCX_CLOSE})")
+
+        # Run crypto scan (24/7, always runs)
+        try:
+            from crypto_paper_trader import CryptoPortfolio, run_scan as run_crypto_scan
+            logger.info(f"  Crypto market: ALWAYS OPEN (24/7)")
+            crypto_portfolio = CryptoPortfolio()
+            run_crypto_scan(crypto_portfolio)
+        except Exception as e:
+            logger.error(f"  Crypto scan error: {e}")
+
+        # Push active trades to Telegram every 6th scan (~30 min)
+        if scan_count % 6 == 0:
+            try:
+                from trade_notifier import notify_active_trades
+                notify_active_trades()
+                logger.info("  Active trades pushed to Telegram")
+            except Exception as e:
+                logger.warning(f"  Telegram active trades push failed: {e}")
 
         # If both markets closed and it's past MCX close, stop
         if not equity_open and not mcx_open and current_time > MCX_CLOSE:

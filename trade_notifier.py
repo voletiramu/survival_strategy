@@ -171,6 +171,106 @@ def notify_error(error_msg):
     return send_message(msg)
 
 
+def notify_active_trades():
+    """Push all active (open) trades from equity + commodity portfolios to Telegram."""
+    import json, os
+    base = os.path.dirname(os.path.abspath(__file__))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Load equity portfolio
+    eq_file = os.path.join(base, 'paper_trades', 'portfolio_state.json')
+    eq_positions, eq_closed, eq_capital = [], [], 300000
+    try:
+        with open(eq_file) as f:
+            eq = json.load(f)
+        eq_positions = eq.get('positions', [])
+        eq_closed = eq.get('closed_trades', [])
+        eq_capital = eq.get('capital', 300000)
+    except Exception:
+        pass
+
+    # Load commodity portfolio
+    comm_file = os.path.join(base, 'paper_trades_commodity', 'commodity_portfolio_state.json')
+    comm_positions, comm_closed, comm_capital = [], [], 300000
+    try:
+        with open(comm_file) as f:
+            comm = json.load(f)
+        comm_positions = comm.get('positions', [])
+        comm_closed = comm.get('closed_trades', [])
+        comm_capital = comm.get('capital', 300000)
+    except Exception:
+        pass
+
+    # Build message — EQUITY OPEN POSITIONS
+    total_unrealized = 0
+    msg = f"<b>📋 ACTIVE TRADES REPORT</b>\n<b>Time:</b> {now}\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+
+    if eq_positions:
+        msg += f"\n<b>EQUITY — {len(eq_positions)} Open Positions</b>\n"
+        for p in eq_positions:
+            pnl = p.get('unrealized_pnl', 0)
+            total_unrealized += pnl
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            opt = "CE" if "CE" in p.get('signal_type', '') else "PE"
+            msg += (
+                f"{emoji} {p['symbol']} {p.get('strike',0):.0f}{opt} "
+                f"| {p['strategy']} | Entry:₹{p['entry_premium']:.1f} "
+                f"Cur:₹{p.get('current_premium', p['entry_premium']):.1f} "
+                f"| PnL:₹{pnl:+,.0f} | Δ:{p.get('delta',0):.3f}\n"
+            )
+
+    if comm_positions:
+        msg += f"\n<b>COMMODITY — {len(comm_positions)} Open Positions</b>\n"
+        for p in comm_positions:
+            pnl = p.get('unrealized_pnl', 0)
+            total_unrealized += pnl
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            opt = "CE" if "CE" in p.get('signal_type', '') else "PE"
+            msg += (
+                f"{emoji} {p.get('commodity', p.get('symbol','?'))} {p.get('strike',0):.0f}{opt} "
+                f"| {p['strategy']} | Entry:₹{p['entry_premium']:.1f} "
+                f"Cur:₹{p.get('current_premium', p['entry_premium']):.1f} "
+                f"| PnL:₹{pnl:+,.0f} | Δ:{p.get('delta',0):.3f}\n"
+            )
+
+    if not eq_positions and not comm_positions:
+        msg += "\nNo open positions.\n"
+
+    # Closed trades summary
+    eq_closed_pnl = sum(t.get('pnl', 0) for t in eq_closed)
+    comm_closed_pnl = sum(t.get('pnl', 0) for t in comm_closed)
+    eq_wins = sum(1 for t in eq_closed if t.get('pnl', 0) > 0)
+    comm_wins = sum(1 for t in comm_closed if t.get('pnl', 0) > 0)
+
+    msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"<b>TODAY'S SUMMARY</b>\n"
+    msg += f"Open Positions: {len(eq_positions) + len(comm_positions)}\n"
+    msg += f"Unrealized PnL: ₹{total_unrealized:+,.2f}\n"
+    msg += f"Closed Trades: {len(eq_closed) + len(comm_closed)}\n"
+    msg += f"Realized PnL: ₹{eq_closed_pnl + comm_closed_pnl:+,.2f}\n"
+    if eq_closed:
+        wr = eq_wins / len(eq_closed) * 100
+        msg += f"Equity Win Rate: {wr:.0f}% ({eq_wins}/{len(eq_closed)})\n"
+    if comm_closed:
+        wr = comm_wins / len(comm_closed) * 100
+        msg += f"Commodity Win Rate: {wr:.0f}% ({comm_wins}/{len(comm_closed)})\n"
+    msg += f"Equity Capital: ₹{eq_capital:,.0f}\n"
+    msg += f"Commodity Capital: ₹{comm_capital:,.0f}\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━"
+
+    # Telegram has 4096 char limit — split if needed
+    if len(msg) > 4000:
+        # Send in two parts
+        mid = msg.find('\n<b>COMMODITY')
+        if mid == -1:
+            mid = len(msg) // 2
+        send_message(msg[:mid])
+        return send_message(msg[mid:])
+    else:
+        return send_message(msg)
+
+
 if __name__ == "__main__":
     # Test: send a test message
     print("Testing Telegram Bot connection...")
