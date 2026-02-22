@@ -47,6 +47,27 @@ STT_SELL = 0.000625
 EXCHANGE_CHARGES = 0.0005
 GST_RATE = 0.18
 
+# ====================================================================
+# CAPITAL ALLOCATION & RISK MANAGEMENT
+# ====================================================================
+TOTAL_CAPITAL = 300000
+EQUITY_CAPITAL = 200000        # Rs 2L for NIFTY, BANKNIFTY, SENSEX
+COMMODITY_CAPITAL = 100000     # Rs 1L for GOLDM, SILVERM, CRUDEOILM
+MAX_RISK_PCT = 25              # Max 25% of segment capital per trade
+MAX_EQUITY_PER_TRADE = EQUITY_CAPITAL * MAX_RISK_PCT / 100    # Rs 50,000
+MAX_COMMODITY_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 25,000
+MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
+MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
+
+# OI + IV Exit Thresholds
+OI_SURGE_PCT = 15       # Exit if OI changes >15% from entry
+OI_REVERSE_PCT = 25     # Reverse trade if OI changes >25%
+IV_SPIKE_PCT = 25       # Exit if IV changes >25% from entry
+IV_REVERSE_PCT = 40     # Reverse trade if IV changes >40%
+OI_IV_COMBO_OI = 10     # Combined exit: OI >10% AND IV >15%
+OI_IV_COMBO_IV = 15
+GAMMA_SHIELD_THRESHOLD = 0.002  # Exit short positions if gamma > this
+
 # Strategy weights from backtest (Sharpe-weighted)
 STRATEGY_WEIGHTS = {
     'CPR': 0.88,          # 87.9% allocation (dominant)
@@ -355,13 +376,45 @@ class PaperPortfolio:
             json.dump(state, f, indent=2, default=str)
 
     def add_signal(self, strategy, symbol, signal_type, strike, entry_premium,
-                   delta, gamma, theta, iv, dte, details=None):
-        """Record a trading signal."""
+                   delta, gamma, theta, iv, dte, details=None, oi=0, spot_price=0):
+        """Record a trading signal with risk management and OI/IV tracking."""
+        # ---- RISK CHECK ----
+        lot_size = LOT_SIZES.get(symbol, 65)
+        trade_cost = entry_premium * lot_size
+        is_commodity = symbol in ('GOLDM', 'SILVERM', 'CRUDEOILM', 'GOLD', 'SILVER', 'CRUDEOIL')
+        max_per_trade = MAX_COMMODITY_PER_TRADE if is_commodity else MAX_EQUITY_PER_TRADE
+        segment_capital = COMMODITY_CAPITAL if is_commodity else EQUITY_CAPITAL
+
+        # Check per-trade risk limit
+        if trade_cost > max_per_trade:
+            logger.warning(f"  RISK_LIMIT: {symbol} {strategy} trade cost Rs {trade_cost:,.0f} "
+                          f"> max Rs {max_per_trade:,.0f}. SKIPPED.")
+            return None
+
+        # Check total exposure for this segment
+        total_exposure = sum(
+            p['entry_premium'] * p['lot_size']
+            for p in self.positions
+            if (p['symbol'] in ('GOLDM', 'SILVERM', 'CRUDEOILM', 'GOLD', 'SILVER', 'CRUDEOIL')) == is_commodity
+        )
+        if total_exposure + trade_cost > segment_capital:
+            logger.warning(f"  RISK_LIMIT: {symbol} {strategy} would exceed segment capital "
+                          f"(exposure Rs {total_exposure+trade_cost:,.0f} > Rs {segment_capital:,.0f}). SKIPPED.")
+            return None
+
+        # Check daily loss limit
+        today = datetime.now().strftime('%Y-%m-%d')
+        daily_loss = self.daily_pnl.get(today, 0)
+        max_daily = MAX_DAILY_LOSS_COMMODITY if is_commodity else MAX_DAILY_LOSS_EQUITY
+        if daily_loss < -max_daily:
+            logger.warning(f"  RISK_LIMIT: Daily loss Rs {daily_loss:,.0f} exceeds limit Rs {max_daily:,.0f}. SKIPPED.")
+            return None
+
         sig = {
             'timestamp': datetime.now().isoformat(),
             'strategy': strategy,
             'symbol': symbol,
-            'signal_type': signal_type,  # BUY_CE, SELL_PE, etc.
+            'signal_type': signal_type,
             'strike': strike,
             'entry_premium': entry_premium,
             'delta': delta,
@@ -370,12 +423,10 @@ class PaperPortfolio:
             'iv': iv,
             'dte': dte,
             'details': details or {},
-            'status': 'SIGNAL'  # SIGNAL -> ENTERED -> EXITED
+            'status': 'SIGNAL'
         }
         self.signals.append(sig)
 
-        # Paper enter
-        lot_size = LOT_SIZES.get(symbol, 25)
         is_sell = 'SELL' in signal_type
         cost = calc_costs(entry_premium, lot_size, is_sell)
 
@@ -397,13 +448,18 @@ class PaperPortfolio:
             'iv': round(iv * 100, 1),
             'dte': dte,
             'unrealized_pnl': 0,
-            'status': 'OPEN'
+            'status': 'OPEN',
+            # OI+IV tracking for dynamic exits
+            'entry_oi': oi,
+            'entry_iv': round(iv * 100, 1),
+            'entry_spot': round(spot_price, 2),
+            'max_risk': round(max_per_trade, 2),
         }
         self.positions.append(pos)
 
         logger.info(f"  PAPER TRADE: {signal_type} {symbol} {strike} "
                     f"@ Rs {entry_premium:.2f} | Strategy: {strategy} "
-                    f"| Delta: {delta:.3f} | IV: {iv*100:.1f}%")
+                    f"| Delta: {delta:.3f} | IV: {iv*100:.1f}% | OI: {oi}")
 
         self.save_state()
         return pos
@@ -1163,8 +1219,156 @@ class PaperTrader:
         if skipped:
             logger.info(f"  Executed: {executed} | Skipped (duplicates): {skipped}")
 
+    def fetch_current_oi_iv(self, pos):
+        """Fetch current OI and IV from Angel SmartAPI for a position."""
+        try:
+            from live_scanner import LiveScanner
+            scanner = getattr(self, '_live_scanner', None)
+            if scanner is None:
+                return None, None
+
+            symbol = pos['symbol']
+            strike = pos['strike']
+            opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+
+            # Try to get market data for this option
+            # Use the scanner's existing API connection
+            try:
+                greeks_data = scanner.get_option_greeks_api(symbol, scanner.get_nearest_expiry(symbol))
+                if greeks_data:
+                    for row in greeks_data:
+                        if abs(row.get('strike', 0) - strike) < 10 and row.get('type') == opt_type:
+                            current_oi = row.get('oi', 0)
+                            current_iv = row.get('iv', 0)
+                            return current_oi, current_iv
+            except Exception:
+                pass
+
+            return None, None
+        except Exception as e:
+            logger.debug(f"  OI/IV fetch failed for {pos['id']}: {e}")
+            return None, None
+
+    def check_oi_iv_exit(self, pos, current_premium):
+        """Check if position should exit based on OI velocity + IV changes + Gamma risk.
+
+        Returns: (exit_reason, should_reverse) or (None, False)
+        """
+        entry_oi = pos.get('entry_oi', 0)
+        entry_iv = pos.get('entry_iv', 0)
+
+        # Try to fetch current OI and IV
+        current_oi, current_iv = self.fetch_current_oi_iv(pos)
+
+        # If we can't get live data, use computed IV as proxy
+        if current_iv is None or current_iv == 0:
+            # Use the recalculated IV from BS model as proxy
+            df = self.engine.historical_data.get(pos['symbol'])
+            if df is not None and len(df) > 20:
+                log_ret = np.log(df['Close'] / df['Close'].shift(1))
+                hv = log_ret.tail(20).std() * np.sqrt(252)
+                current_iv = max(min(hv * 1.15 * 100, 60), 8)  # as percentage
+            else:
+                current_iv = entry_iv
+
+        if current_oi is None:
+            current_oi = entry_oi
+
+        # Calculate changes
+        oi_change = 0
+        iv_change = 0
+
+        if entry_oi and entry_oi > 0:
+            oi_change = abs(current_oi - entry_oi) / entry_oi * 100
+
+        if entry_iv and entry_iv > 0:
+            iv_change = abs(current_iv - entry_iv) / entry_iv * 100
+
+        # Rule 1: OI surge >15% from entry
+        if oi_change > OI_SURGE_PCT:
+            should_reverse = oi_change > OI_REVERSE_PCT
+            logger.info(f"  OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% "
+                       f"(entry={entry_oi}, current={current_oi}). Reverse={should_reverse}")
+            return 'OI_SURGE_EXIT', should_reverse
+
+        # Rule 2: IV spike >25% from entry
+        if iv_change > IV_SPIKE_PCT:
+            should_reverse = iv_change > IV_REVERSE_PCT
+            logger.info(f"  IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% "
+                       f"(entry={entry_iv}%, current={current_iv}%). Reverse={should_reverse}")
+            return 'IV_SPIKE_EXIT', should_reverse
+
+        # Rule 3: Combined OI+IV (lower thresholds)
+        if oi_change > OI_IV_COMBO_OI and iv_change > OI_IV_COMBO_IV:
+            logger.info(f"  OI_IV_COMBO: {pos['id']} OI={oi_change:.1f}%, IV={iv_change:.1f}%. REVERSE!")
+            return 'OI_IV_COMBINED_EXIT', True
+
+        # Rule 4: Gamma shield for short positions
+        if pos.get('is_sell') and abs(pos.get('gamma', 0)) > GAMMA_SHIELD_THRESHOLD:
+            logger.info(f"  GAMMA_SHIELD: {pos['id']} gamma={pos.get('gamma', 0):.6f} > {GAMMA_SHIELD_THRESHOLD}")
+            return 'GAMMA_SHIELD_EXIT', False
+
+        return None, False
+
+    def execute_reversal(self, pos, exit_reason):
+        """After closing a position due to OI+IV exit, open a reverse trade."""
+        try:
+            symbol = pos['symbol']
+            strategy = pos['strategy']
+            original_type = pos['signal_type']
+
+            # Determine reverse direction
+            if 'CE' in original_type:
+                if pos['is_sell']:
+                    reverse_type = 'BUY_CE_' + strategy.upper().replace(' ', '_')
+                else:
+                    reverse_type = 'SELL_CE'
+            else:
+                if pos['is_sell']:
+                    reverse_type = 'BUY_PE_' + strategy.upper().replace(' ', '_')
+                else:
+                    reverse_type = 'SELL_PE'
+
+            logger.info(f"  REVERSAL: {pos['id']} → Opening {reverse_type} {symbol} "
+                       f"@ strike {pos['strike']} due to {exit_reason}")
+
+            # Open reverse trade using same strike and current premium
+            reverse_pos = self.portfolio.add_signal(
+                strategy=strategy + ' (Reversal)',
+                symbol=symbol,
+                signal_type=reverse_type,
+                strike=pos['strike'],
+                entry_premium=pos['current_premium'],
+                delta=pos.get('delta', 0),
+                gamma=pos.get('gamma', 0),
+                theta=pos.get('theta', 0),
+                iv=pos.get('iv', 15) / 100,
+                dte=pos.get('dte', 1),
+                details={'origin': 'REVERSAL', 'original_id': pos['id'], 'exit_reason': exit_reason},
+                oi=pos.get('entry_oi', 0),
+                spot_price=pos.get('entry_spot', 0),
+            )
+
+            if reverse_pos:
+                # Telegram notification for reversal
+                try:
+                    from trade_notifier import send_message
+                    msg = (f"<b>REVERSAL TRADE</b>\n"
+                           f"Closed: {pos['signal_type']} {symbol}\n"
+                           f"Opened: {reverse_type} {symbol}\n"
+                           f"Reason: {exit_reason}\n"
+                           f"Strike: {pos['strike']:.0f}\n"
+                           f"Premium: Rs {pos['current_premium']:.2f}")
+                    send_message(msg)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"  Reversal failed for {pos['id']}: {e}")
+
     def check_exits(self):
-        """Check if any open positions should be exited."""
+        """Check if any open positions should be exited.
+        Now includes OI+IV dynamic exits with reversal capability.
+        """
         if not self.portfolio.positions:
             return
 
@@ -1184,25 +1388,51 @@ class PaperTrader:
 
             T = max(pos['dte'] - 0.5, 0.01) / 365
 
-            # FIX: Compute IV from historical data (same method as entry)
-            # pos['iv'] was stored as percentage (15.0) but that's just BS default,
-            # not the actual IV used in signal generation. Use historical HV instead.
             df = self.engine.historical_data.get(symbol)
             if df is not None and len(df) > 20:
                 log_ret = np.log(df['Close'] / df['Close'].shift(1))
                 hv = log_ret.tail(20).std() * np.sqrt(252)
                 iv = max(min(hv * 1.15, 0.60), 0.08)
             else:
-                iv = pos['iv'] / 100  # fallback
+                iv = pos['iv'] / 100
 
-            # Recalculate premium with proper IV
             opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
             current_g = bs_greeks(spot, pos['strike'], T, RISK_FREE_RATE, iv, opt_type)
             current_premium = current_g['price']
 
+            # Update position Greeks
+            pos['gamma'] = round(current_g.get('gamma', pos.get('gamma', 0)), 6)
+            pos['delta'] = round(current_g.get('delta', pos.get('delta', 0)), 4)
+
             self.portfolio.update_position(pos['id'], current_premium)
 
-            # Check exit conditions
+            # ---- OI+IV DYNAMIC EXIT CHECK (runs BEFORE static exit) ----
+            oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current_premium)
+            if oi_iv_reason:
+                self.portfolio.close_position(pos['id'], current_premium, oi_iv_reason)
+                # Telegram notification
+                try:
+                    from trade_notifier import notify_trade_exit
+                    lot_size = LOT_SIZES.get(symbol, 50)
+                    capital = pos['entry_premium'] * lot_size
+                    pnl = pos.get('unrealized_pnl', 0)
+                    notify_trade_exit(
+                        market="EQUITY", strategy=pos['strategy'],
+                        symbol=symbol, signal_type=pos['signal_type'],
+                        strike=pos['strike'], entry_price=pos['entry_premium'],
+                        exit_price=current_premium, entry_time=pos['timestamp'],
+                        pnl=pnl, capital_used=capital,
+                        exit_reason=oi_iv_reason,
+                    )
+                except Exception as e:
+                    logger.warning(f"  Telegram exit notify failed: {e}")
+
+                # Execute reversal if triggered
+                if should_reverse:
+                    self.execute_reversal(pos, oi_iv_reason)
+                continue  # Skip static exit check for this position
+
+            # ---- STATIC EXIT CHECK (original logic) ----
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
             target = details.get('target', pos['entry_premium'] * 2)
             sl = details.get('sl', pos['entry_premium'] * 0.3)
@@ -1210,7 +1440,6 @@ class PaperTrader:
             exit_reason = None
 
             if pos['is_sell']:
-                # For sellers: profit when premium drops, loss when it rises
                 if current_premium <= target:
                     exit_reason = 'TARGET_HIT'
                 elif current_premium >= sl:
@@ -1218,7 +1447,6 @@ class PaperTrader:
                 elif pos['dte'] <= 0:
                     exit_reason = 'EXPIRY'
             else:
-                # For buyers: profit when premium rises, loss when it drops
                 if current_premium >= target:
                     exit_reason = 'TARGET_HIT'
                 elif current_premium <= sl:
@@ -1228,7 +1456,6 @@ class PaperTrader:
 
             if exit_reason:
                 self.portfolio.close_position(pos['id'], current_premium, exit_reason)
-                # Send Telegram exit notification
                 try:
                     from trade_notifier import notify_trade_exit
                     lot_size = LOT_SIZES.get(symbol, 50)

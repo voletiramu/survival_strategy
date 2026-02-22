@@ -45,7 +45,7 @@ EQUITY_OPEN = dtime(9, 15)
 EQUITY_CLOSE = dtime(15, 30)
 MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)
-COMMODITY_TRADE_START = dtime(15, 30)  # Commodity trades only after 3:30 PM (equity close)
+COMMODITY_TRADE_START = dtime(9, 15)  # Commodity trades from 9:15 AM (no time barrier)
 
 
 def print_banner():
@@ -194,7 +194,7 @@ def reset_all():
     except Exception as e:
         print(f"  Commodity reset error: {e}")
 
-    print("  Total starting capital: Rs 6,00,000 (Rs 3L equity + Rs 3L commodity)")
+    print("  Total starting capital: Rs 3,00,000 (Rs 2L equity + Rs 1L commodity)")
 
 
 def run_continuous(interval=5, offline=False):
@@ -274,12 +274,32 @@ def run_continuous(interval=5, offline=False):
         except Exception as e:
             logger.error(f"  Crypto scan error: {e}")
 
-        # Push active trades to Telegram every 6th scan (~30 min)
+        # Push active trades + heartbeat to Telegram every 6th scan (~30 min)
         if scan_count % 6 == 0:
             try:
-                from trade_notifier import notify_active_trades
+                from trade_notifier import notify_active_trades, send_message
                 notify_active_trades()
-                logger.info("  Active trades pushed to Telegram")
+                # Heartbeat message
+                eq_count = 0
+                comm_count = 0
+                try:
+                    from paper_trader import PaperPortfolio
+                    eq_port = PaperPortfolio()
+                    eq_count = len(eq_port.positions)
+                except Exception:
+                    pass
+                try:
+                    from commodity_paper_trader import CommodityPortfolio
+                    comm_port = CommodityPortfolio()
+                    comm_count = len(comm_port.positions)
+                except Exception:
+                    pass
+                heartbeat = (f"HEARTBEAT | {now.strftime('%H:%M')}\n"
+                           f"Equity: {eq_count} positions\n"
+                           f"Commodity: {comm_count} positions\n"
+                           f"Scans: {scan_count}")
+                send_message(heartbeat)
+                logger.info("  Heartbeat + active trades pushed to Telegram")
             except Exception as e:
                 logger.warning(f"  Telegram active trades push failed: {e}")
 
