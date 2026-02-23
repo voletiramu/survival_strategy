@@ -1,17 +1,20 @@
 """
-UNIFIED PAPER TRADING LAUNCHER
-================================
-Runs BOTH equity index AND commodity options paper trading simultaneously.
+UNIFIED PAPER TRADING LAUNCHER (Threaded)
+==========================================
+Runs equity, commodity, and crypto paper trading in SEPARATE THREADS
+with independent scan intervals.
 
-Equity:   NIFTY, BANKNIFTY, SENSEX     (9:15 AM - 3:30 PM)
-Commodity: Gold Mini, Silver Mini, Crude Oil Mini  (9:00 AM - 11:30 PM)
+Equity:    NIFTY, BANKNIFTY, SENSEX          every 45 seconds (9:15-15:30)
+Commodity: Gold Mini, Silver Mini, Crude Oil  every 30 seconds (9:00-23:30)
+Crypto:    BTC, ETH, SOL                      every 5 minutes  (24/7)
 
 Usage:
-    python run_paper_trade.py              # Run both systems live
-    python run_paper_trade.py --once       # Single scan both
-    python run_paper_trade.py --offline    # Offline test both
-    python run_paper_trade.py --status     # Show both portfolios
-    python run_paper_trade.py --reset      # Reset both portfolios
+    python run_paper_trade.py                   # Run all systems (threaded)
+    python run_paper_trade.py --once            # Single scan both
+    python run_paper_trade.py --offline         # Offline test both
+    python run_paper_trade.py --status          # Show both portfolios
+    python run_paper_trade.py --reset           # Reset both portfolios
+    python run_paper_trade.py --equity-interval 0.75 --commodity-interval 0.5
 """
 
 import sys
@@ -21,6 +24,7 @@ import signal
 import logging
 import argparse
 import threading
+import json
 from datetime import datetime, time as dtime
 
 sys.stdout.reconfigure(line_buffering=True, encoding='utf-8', errors='replace')
@@ -32,7 +36,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 today_str = datetime.now().strftime('%Y%m%d')
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format='%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s',
     handlers=[
         logging.FileHandler(os.path.join(LOG_DIR, f'unified_paper_{today_str}.log')),
         logging.StreamHandler(sys.stdout)
@@ -47,33 +51,37 @@ MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)
 COMMODITY_TRADE_START = dtime(9, 15)  # Commodity trades from 9:15 AM (no time barrier)
 
+# Default scan intervals (seconds)
+DEFAULT_EQUITY_INTERVAL = 45    # 45 seconds for NIFTY, BANKNIFTY, SENSEX
+DEFAULT_COMMODITY_INTERVAL = 30  # 30 seconds for GOLDM, SILVERM, CRUDEOILM
+DEFAULT_CRYPTO_INTERVAL = 300    # 5 minutes for BTC, ETH, SOL
+
 
 def print_banner():
     print("\n" + "=" * 70)
-    print("  UNIFIED ALGO TRADING - PAPER TRADING SYSTEM")
+    print("  UNIFIED ALGO TRADING - PAPER TRADING SYSTEM (Threaded)")
     print("  " + "-" * 64)
     print("  EQUITY:     NIFTY | BANKNIFTY | SENSEX")
     print("              Strategies: CPR, Gamma Blast, Ghost Zone, PCR+VWAP, Survivor")
-    print("              Hours: 9:15 AM - 3:30 PM IST")
+    print(f"              Scan: Every {DEFAULT_EQUITY_INTERVAL}s | Hours: 9:15 AM - 3:30 PM IST")
     print("  " + "-" * 64)
     print("  COMMODITY:  Gold Mini | Silver Mini | Crude Oil Mini")
     print("              Strategies: CPR, Gamma Blast, Ghost Zone")
-    print("              Hours: 9:00 AM - 11:30 PM IST")
+    print(f"              Scan: Every {DEFAULT_COMMODITY_INTERVAL}s | Hours: 9:00 AM - 11:30 PM IST")
     print("  " + "-" * 64)
-    print(f"  Capital: Rs 3,00,000 each | Angel One SmartAPI")
+    print("  CRYPTO:     BTC | ETH | SOL (24/7)")
+    print("  " + "-" * 64)
+    print(f"  Capital: Rs 3,00,000 (Rs 2L equity + Rs 1L commodity)")
     print("=" * 70 + "\n")
 
 
 def run_equity_scan(offline=False):
-    """Run equity paper trading scan."""
+    """Run equity paper trading scan (creates new trader each call - for --once mode)."""
     try:
-        # Import here to avoid circular imports
         sys.path.insert(0, BASE_DIR)
         from paper_trader import PaperTrader
 
-        logger.info("\n" + "=" * 70)
-        logger.info("EQUITY INDEX SCAN")
-        logger.info("=" * 70)
+        logger.info("=" * 50 + " EQUITY INDEX SCAN " + "=" * 50)
 
         trader = PaperTrader()
         for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
@@ -94,14 +102,12 @@ def run_equity_scan(offline=False):
 
 
 def run_commodity_scan(offline=False):
-    """Run commodity paper trading scan."""
+    """Run commodity paper trading scan (creates new trader each call - for --once mode)."""
     try:
         sys.path.insert(0, BASE_DIR)
         from commodity_paper_trader import CommodityPaperTrader, PAPER_TRADE_COMMODITIES
 
-        logger.info("\n" + "=" * 70)
-        logger.info("COMMODITY MCX SCAN")
-        logger.info("=" * 70)
+        logger.info("=" * 50 + " COMMODITY MCX SCAN " + "=" * 50)
 
         trader = CommodityPaperTrader()
         for comm in PAPER_TRADE_COMMODITIES:
@@ -121,9 +127,184 @@ def run_commodity_scan(offline=False):
         return None
 
 
+# ====================================================================
+# THREADED LOOP FUNCTIONS
+# ====================================================================
+
+def equity_loop(interval_sec=45, offline=False, stop_event=None):
+    """Equity scanning thread: NIFTY, BANKNIFTY, SENSEX every 45 seconds.
+    Creates ONE PaperTrader instance and reuses it across scans.
+    """
+    logger.info(f"[EquityThread] Starting | Interval: {interval_sec}s | Hours: {EQUITY_OPEN}-{EQUITY_CLOSE}")
+
+    try:
+        sys.path.insert(0, BASE_DIR)
+        from paper_trader import PaperTrader
+
+        trader = PaperTrader()
+        for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+            trader.engine.load_historical(symbol)
+
+        if not offline:
+            if not trader.connect():
+                logger.warning("[EquityThread] Angel API failed, using offline data")
+
+        scan_count = 0
+
+        while not stop_event.is_set():
+            now = datetime.now()
+            current_time = now.time()
+            is_weekday = now.weekday() <= 4
+            equity_open = EQUITY_OPEN <= current_time <= EQUITY_CLOSE and is_weekday
+
+            if equity_open:
+                scan_count += 1
+                logger.info(f"[EquityThread] Scan #{scan_count} | {now.strftime('%H:%M:%S')}")
+                try:
+                    trader.run_once()
+                except Exception as e:
+                    logger.error(f"[EquityThread] Scan error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            elif current_time > EQUITY_CLOSE and is_weekday:
+                logger.info("[EquityThread] Equity market closed for today.")
+                break
+            elif not is_weekday:
+                logger.info("[EquityThread] Weekend - equity market closed. Waiting...")
+
+            stop_event.wait(interval_sec)
+
+    except Exception as e:
+        logger.error(f"[EquityThread] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    logger.info(f"[EquityThread] Exited after {scan_count if 'scan_count' in dir() else 0} scans")
+
+
+def commodity_loop(interval_sec=30, offline=False, stop_event=None):
+    """Commodity scanning thread: GOLDM, SILVERM, CRUDEOILM every 30 seconds.
+    Creates ONE CommodityPaperTrader instance and reuses it across scans.
+    """
+    logger.info(f"[CommodityThread] Starting | Interval: {interval_sec}s | Hours: {MCX_OPEN}-{MCX_CLOSE}")
+
+    try:
+        sys.path.insert(0, BASE_DIR)
+        from commodity_paper_trader import CommodityPaperTrader, PAPER_TRADE_COMMODITIES
+
+        trader = CommodityPaperTrader()
+        for comm in PAPER_TRADE_COMMODITIES:
+            trader.engine.load_historical(comm)
+
+        if not offline:
+            if not trader.connect():
+                logger.warning("[CommodityThread] Angel API failed, using offline data")
+
+        scan_count = 0
+
+        while not stop_event.is_set():
+            now = datetime.now()
+            current_time = now.time()
+            is_weekday = now.weekday() <= 4
+            mcx_open = MCX_OPEN <= current_time <= MCX_CLOSE and is_weekday
+            commodity_trade_ok = current_time >= COMMODITY_TRADE_START
+
+            if mcx_open and commodity_trade_ok:
+                scan_count += 1
+                logger.info(f"[CommodityThread] Scan #{scan_count} | {now.strftime('%H:%M:%S')}")
+                try:
+                    trader.run_once()
+                except Exception as e:
+                    logger.error(f"[CommodityThread] Scan error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            elif mcx_open and not commodity_trade_ok:
+                logger.info(f"[CommodityThread] MCX open but trades blocked until {COMMODITY_TRADE_START}")
+            elif current_time > MCX_CLOSE and is_weekday:
+                logger.info("[CommodityThread] MCX closed for today.")
+                break
+            elif not is_weekday:
+                logger.info("[CommodityThread] Weekend - MCX closed. Waiting...")
+
+            stop_event.wait(interval_sec)
+
+    except Exception as e:
+        logger.error(f"[CommodityThread] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    logger.info(f"[CommodityThread] Exited after {scan_count if 'scan_count' in dir() else 0} scans")
+
+
+def crypto_loop(interval_sec=300, stop_event=None):
+    """Crypto scanning thread: 24/7, every 5 minutes."""
+    logger.info(f"[CryptoThread] Starting | Interval: {interval_sec}s | 24/7")
+
+    scan_count = 0
+
+    while not stop_event.is_set():
+        scan_count += 1
+        try:
+            from crypto_paper_trader import CryptoPortfolio, run_scan as run_crypto_scan
+            logger.info(f"[CryptoThread] Scan #{scan_count} | {datetime.now().strftime('%H:%M:%S')}")
+            crypto_portfolio = CryptoPortfolio()
+            run_crypto_scan(crypto_portfolio)
+        except Exception as e:
+            logger.error(f"[CryptoThread] Scan error: {e}")
+
+        stop_event.wait(interval_sec)
+
+    logger.info(f"[CryptoThread] Exited after {scan_count} scans")
+
+
+def _send_heartbeat():
+    """Send heartbeat + active trades to Telegram."""
+    try:
+        from trade_notifier import notify_active_trades, send_message
+        notify_active_trades()
+
+        # Get position counts and capital
+        eq_count = 0
+        eq_capital = 200000
+        comm_count = 0
+        comm_capital = 100000
+
+        try:
+            from paper_trader import PaperPortfolio
+            eq_port = PaperPortfolio()
+            eq_count = len(eq_port.positions)
+            eq_capital = eq_port.capital
+        except Exception:
+            pass
+
+        try:
+            from commodity_paper_trader import CommodityPortfolio
+            comm_port = CommodityPortfolio()
+            comm_count = len(comm_port.positions)
+            comm_capital = comm_port.capital
+        except Exception:
+            pass
+
+        now = datetime.now()
+        heartbeat = (
+            f"<b>HEARTBEAT</b> | {now.strftime('%H:%M')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Equity: {eq_count} positions | Capital: Rs {eq_capital:,.0f}\n"
+            f"Commodity: {comm_count} positions | Capital: Rs {comm_capital:,.0f}\n"
+            f"Total Capital: Rs {eq_capital + comm_capital:,.0f}"
+        )
+        send_message(heartbeat)
+        logger.info("Heartbeat + active trades pushed to Telegram")
+    except Exception as e:
+        logger.warning(f"Telegram heartbeat failed: {e}")
+
+
 def show_combined_status():
     """Show both equity and commodity portfolio status."""
     print_banner()
+
+    eq_port = None
+    comm_port = None
 
     # Equity status
     try:
@@ -143,10 +324,10 @@ def show_combined_status():
 
     # Combined summary
     try:
-        eq_capital = eq_port.capital if eq_port else 300000
-        comm_capital = comm_port.capital if comm_port else 300000
+        eq_capital = eq_port.capital if eq_port else 200000
+        comm_capital = comm_port.capital if comm_port else 100000
         total_capital = eq_capital + comm_capital
-        total_initial = 600000  # 3L each
+        total_initial = 300000  # Rs 3L total (2L equity + 1L commodity)
         total_return = (total_capital - total_initial) / total_initial * 100
 
         eq_trades = len(eq_port.closed_trades) if eq_port else 0
@@ -179,46 +360,47 @@ def reset_all():
     try:
         from paper_trader import PaperPortfolio
         eq = PaperPortfolio()
-        eq.capital = 300000; eq.positions = []; eq.closed_trades = []; eq.daily_pnl = {}
+        eq.capital = 200000; eq.positions = []; eq.closed_trades = []; eq.daily_pnl = {}
         eq.save_state()
-        print("  Equity portfolio reset to Rs 3,00,000")
+        print("  Equity portfolio reset to Rs 2,00,000")
     except Exception as e:
         print(f"  Equity reset error: {e}")
 
     try:
         from commodity_paper_trader import CommodityPortfolio
         comm = CommodityPortfolio()
-        comm.capital = 300000; comm.positions = []; comm.closed_trades = []; comm.daily_pnl = {}
+        comm.capital = 100000; comm.positions = []; comm.closed_trades = []; comm.daily_pnl = {}
         comm.save_state()
-        print("  Commodity portfolio reset to Rs 3,00,000")
+        print("  Commodity portfolio reset to Rs 1,00,000")
     except Exception as e:
         print(f"  Commodity reset error: {e}")
 
     print("  Total starting capital: Rs 3,00,000 (Rs 2L equity + Rs 1L commodity)")
 
 
-def run_continuous(interval=5, offline=False):
-    """Run both systems continuously with proper market hour handling."""
-    running = True
+# ====================================================================
+# MAIN CONTINUOUS RUNNER (Threaded)
+# ====================================================================
+
+def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=300, offline=False):
+    """Run all systems in SEPARATE THREADS with independent scan intervals.
+
+    Args:
+        equity_interval: Seconds between equity scans (default 45)
+        commodity_interval: Seconds between commodity scans (default 30)
+        crypto_interval: Seconds between crypto scans (default 300)
+        offline: If True, don't connect to Angel API
+    """
+    stop_event = threading.Event()
 
     def signal_handler(sig, frame):
-        nonlocal running
-        logger.info("\nShutting down paper trading...")
-        running = False
+        logger.info("\n" + "=" * 70)
+        logger.info("SHUTDOWN SIGNAL RECEIVED - stopping all threads...")
+        logger.info("=" * 70)
+        stop_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)
-
-    # Track API connections
-    equity_trader = None
-    commodity_trader = None
-    equity_connected = False
-    commodity_connected = False
-
-    logger.info(f"Scanning every {interval} minutes")
-    logger.info(f"Equity hours:    9:15 AM - 3:30 PM")
-    logger.info(f"Commodity hours: 9:00 AM - 11:30 PM")
-    logger.info(f"Crypto:          24/7 (BTCUSDT, ETHUSDT, SOLUSDT)")
-    logger.info(f"Press Ctrl+C to stop\n")
+    signal.signal(signal.SIGTERM, signal_handler)
 
     # Send Telegram startup notification
     try:
@@ -227,124 +409,101 @@ def run_continuous(interval=5, offline=False):
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
 
-    scan_count = 0
+    logger.info("=" * 70)
+    logger.info("THREADED PAPER TRADING SYSTEM STARTING")
+    logger.info("=" * 70)
+    logger.info(f"  Equity interval:    {equity_interval}s ({equity_interval/60:.1f} min)")
+    logger.info(f"  Commodity interval: {commodity_interval}s ({commodity_interval/60:.1f} min)")
+    logger.info(f"  Crypto interval:    {crypto_interval}s ({crypto_interval/60:.1f} min)")
+    logger.info(f"  Equity hours:       {EQUITY_OPEN} - {EQUITY_CLOSE}")
+    logger.info(f"  Commodity hours:    {MCX_OPEN} - {MCX_CLOSE}")
+    logger.info(f"  Crypto hours:       24/7")
+    logger.info(f"  Capital:            Rs 2,00,000 (equity) + Rs 1,00,000 (commodity)")
+    logger.info(f"  Press Ctrl+C to stop")
+    logger.info("=" * 70 + "\n")
 
-    while running:
-        now = datetime.now()
-        current_time = now.time()
-        scan_count += 1
+    # Create threads
+    t_equity = threading.Thread(
+        target=equity_loop,
+        args=(equity_interval, offline, stop_event),
+        name="EquityThread",
+        daemon=True
+    )
 
-        logger.info(f"\n{'#'*70}")
-        logger.info(f"SCAN #{scan_count} | {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"{'#'*70}")
+    t_commodity = threading.Thread(
+        target=commodity_loop,
+        args=(commodity_interval, offline, stop_event),
+        name="CommodityThread",
+        daemon=True
+    )
 
-        # Check if equity market is open
-        equity_open = EQUITY_OPEN <= current_time <= EQUITY_CLOSE
-        # Check if MCX is open
-        mcx_open = MCX_OPEN <= current_time <= MCX_CLOSE
+    t_crypto = threading.Thread(
+        target=crypto_loop,
+        args=(crypto_interval, stop_event),
+        name="CryptoThread",
+        daemon=True
+    )
 
-        if now.weekday() > 4:  # Saturday/Sunday
-            equity_open = False
-            mcx_open = False
-            logger.info("Weekend - markets closed")
+    threads = [t_equity, t_commodity, t_crypto]
 
-        # Run equity scan if market open
-        if equity_open:
-            logger.info(f"  Equity market: OPEN")
-            run_equity_scan(offline)
-        else:
-            logger.info(f"  Equity market: CLOSED ({EQUITY_OPEN}-{EQUITY_CLOSE})")
+    # Start all threads
+    for t in threads:
+        t.start()
+        logger.info(f"  Started thread: {t.name}")
 
-        # Run commodity scan if MCX open AND after 14:30
-        commodity_trade_ok = current_time >= COMMODITY_TRADE_START
-        if mcx_open and commodity_trade_ok:
-            logger.info(f"  MCX market: OPEN (trades active after {COMMODITY_TRADE_START})")
-            run_commodity_scan(offline)
-        elif mcx_open and not commodity_trade_ok:
-            logger.info(f"  MCX: OPEN but trades blocked until {COMMODITY_TRADE_START}")
-        else:
-            logger.info(f"  MCX market: CLOSED ({MCX_OPEN}-{MCX_CLOSE})")
+    # Main thread: heartbeat + monitor
+    heartbeat_interval = 1800  # 30 minutes
+    while not stop_event.is_set():
+        stop_event.wait(heartbeat_interval)
+        if not stop_event.is_set():
+            _send_heartbeat()
 
-        # Run crypto scan (24/7, always runs)
-        try:
-            from crypto_paper_trader import CryptoPortfolio, run_scan as run_crypto_scan
-            logger.info(f"  Crypto market: ALWAYS OPEN (24/7)")
-            crypto_portfolio = CryptoPortfolio()
-            run_crypto_scan(crypto_portfolio)
-        except Exception as e:
-            logger.error(f"  Crypto scan error: {e}")
+            # Check if both market threads have exited (market closed)
+            if not t_equity.is_alive() and not t_commodity.is_alive():
+                logger.info("All market threads finished for today. Shutting down.")
 
-        # Push active trades + heartbeat to Telegram every 6th scan (~30 min)
-        if scan_count % 6 == 0:
-            try:
-                from trade_notifier import notify_active_trades, send_message
-                notify_active_trades()
-                # Heartbeat message
-                eq_count = 0
-                comm_count = 0
+                # Save end-of-day report
                 try:
-                    from paper_trader import PaperPortfolio
-                    eq_port = PaperPortfolio()
-                    eq_count = len(eq_port.positions)
+                    now = datetime.now()
+                    report = {
+                        'date': now.strftime('%Y-%m-%d'),
+                        'timestamp': now.isoformat(),
+                    }
+                    report_file = os.path.join(LOG_DIR, f'eod_report_{today_str}.json')
+                    with open(report_file, 'w') as f:
+                        json.dump(report, f, indent=2)
+                    logger.info(f"EOD report saved: {report_file}")
                 except Exception:
                     pass
-                try:
-                    from commodity_paper_trader import CommodityPortfolio
-                    comm_port = CommodityPortfolio()
-                    comm_count = len(comm_port.positions)
-                except Exception:
-                    pass
-                heartbeat = (f"HEARTBEAT | {now.strftime('%H:%M')}\n"
-                           f"Equity: {eq_count} positions\n"
-                           f"Commodity: {comm_count} positions\n"
-                           f"Scans: {scan_count}")
-                send_message(heartbeat)
-                logger.info("  Heartbeat + active trades pushed to Telegram")
-            except Exception as e:
-                logger.warning(f"  Telegram active trades push failed: {e}")
 
-        # If both markets closed and it's past MCX close, stop
-        if not equity_open and not mcx_open and current_time > MCX_CLOSE:
-            logger.info("\nAll markets closed for today.")
-            show_combined_status()
+                stop_event.set()
 
-            # Save end-of-day report
-            try:
-                import json
-                report = {
-                    'date': now.strftime('%Y-%m-%d'),
-                    'scans': scan_count,
-                    'timestamp': now.isoformat(),
-                }
-                report_file = os.path.join(LOG_DIR, f'eod_report_{today_str}.json')
-                with open(report_file, 'w') as f:
-                    json.dump(report, f, indent=2)
-                logger.info(f"EOD report saved: {report_file}")
-            except Exception:
-                pass
-            break
+    # Wait for threads to finish
+    for t in threads:
+        t.join(timeout=10)
+        if t.is_alive():
+            logger.warning(f"  Thread {t.name} did not exit cleanly")
+        else:
+            logger.info(f"  Thread {t.name} exited")
 
-        # If no market is open yet, wait
-        if not equity_open and not mcx_open:
-            # Find next market open
-            if current_time < MCX_OPEN:
-                wait_secs = (datetime.combine(now.date(), MCX_OPEN) - now).total_seconds()
-                logger.info(f"  Waiting {wait_secs/60:.0f} min for MCX to open...")
-                time.sleep(min(wait_secs, interval * 60))
-                continue
-
-        # Normal interval wait
-        logger.info(f"\n  Next scan in {interval} minutes...")
-        time.sleep(interval * 60)
+    show_combined_status()
+    logger.info("Paper trading system shut down cleanly.")
 
 
 def main():
     print_banner()
 
-    parser = argparse.ArgumentParser(description='Unified Paper Trading System')
+    parser = argparse.ArgumentParser(description='Unified Paper Trading System (Threaded)')
     parser.add_argument('--status', action='store_true', help='Show both portfolio status')
     parser.add_argument('--once', action='store_true', help='Single scan both markets')
-    parser.add_argument('--interval', type=int, default=5, help='Scan interval (minutes)')
+    parser.add_argument('--interval', type=float, default=None,
+                        help='Legacy: set ALL intervals (minutes). Overridden by per-market args.')
+    parser.add_argument('--equity-interval', type=float, default=0.75,
+                        help='Equity scan interval in minutes (default: 0.75 = 45s)')
+    parser.add_argument('--commodity-interval', type=float, default=0.5,
+                        help='Commodity scan interval in minutes (default: 0.5 = 30s)')
+    parser.add_argument('--crypto-interval', type=float, default=5,
+                        help='Crypto scan interval in minutes (default: 5)')
     parser.add_argument('--offline', action='store_true', help='Run offline (no API)')
     parser.add_argument('--reset', action='store_true', help='Reset both portfolios')
     parser.add_argument('--equity-only', action='store_true', help='Only run equity')
@@ -387,8 +546,18 @@ def main():
         show_combined_status()
         return
 
-    # Continuous mode
-    run_continuous(args.interval, args.offline)
+    # Continuous mode — threaded
+    # If legacy --interval is provided, use it for all
+    if args.interval is not None:
+        eq_sec = int(args.interval * 60)
+        comm_sec = int(args.interval * 60)
+        crypto_sec = int(args.interval * 60)
+    else:
+        eq_sec = int(args.equity_interval * 60)
+        comm_sec = int(args.commodity_interval * 60)
+        crypto_sec = int(args.crypto_interval * 60)
+
+    run_continuous(eq_sec, comm_sec, crypto_sec, args.offline)
 
 
 if __name__ == '__main__':

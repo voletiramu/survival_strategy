@@ -102,9 +102,9 @@ MCX_GST = 0.18
 # MCX Market hours (extended)
 MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)  # 11:30 PM
-COMMODITY_TRADE_START = dtime(15, 30)  # Trade only after 3:30 PM (equity close)
+COMMODITY_TRADE_START = dtime(9, 15)  # Commodity trades from 9:15 AM (no time barrier)
 
-ANGEL_CRED_FILE = r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt"
+ANGEL_CRED_FILE = os.environ.get('ANGEL_CRED_FILE', r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt")
 
 # Logging
 today_str = datetime.now().strftime('%Y%m%d')
@@ -703,6 +703,12 @@ class CommodityPaperTrader:
                 from trade_notifier import notify_trade_entry
                 spec = COMMODITIES[sig['commodity']]
                 capital = sig['premium'] * spec['lot_size'] * spec['multiplier']
+                # Calculate available capital for Telegram message
+                locked = sum(
+                    p['entry_premium'] * COMMODITIES[p['commodity']]['lot_size'] * COMMODITIES[p['commodity']]['multiplier']
+                    for p in self.portfolio.positions
+                )
+                capital_available = self.portfolio.capital - locked
                 notify_trade_entry(
                     market="COMMODITY", strategy=sig['strategy'],
                     symbol=sig['commodity'], signal_type=sig['type'],
@@ -711,6 +717,7 @@ class CommodityPaperTrader:
                     multiplier=spec['multiplier'], delta=sig['greeks'].get('delta', 0),
                     target=sig.get('target', 0), sl=sig.get('sl', 0),
                     capital_used=capital, reason=sig['reason'],
+                    capital_available=capital_available,
                 )
             except Exception as e:
                 logger.warning(f"  Telegram notify failed: {e}")
@@ -778,6 +785,12 @@ class CommodityPaperTrader:
                     from trade_notifier import notify_trade_exit
                     spec = COMMODITIES[commodity]
                     capital = pos['entry_premium'] * spec['lot_size'] * spec['multiplier']
+                    # Capital available AFTER closing this position
+                    locked = sum(
+                        p['entry_premium'] * COMMODITIES[p['commodity']]['lot_size'] * COMMODITIES[p['commodity']]['multiplier']
+                        for p in self.portfolio.positions
+                    )
+                    capital_available = self.portfolio.capital - locked
                     notify_trade_exit(
                         market="COMMODITY", strategy=pos['strategy'],
                         symbol=commodity, signal_type=pos['signal_type'],
@@ -785,6 +798,7 @@ class CommodityPaperTrader:
                         exit_price=current, entry_time=pos['timestamp'],
                         pnl=pos['unrealized_pnl'], capital_used=capital,
                         exit_reason=exit_reason,
+                        capital_available=capital_available,
                     )
                 except Exception as e:
                     logger.warning(f"  Telegram exit notify failed: {e}")

@@ -58,11 +58,16 @@ def send_message(text, parse_mode="HTML"):
 
 
 def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_price,
-                       spot, lot_size, multiplier, delta, target, sl, capital_used, reason):
+                       spot, lot_size, multiplier, delta, target, sl, capital_used, reason,
+                       capital_available=None):
     """Send notification when a new trade is entered."""
     direction = "BUY" if "BUY" in signal_type else "SELL"
     opt_type = "CE" if "CE" in signal_type else "PE"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    capital_line = ""
+    if capital_available is not None:
+        capital_line = f"<b>💰 Capital Available:</b> ₹{capital_available:,.2f}\n"
 
     msg = (
         f"<b>{'🟢' if 'CE' in signal_type else '🔴'} TRADE ENTRY</b>\n"
@@ -78,6 +83,7 @@ def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_pric
         f"<b>Target:</b> ₹{target:,.2f}\n"
         f"<b>Stop Loss:</b> ₹{sl:,.2f}\n"
         f"<b>Capital Used:</b> ₹{capital_used:,.2f}\n"
+        f"{capital_line}"
         f"<b>Entry Time:</b> {now}\n"
         f"<b>Reason:</b> {reason}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
@@ -87,13 +93,17 @@ def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_pric
 
 def notify_trade_exit(market, strategy, symbol, signal_type, strike,
                       entry_price, exit_price, entry_time, pnl,
-                      capital_used, exit_reason):
+                      capital_used, exit_reason, capital_available=None):
     """Send notification when a trade is exited."""
     opt_type = "CE" if "CE" in signal_type else "PE"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pnl_emoji = "💰" if pnl > 0 else "📉"
     pnl_pct = (pnl / capital_used * 100) if capital_used > 0 else 0
     final_amount = capital_used + pnl
+
+    capital_line = ""
+    if capital_available is not None:
+        capital_line = f"<b>💰 Capital Available:</b> ₹{capital_available:,.2f}\n"
 
     msg = (
         f"<b>{pnl_emoji} TRADE EXIT</b>\n"
@@ -108,6 +118,7 @@ def notify_trade_exit(market, strategy, symbol, signal_type, strike,
         f"<b>PnL:</b> ₹{pnl:,.2f} ({pnl_pct:+.1f}%)\n"
         f"<b>Initial Amount:</b> ₹{capital_used:,.2f}\n"
         f"<b>Final Amount:</b> ₹{final_amount:,.2f}\n"
+        f"{capital_line}"
         f"<b>Exit Reason:</b> {exit_reason}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
@@ -148,13 +159,14 @@ def notify_scanner_start():
     """Send notification when scanner starts."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     msg = (
-        f"<b>🚀 ALGO TRADING BOT STARTED</b>\n"
+        f"<b>🚀 ALGO TRADING BOT STARTED (Threaded)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Time:</b> {now}\n"
-        f"<b>Equity:</b> NIFTY, BANKNIFTY, SENSEX (9:15-15:30)\n"
-        f"<b>Commodity:</b> GOLDM, SILVERM, CRUDEOILM (15:30-23:30)\n"
+        f"<b>Equity:</b> NIFTY, BANKNIFTY, SENSEX (9:15-15:30) | Every 45s\n"
+        f"<b>Commodity:</b> GOLDM, SILVERM, CRUDEOILM (9:15-23:30) | Every 30s\n"
+        f"<b>Crypto:</b> BTC, ETH, SOL (24/7) | Every 5min\n"
         f"<b>Strategies:</b> CPR, Gamma Blast, Ghost Zone, PCR+VWAP, Survivor\n"
-        f"<b>Capital:</b> ₹3,00,000 Equity + ₹3,00,000 Commodity\n"
+        f"<b>Capital:</b> ₹2,00,000 Equity + ₹1,00,000 Commodity = ₹3,00,000\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     return send_message(msg)

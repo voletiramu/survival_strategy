@@ -38,7 +38,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LIVE_DATA_LOG = os.path.join(LOG_DIR, 'live_data_log.csv')
 TRADING_LOG = os.path.join(LOG_DIR, 'trading_log.csv')
 
-ANGEL_CRED_FILE = r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt"
+ANGEL_CRED_FILE = os.environ.get('ANGEL_CRED_FILE', r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt")
 
 # Market hours
 EQUITY_OPEN = dtime(9, 15)
