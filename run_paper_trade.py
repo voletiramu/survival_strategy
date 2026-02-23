@@ -56,6 +56,76 @@ DEFAULT_EQUITY_INTERVAL = 45    # 45 seconds for NIFTY, BANKNIFTY, SENSEX
 DEFAULT_COMMODITY_INTERVAL = 30  # 30 seconds for GOLDM, SILVERM, CRUDEOILM
 DEFAULT_CRYPTO_INTERVAL = 300    # 5 minutes for BTC, ETH, SOL
 
+# Instance identification & PID lock
+LOCK_DIR = os.path.join(BASE_DIR, 'locks')
+LOCK_FILE = os.path.join(LOCK_DIR, 'trading.pid')
+
+
+def acquire_lock(instance_id, force=False):
+    """Acquire PID lock file. Exits if another instance is running on this machine.
+
+    Args:
+        instance_id: 'local' or 'gcloud' (auto-detected from TRADING_INSTANCE env)
+        force: If True, override existing lock regardless
+    """
+    os.makedirs(LOCK_DIR, exist_ok=True)
+
+    if force and os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
+        logger.warning("Lock forcibly removed (--force flag)")
+
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                data = json.load(f)
+            old_pid = data.get('pid')
+            old_instance = data.get('instance', 'unknown')
+            # Check if the old process is still alive
+            try:
+                os.kill(old_pid, 0)  # Signal 0 = check existence, doesn't kill
+                # Process is alive — another instance is running on THIS machine
+                logger.error("=" * 70)
+                logger.error("ANOTHER INSTANCE ALREADY RUNNING on this machine!")
+                logger.error(f"  Instance: {old_instance}, PID: {old_pid}")
+                logger.error(f"  Started: {data.get('started', 'unknown')}")
+                logger.error(f"  Lock file: {LOCK_FILE}")
+                logger.error("  Use --force to override, or stop the other instance first.")
+                logger.error("=" * 70)
+                sys.exit(1)
+            except (OSError, ProcessLookupError):
+                # Process is dead — stale lock, safe to override
+                logger.warning(f"Stale lock found (PID {old_pid} dead). Overriding.")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            logger.warning("Corrupt lock file. Overriding.")
+
+    # Write new lock
+    lock_data = {
+        'pid': os.getpid(),
+        'instance': instance_id,
+        'started': datetime.now().isoformat(),
+    }
+    with open(LOCK_FILE, 'w') as f:
+        json.dump(lock_data, f, indent=2)
+    logger.info(f"Lock acquired: instance={instance_id}, PID={os.getpid()}")
+
+
+def release_lock():
+    """Remove PID lock file on shutdown."""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            logger.info("Lock released.")
+    except Exception as e:
+        logger.warning(f"Failed to release lock: {e}")
+
+
+def get_instance_label(instance_id):
+    """Get human-readable label for instance ID."""
+    if instance_id == 'gcloud':
+        return '☁️ GCloud VM'
+    else:
+        return '🖥️ Local Machine'
+
 
 def print_banner():
     print("\n" + "=" * 70)
@@ -257,7 +327,7 @@ def crypto_loop(interval_sec=300, stop_event=None):
     logger.info(f"[CryptoThread] Exited after {scan_count} scans")
 
 
-def _send_heartbeat():
+def _send_heartbeat(instance_id='local'):
     """Send heartbeat + active trades to Telegram."""
     try:
         from trade_notifier import notify_active_trades, send_message
@@ -286,9 +356,11 @@ def _send_heartbeat():
             pass
 
         now = datetime.now()
+        instance_label = get_instance_label(instance_id)
         heartbeat = (
-            f"<b>HEARTBEAT</b> | {now.strftime('%H:%M')}\n"
+            f"<b>💓 HEARTBEAT</b> | {now.strftime('%H:%M')}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📍 Running on:</b> {instance_label}\n"
             f"Equity: {eq_count} positions | Capital: Rs {eq_capital:,.0f}\n"
             f"Commodity: {comm_count} positions | Capital: Rs {comm_capital:,.0f}\n"
             f"Total Capital: Rs {eq_capital + comm_capital:,.0f}"
@@ -382,7 +454,8 @@ def reset_all():
 # MAIN CONTINUOUS RUNNER (Threaded)
 # ====================================================================
 
-def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=300, offline=False):
+def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=300,
+                   offline=False, instance_id='local', force=False):
     """Run all systems in SEPARATE THREADS with independent scan intervals.
 
     Args:
@@ -390,7 +463,12 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
         commodity_interval: Seconds between commodity scans (default 30)
         crypto_interval: Seconds between crypto scans (default 300)
         offline: If True, don't connect to Angel API
+        instance_id: 'local' or 'gcloud' (identifies this instance)
+        force: If True, override existing PID lock
     """
+    # Acquire PID lock — prevents duplicate instances on same machine
+    acquire_lock(instance_id, force=force)
+
     stop_event = threading.Event()
 
     def signal_handler(sig, frame):
@@ -402,16 +480,18 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Send Telegram startup notification
+    # Send Telegram startup notification with instance ID
+    instance_label = get_instance_label(instance_id)
     try:
         from trade_notifier import notify_scanner_start
-        notify_scanner_start()
+        notify_scanner_start(instance_id=instance_id)
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
 
     logger.info("=" * 70)
-    logger.info("THREADED PAPER TRADING SYSTEM STARTING")
+    logger.info(f"THREADED PAPER TRADING SYSTEM STARTING — {instance_label}")
     logger.info("=" * 70)
+    logger.info(f"  Instance:           {instance_id} ({instance_label})")
     logger.info(f"  Equity interval:    {equity_interval}s ({equity_interval/60:.1f} min)")
     logger.info(f"  Commodity interval: {commodity_interval}s ({commodity_interval/60:.1f} min)")
     logger.info(f"  Crypto interval:    {crypto_interval}s ({crypto_interval/60:.1f} min)")
@@ -419,6 +499,7 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
     logger.info(f"  Commodity hours:    {MCX_OPEN} - {MCX_CLOSE}")
     logger.info(f"  Crypto hours:       24/7")
     logger.info(f"  Capital:            Rs 2,00,000 (equity) + Rs 1,00,000 (commodity)")
+    logger.info(f"  PID:                {os.getpid()}")
     logger.info(f"  Press Ctrl+C to stop")
     logger.info("=" * 70 + "\n")
 
@@ -456,7 +537,7 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
     while not stop_event.is_set():
         stop_event.wait(heartbeat_interval)
         if not stop_event.is_set():
-            _send_heartbeat()
+            _send_heartbeat(instance_id)
 
             # Check if both market threads have exited (market closed)
             if not t_equity.is_alive() and not t_commodity.is_alive():
@@ -486,6 +567,9 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
         else:
             logger.info(f"  Thread {t.name} exited")
 
+    # Release PID lock
+    release_lock()
+
     show_combined_status()
     logger.info("Paper trading system shut down cleanly.")
 
@@ -508,7 +592,15 @@ def main():
     parser.add_argument('--reset', action='store_true', help='Reset both portfolios')
     parser.add_argument('--equity-only', action='store_true', help='Only run equity')
     parser.add_argument('--commodity-only', action='store_true', help='Only run commodity')
+    parser.add_argument('--instance', type=str, default=None,
+                        help='Instance ID (auto-detected: local/gcloud via TRADING_INSTANCE env)')
+    parser.add_argument('--force', action='store_true',
+                        help='Override existing PID lock (use if previous instance crashed)')
     args = parser.parse_args()
+
+    # Auto-detect instance ID: CLI arg > env var > default 'local'
+    instance_id = args.instance or os.environ.get('TRADING_INSTANCE', 'local')
+    instance_label = get_instance_label(instance_id)
 
     if args.reset:
         reset_all()
@@ -557,7 +649,8 @@ def main():
         comm_sec = int(args.commodity_interval * 60)
         crypto_sec = int(args.crypto_interval * 60)
 
-    run_continuous(eq_sec, comm_sec, crypto_sec, args.offline)
+    run_continuous(eq_sec, comm_sec, crypto_sec, args.offline,
+                   instance_id=instance_id, force=args.force)
 
 
 if __name__ == '__main__':

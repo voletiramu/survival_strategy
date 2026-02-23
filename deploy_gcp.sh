@@ -114,6 +114,7 @@ Restart=always
 RestartSec=30
 Environment=TZ=Asia/Kolkata
 Environment=ANGEL_CRED_FILE=/home/ram/angel_creds.txt
+Environment=TRADING_INSTANCE=gcloud
 StandardOutput=append:/var/log/algo-trading.log
 StandardError=append:/var/log/algo-trading-error.log
 MemoryMax=1500M

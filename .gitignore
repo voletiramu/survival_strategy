@@ -24,6 +24,9 @@ logs/
 # Paper trading state (local only)
 paper_trades/portfolio_state.json
 
+# Instance lock files
+locks/
+
 # IDE
 .vscode/
 .idea/

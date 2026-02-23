@@ -59,7 +59,7 @@ def send_message(text, parse_mode="HTML"):
 
 def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_price,
                        spot, lot_size, multiplier, delta, target, sl, capital_used, reason,
-                       capital_available=None):
+                       capital_available=None, instance_id=None):
     """Send notification when a new trade is entered."""
     direction = "BUY" if "BUY" in signal_type else "SELL"
     opt_type = "CE" if "CE" in signal_type else "PE"
@@ -69,9 +69,15 @@ def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_pric
     if capital_available is not None:
         capital_line = f"<b>💰 Capital Available:</b> ₹{capital_available:,.2f}\n"
 
+    instance_line = ""
+    if instance_id:
+        label = '☁️ GCloud VM' if instance_id == 'gcloud' else '🖥️ Local Machine'
+        instance_line = f"<b>📍 Instance:</b> {label}\n"
+
     msg = (
         f"<b>{'🟢' if 'CE' in signal_type else '🔴'} TRADE ENTRY</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{instance_line}"
         f"<b>Strategy:</b> {strategy}\n"
         f"<b>Symbol:</b> {symbol} {strike} {opt_type}\n"
         f"<b>Direction:</b> {direction}\n"
@@ -93,7 +99,8 @@ def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_pric
 
 def notify_trade_exit(market, strategy, symbol, signal_type, strike,
                       entry_price, exit_price, entry_time, pnl,
-                      capital_used, exit_reason, capital_available=None):
+                      capital_used, exit_reason, capital_available=None,
+                      instance_id=None):
     """Send notification when a trade is exited."""
     opt_type = "CE" if "CE" in signal_type else "PE"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -105,9 +112,15 @@ def notify_trade_exit(market, strategy, symbol, signal_type, strike,
     if capital_available is not None:
         capital_line = f"<b>💰 Capital Available:</b> ₹{capital_available:,.2f}\n"
 
+    instance_line = ""
+    if instance_id:
+        label = '☁️ GCloud VM' if instance_id == 'gcloud' else '🖥️ Local Machine'
+        instance_line = f"<b>📍 Instance:</b> {label}\n"
+
     msg = (
         f"<b>{pnl_emoji} TRADE EXIT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{instance_line}"
         f"<b>Strategy:</b> {strategy}\n"
         f"<b>Symbol:</b> {symbol} {strike} {opt_type}\n"
         f"<b>Market:</b> {market}\n"
@@ -155,13 +168,24 @@ def notify_daily_summary(equity_capital, equity_pnl, equity_positions, equity_cl
     return send_message(msg)
 
 
-def notify_scanner_start():
+def notify_scanner_start(instance_id=None):
     """Send notification when scanner starts."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if instance_id:
+        label = '☁️ GCloud VM' if instance_id == 'gcloud' else '🖥️ Local Machine'
+        instance_line = f"<b>📍 Running on:</b> {label}\n"
+        warning_line = f"⚠️ Ensure the other instance is STOPPED to avoid duplicate trades!\n"
+    else:
+        instance_line = ""
+        warning_line = ""
+
     msg = (
         f"<b>🚀 ALGO TRADING BOT STARTED (Threaded)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Time:</b> {now}\n"
+        f"{instance_line}"
+        f"{warning_line}"
         f"<b>Equity:</b> NIFTY, BANKNIFTY, SENSEX (9:15-15:30) | Every 45s\n"
         f"<b>Commodity:</b> GOLDM, SILVERM, CRUDEOILM (9:15-23:30) | Every 30s\n"
         f"<b>Crypto:</b> BTC, ETH, SOL (24/7) | Every 5min\n"
