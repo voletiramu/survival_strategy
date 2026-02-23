@@ -1204,9 +1204,10 @@ class PaperTrader:
                 from trade_notifier import notify_trade_entry
                 lot_size = LOT_SIZES.get(sig['symbol'], 50)
                 capital = sig['premium'] * lot_size
-                # Calculate available capital for Telegram message
+                # Calculate total invested and available capital for Telegram message
                 locked = sum(p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                              for p in self.portfolio.positions)
+                total_invested = locked
                 capital_available = self.portfolio.capital - locked
                 notify_trade_entry(
                     market="EQUITY", strategy=sig['strategy'],
@@ -1217,6 +1218,7 @@ class PaperTrader:
                     target=sig.get('target', 0), sl=sig.get('sl', 0),
                     capital_used=capital, reason=sig['reason'],
                     capital_available=capital_available,
+                    total_invested=total_invested,
                 )
             except Exception as e:
                 logger.warning(f"  Telegram notify failed: {e}")
@@ -1424,6 +1426,7 @@ class PaperTrader:
                     # Capital available AFTER closing this position
                     locked = sum(p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                                  for p in self.portfolio.positions)
+                    total_invested = locked
                     capital_available = self.portfolio.capital - locked
                     notify_trade_exit(
                         market="EQUITY", strategy=pos['strategy'],
@@ -1433,6 +1436,7 @@ class PaperTrader:
                         pnl=pnl, capital_used=capital,
                         exit_reason=oi_iv_reason,
                         capital_available=capital_available,
+                        total_invested=total_invested,
                     )
                 except Exception as e:
                     logger.warning(f"  Telegram exit notify failed: {e}")
@@ -1474,6 +1478,7 @@ class PaperTrader:
                     # Capital available AFTER closing this position
                     locked = sum(p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                                  for p in self.portfolio.positions)
+                    total_invested = locked
                     capital_available = self.portfolio.capital - locked
                     notify_trade_exit(
                         market="EQUITY", strategy=pos['strategy'],
@@ -1483,6 +1488,7 @@ class PaperTrader:
                         pnl=pnl, capital_used=capital,
                         exit_reason=exit_reason,
                         capital_available=capital_available,
+                        total_invested=total_invested,
                     )
                 except Exception as e:
                     logger.warning(f"  Telegram exit notify failed: {e}")

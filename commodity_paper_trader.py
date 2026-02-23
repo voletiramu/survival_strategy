@@ -703,11 +703,12 @@ class CommodityPaperTrader:
                 from trade_notifier import notify_trade_entry
                 spec = COMMODITIES[sig['commodity']]
                 capital = sig['premium'] * spec['lot_size'] * spec['multiplier']
-                # Calculate available capital for Telegram message
+                # Calculate total invested and available capital for Telegram message
                 locked = sum(
                     p['entry_premium'] * COMMODITIES[p['commodity']]['lot_size'] * COMMODITIES[p['commodity']]['multiplier']
                     for p in self.portfolio.positions
                 )
+                total_invested = locked
                 capital_available = self.portfolio.capital - locked
                 notify_trade_entry(
                     market="COMMODITY", strategy=sig['strategy'],
@@ -718,6 +719,7 @@ class CommodityPaperTrader:
                     target=sig.get('target', 0), sl=sig.get('sl', 0),
                     capital_used=capital, reason=sig['reason'],
                     capital_available=capital_available,
+                    total_invested=total_invested,
                 )
             except Exception as e:
                 logger.warning(f"  Telegram notify failed: {e}")
@@ -790,6 +792,7 @@ class CommodityPaperTrader:
                         p['entry_premium'] * COMMODITIES[p['commodity']]['lot_size'] * COMMODITIES[p['commodity']]['multiplier']
                         for p in self.portfolio.positions
                     )
+                    total_invested = locked
                     capital_available = self.portfolio.capital - locked
                     notify_trade_exit(
                         market="COMMODITY", strategy=pos['strategy'],
@@ -799,6 +802,7 @@ class CommodityPaperTrader:
                         pnl=pos['unrealized_pnl'], capital_used=capital,
                         exit_reason=exit_reason,
                         capital_available=capital_available,
+                        total_invested=total_invested,
                     )
                 except Exception as e:
                     logger.warning(f"  Telegram exit notify failed: {e}")
