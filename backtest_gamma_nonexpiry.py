@@ -273,7 +273,7 @@ def main():
             print(f"\n  WARNING: {path} not found, skipping {symbol}")
             continue
 
-        df = pd.read_csv(path, parse_dates=['Date'], index_col='Date')
+        df = pd.read_csv(path, parse_dates=['DateTime'], index_col='DateTime')
         lot_size = LOT_SIZES[symbol]
 
         print(f"\n{'='*60}")
