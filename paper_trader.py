@@ -787,19 +787,32 @@ class StrategyEngine:
         return signals
 
     def check_gamma_blast_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Gamma Blast - expiry day only."""
+        """Gamma Blast - all days mode (paper trading test)."""
         signals = []
         ind = indicators
-        T = 1 / 365  # 0 DTE
 
-        # Only on expiry days
+        # Calculate actual DTE to next expiry for IV/target adjustment
         if symbol == 'BANKNIFTY':
-            is_expiry = dow == 2  # Wednesday
+            days_to_expiry = (2 - dow) % 7  # Days to Wednesday
         else:
-            is_expiry = dow == 3  # Thursday
+            days_to_expiry = (3 - dow) % 7  # Days to Thursday
+        days_to_expiry = max(days_to_expiry, 1)
+        is_expiry_day = (days_to_expiry == 7 or days_to_expiry == 0 or
+                         (symbol == 'BANKNIFTY' and dow == 2) or
+                         (symbol != 'BANKNIFTY' and dow == 3))
 
-        if not is_expiry:
-            return signals
+        T = max(dte, days_to_expiry) / 365 if not is_expiry_day else 1 / 365
+
+        # IV multiplier: higher on expiry day (gamma spike), lower further out
+        iv_mult = 1.3 if is_expiry_day else max(1.0, 1.3 - days_to_expiry * 0.08)
+
+        # Target/SL adjustment: more conservative on non-expiry (less gamma boost)
+        if is_expiry_day:
+            target_mult = 2.5
+            sl_mult = 0.3
+        else:
+            target_mult = max(1.8, 2.5 - days_to_expiry * 0.15)  # 1.8x-2.5x
+            sl_mult = min(0.4, 0.3 + days_to_expiry * 0.02)      # 30%-40% SL
 
         # Need coiled spring
         if ind['prev_range'] > 1.5:
@@ -813,35 +826,36 @@ class StrategyEngine:
             return signals
 
         strike_interval = 50 if symbol in ['NIFTY', 'BANKNIFTY'] else 100
+        day_label = "EXPIRY" if is_expiry_day else f"{days_to_expiry}DTE"
 
         if abs(body) > atr * 0.15:
             if body > 0:  # Up breakout
                 ce_strike = round(spot / strike_interval) * strike_interval
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'] * 1.3, 'CE')
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'] * iv_mult, 'CE')
                 if g['price'] > 3:
                     signals.append({
                         'type': 'BUY_CE_GAMMA',
                         'strike': ce_strike,
                         'premium': g['price'],
                         'greeks': g,
-                        'reason': f"Gamma Blast: Up breakout body={body:.0f} ATR={atr:.0f} "
-                                  f"range={day_range:.2f}x",
-                        'target': g['price'] * 2.5,
-                        'sl': g['price'] * 0.3,
+                        'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
+                                  f"ATR={atr:.0f} range={day_range:.2f}x",
+                        'target': g['price'] * target_mult,
+                        'sl': g['price'] * sl_mult,
                     })
             else:  # Down breakout
                 pe_strike = round(spot / strike_interval) * strike_interval
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'] * 1.3, 'PE')
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'] * iv_mult, 'PE')
                 if g['price'] > 3:
                     signals.append({
                         'type': 'BUY_PE_GAMMA',
                         'strike': pe_strike,
                         'premium': g['price'],
                         'greeks': g,
-                        'reason': f"Gamma Blast: Down breakout body={body:.0f} ATR={atr:.0f} "
-                                  f"range={day_range:.2f}x",
-                        'target': g['price'] * 2.5,
-                        'sl': g['price'] * 0.3,
+                        'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
+                                  f"ATR={atr:.0f} range={day_range:.2f}x",
+                        'target': g['price'] * target_mult,
+                        'sl': g['price'] * sl_mult,
                     })
 
         return signals
