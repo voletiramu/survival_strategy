@@ -380,29 +380,40 @@ class PaperPortfolio:
         """Record a trading signal with risk management and OI/IV tracking."""
         # ---- RISK CHECK ----
         lot_size = LOT_SIZES.get(symbol, 65)
-        trade_cost = entry_premium * lot_size
+        is_sell = 'SELL' in signal_type
         is_commodity = symbol in ('GOLDM', 'SILVERM', 'CRUDEOILM', 'GOLD', 'SILVER', 'CRUDEOIL')
         max_per_trade = MAX_COMMODITY_PER_TRADE if is_commodity else MAX_EQUITY_PER_TRADE
         segment_capital = COMMODITY_CAPITAL if is_commodity else EQUITY_CAPITAL
 
-        # Check per-trade risk limit
+        # Capital required: SELL = margin blocked, BUY = premium paid
+        if is_sell:
+            trade_cost = MARGIN_PER_LOT.get(symbol, 120000)
+        else:
+            trade_cost = entry_premium * lot_size
+
+        # Check 1: Per-trade risk limit
         if trade_cost > max_per_trade:
             logger.warning(f"  RISK_LIMIT: {symbol} {strategy} trade cost Rs {trade_cost:,.0f} "
                           f"> max Rs {max_per_trade:,.0f}. SKIPPED.")
             return None
 
-        # Check total exposure for this segment
-        total_exposure = sum(
-            p['entry_premium'] * p['lot_size']
-            for p in self.positions
-            if (p['symbol'] in ('GOLDM', 'SILVERM', 'CRUDEOILM', 'GOLD', 'SILVER', 'CRUDEOIL')) == is_commodity
-        )
-        if total_exposure + trade_cost > segment_capital:
-            logger.warning(f"  RISK_LIMIT: {symbol} {strategy} would exceed segment capital "
-                          f"(exposure Rs {total_exposure+trade_cost:,.0f} > Rs {segment_capital:,.0f}). SKIPPED.")
+        # Check 2: Only trade with LEFTOVER available capital
+        total_exposure = 0
+        for p in self.positions:
+            p_is_commodity = p['symbol'] in ('GOLDM', 'SILVERM', 'CRUDEOILM', 'GOLD', 'SILVER', 'CRUDEOIL')
+            if p_is_commodity == is_commodity:
+                if p.get('is_sell', False):
+                    total_exposure += MARGIN_PER_LOT.get(p['symbol'], 120000)
+                else:
+                    total_exposure += p['entry_premium'] * p['lot_size']
+
+        available_capital = segment_capital - total_exposure
+        if trade_cost > available_capital:
+            logger.warning(f"  RISK_LIMIT: {symbol} {strategy} needs Rs {trade_cost:,.0f} "
+                          f"but only Rs {available_capital:,.0f} available. SKIPPED.")
             return None
 
-        # Check daily loss limit
+        # Check 3: Daily loss limit
         today = datetime.now().strftime('%Y-%m-%d')
         daily_loss = self.daily_pnl.get(today, 0)
         max_daily = MAX_DAILY_LOSS_COMMODITY if is_commodity else MAX_DAILY_LOSS_EQUITY
@@ -1203,10 +1214,19 @@ class PaperTrader:
             try:
                 from trade_notifier import notify_trade_entry
                 lot_size = LOT_SIZES.get(sig['symbol'], 50)
-                capital = sig['premium'] * lot_size
-                # Calculate total invested and available capital for Telegram message
-                locked = sum(p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
-                             for p in self.portfolio.positions)
+                # Capital used: SELL = margin blocked, BUY = premium paid
+                is_sell_sig = 'SELL' in sig['type']
+                if is_sell_sig:
+                    capital = MARGIN_PER_LOT.get(sig['symbol'], 120000)
+                else:
+                    capital = sig['premium'] * lot_size
+                # Calculate total locked (BUY/SELL aware) and available capital
+                locked = 0
+                for p in self.portfolio.positions:
+                    if p.get('is_sell', False):
+                        locked += MARGIN_PER_LOT.get(p['symbol'], 120000)
+                    else:
+                        locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                 total_invested = locked
                 capital_available = self.portfolio.capital - locked
                 notify_trade_entry(
@@ -1421,11 +1441,19 @@ class PaperTrader:
                 try:
                     from trade_notifier import notify_trade_exit
                     lot_size = LOT_SIZES.get(symbol, 50)
-                    capital = pos['entry_premium'] * lot_size
+                    # Capital used: SELL = margin, BUY = premium
+                    if pos.get('is_sell', False):
+                        capital = MARGIN_PER_LOT.get(symbol, 120000)
+                    else:
+                        capital = pos['entry_premium'] * lot_size
                     pnl = pos.get('unrealized_pnl', 0)
-                    # Capital available AFTER closing this position
-                    locked = sum(p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
-                                 for p in self.portfolio.positions)
+                    # Capital available AFTER closing (BUY/SELL aware)
+                    locked = 0
+                    for p in self.portfolio.positions:
+                        if p.get('is_sell', False):
+                            locked += MARGIN_PER_LOT.get(p['symbol'], 120000)
+                        else:
+                            locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                     total_invested = locked
                     capital_available = self.portfolio.capital - locked
                     notify_trade_exit(
@@ -1473,11 +1501,19 @@ class PaperTrader:
                 try:
                     from trade_notifier import notify_trade_exit
                     lot_size = LOT_SIZES.get(symbol, 50)
-                    capital = pos['entry_premium'] * lot_size
+                    # Capital used: SELL = margin, BUY = premium
+                    if pos.get('is_sell', False):
+                        capital = MARGIN_PER_LOT.get(symbol, 120000)
+                    else:
+                        capital = pos['entry_premium'] * lot_size
                     pnl = pos.get('unrealized_pnl', 0)
-                    # Capital available AFTER closing this position
-                    locked = sum(p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
-                                 for p in self.portfolio.positions)
+                    # Capital available AFTER closing (BUY/SELL aware)
+                    locked = 0
+                    for p in self.portfolio.positions:
+                        if p.get('is_sell', False):
+                            locked += MARGIN_PER_LOT.get(p['symbol'], 120000)
+                        else:
+                            locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                     total_invested = locked
                     capital_available = self.portfolio.capital - locked
                     notify_trade_exit(

@@ -47,7 +47,7 @@ RISK_FREE_RATE = 0.065
 # Focus on MINI contracts (affordable with Rs 3L capital)
 COMMODITIES = {
     'GOLDM': {
-        'lot_size': 100, 'multiplier': 10, 'margin': 15000,
+        'lot_size': 1, 'multiplier': 10, 'margin': 15000,
         'strike_interval': 100, 'vol_adj': 1.0,
         'file': 'GOLDM_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Gold Mini (100g)',
@@ -92,6 +92,15 @@ COMMODITIES = {
 
 # For paper trading with Rs 3L, focus on affordable mini contracts
 PAPER_TRADE_COMMODITIES = ['GOLDM', 'SILVERM', 'CRUDEOILM']
+
+# ====================================================================
+# CAPITAL & RISK MANAGEMENT FOR COMMODITY TRADING
+# ====================================================================
+COMMODITY_CAPITAL = 100000                              # Rs 1L for commodities
+MAX_RISK_PCT = 25                                       # Max 25% of capital per trade
+MAX_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 25,000
+MAX_POSITIONS_PER_COMMODITY = 3                         # Prevent cascade (e.g., 16 SILVERM trades)
+MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 10,000 (10% daily loss limit)
 
 # MCX Trading costs
 MCX_BROKERAGE = 20
@@ -201,6 +210,53 @@ class CommodityPortfolio:
         lot = spec['lot_size']
         mult = spec['multiplier']
         is_sell = 'SELL' in signal_type
+
+        # ---- RISK CHECKS: Only trade with leftover capital ----
+
+        # Capital required: SELL = margin blocked, BUY = premium paid
+        if is_sell:
+            trade_capital = spec['margin']
+        else:
+            trade_capital = entry_premium * lot * mult
+
+        # Check 1: Per-trade limit (25% of commodity capital)
+        if trade_capital > MAX_PER_TRADE:
+            logger.warning(f"  RISK_LIMIT: {commodity} {strategy} trade capital Rs {trade_capital:,.0f} "
+                          f"> max Rs {MAX_PER_TRADE:,.0f}. SKIPPED.")
+            return None
+
+        # Check 2: Only trade with LEFTOVER available capital
+        total_locked = 0
+        for p in self.positions:
+            p_spec = COMMODITIES[p['commodity']]
+            if p['is_sell']:
+                total_locked += p_spec['margin']
+            else:
+                total_locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
+
+        available_capital = self.capital - total_locked
+        if trade_capital > available_capital:
+            logger.warning(f"  RISK_LIMIT: {commodity} {strategy} needs Rs {trade_capital:,.0f} "
+                          f"but only Rs {available_capital:,.0f} available. SKIPPED.")
+            return None
+
+        # Check 3: Daily loss limit (10% of commodity capital)
+        today = datetime.now().strftime('%Y-%m-%d')
+        daily_loss = self.daily_pnl.get(today, 0)
+        if daily_loss < -MAX_DAILY_LOSS:
+            logger.warning(f"  RISK_LIMIT: Daily loss Rs {daily_loss:,.0f} exceeds "
+                          f"limit Rs {MAX_DAILY_LOSS:,.0f}. SKIPPED.")
+            return None
+
+        # Check 4: Max positions per commodity (prevent cascade)
+        same_commodity = [p for p in self.positions if p['commodity'] == commodity]
+        if len(same_commodity) >= MAX_POSITIONS_PER_COMMODITY:
+            logger.warning(f"  RISK_LIMIT: Max {MAX_POSITIONS_PER_COMMODITY} positions "
+                          f"for {commodity} reached. SKIPPED.")
+            return None
+
+        # ---- END RISK CHECKS ----
+
         cost = calc_mcx_costs(entry_premium, lot, mult, is_sell)
 
         pos = {
@@ -702,12 +758,20 @@ class CommodityPaperTrader:
             try:
                 from trade_notifier import notify_trade_entry
                 spec = COMMODITIES[sig['commodity']]
-                capital = sig['premium'] * spec['lot_size'] * spec['multiplier']
-                # Calculate total invested and available capital for Telegram message
-                locked = sum(
-                    p['entry_premium'] * COMMODITIES[p['commodity']]['lot_size'] * COMMODITIES[p['commodity']]['multiplier']
-                    for p in self.portfolio.positions
-                )
+                # Capital used: SELL = margin blocked, BUY = premium paid
+                is_sell_sig = 'SELL' in sig['type']
+                if is_sell_sig:
+                    capital = spec['margin']
+                else:
+                    capital = sig['premium'] * spec['lot_size'] * spec['multiplier']
+                # Calculate total locked (BUY/SELL aware) and available capital
+                locked = 0
+                for p in self.portfolio.positions:
+                    p_spec = COMMODITIES[p['commodity']]
+                    if p['is_sell']:
+                        locked += p_spec['margin']
+                    else:
+                        locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
                 total_invested = locked
                 capital_available = self.portfolio.capital - locked
                 notify_trade_entry(
@@ -786,12 +850,19 @@ class CommodityPaperTrader:
                 try:
                     from trade_notifier import notify_trade_exit
                     spec = COMMODITIES[commodity]
-                    capital = pos['entry_premium'] * spec['lot_size'] * spec['multiplier']
-                    # Capital available AFTER closing this position
-                    locked = sum(
-                        p['entry_premium'] * COMMODITIES[p['commodity']]['lot_size'] * COMMODITIES[p['commodity']]['multiplier']
-                        for p in self.portfolio.positions
-                    )
+                    # Capital used: SELL = margin, BUY = premium
+                    if pos['is_sell']:
+                        capital = spec['margin']
+                    else:
+                        capital = pos['entry_premium'] * spec['lot_size'] * spec['multiplier']
+                    # Capital available AFTER closing (BUY/SELL aware)
+                    locked = 0
+                    for p in self.portfolio.positions:
+                        p_spec = COMMODITIES[p['commodity']]
+                        if p['is_sell']:
+                            locked += p_spec['margin']
+                        else:
+                            locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
                     total_invested = locked
                     capital_available = self.portfolio.capital - locked
                     notify_trade_exit(
