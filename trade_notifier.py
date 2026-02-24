@@ -144,11 +144,17 @@ def notify_trade_exit(market, strategy, symbol, signal_type, strike,
 
 def notify_daily_summary(equity_capital, equity_pnl, equity_positions, equity_closed,
                          commodity_capital, commodity_pnl, commodity_positions, commodity_closed,
-                         equity_win_rate=0, commodity_win_rate=0):
-    """Send end-of-day portfolio summary."""
+                         equity_win_rate=0, commodity_win_rate=0,
+                         equity_signals=0, equity_dummy_pnl=0,
+                         commodity_signals=0, commodity_dummy_pnl=0,
+                         equity_capital_used=0, commodity_capital_used=0):
+    """Send end-of-day portfolio summary with actual + dummy PnL."""
     total_capital = equity_capital + commodity_capital
     total_pnl = equity_pnl + commodity_pnl
     total_pct = (total_pnl / total_capital * 100) if total_capital > 0 else 0
+    total_dummy = equity_dummy_pnl + commodity_dummy_pnl
+    total_signals = equity_signals + commodity_signals
+    total_trades = equity_positions + equity_closed + commodity_positions + commodity_closed
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     msg = (
@@ -156,17 +162,22 @@ def notify_daily_summary(equity_capital, equity_pnl, equity_positions, equity_cl
         f"<b>Date:</b> {now}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"\n<b>EQUITY (NIFTY/BN/SENSEX)</b>\n"
-        f"  Capital: ₹{equity_capital:,.0f}\n"
+        f"  Capital: ₹{equity_capital:,.0f} | Used: ₹{equity_capital_used:,.0f}\n"
         f"  PnL: ₹{equity_pnl:,.2f}\n"
         f"  Open: {equity_positions} | Closed: {equity_closed}\n"
         f"  Win Rate: {equity_win_rate:.0f}%\n"
         f"\n<b>COMMODITY (GOLDM/SILVERM/CRUDEOILM)</b>\n"
-        f"  Capital: ₹{commodity_capital:,.0f}\n"
+        f"  Capital: ₹{commodity_capital:,.0f} | Used: ₹{commodity_capital_used:,.0f}\n"
         f"  PnL: ₹{commodity_pnl:,.2f}\n"
         f"  Open: {commodity_positions} | Closed: {commodity_closed}\n"
         f"  Win Rate: {commodity_win_rate:.0f}%\n"
+        f"\n<b>SIGNAL ANALYSIS</b>\n"
+        f"  Equity Signals: {equity_signals} | Trades Taken: {equity_positions + equity_closed}\n"
+        f"  Commodity Signals: {commodity_signals} | Trades Taken: {commodity_positions + commodity_closed}\n"
+        f"  Total Signals: {total_signals} | Total Trades: {total_trades}\n"
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>TOTAL PnL: ₹{total_pnl:,.2f} ({total_pct:+.1f}%)</b>\n"
+        f"<b>ACTUAL PnL (trades taken): ₹{total_pnl:,.2f} ({total_pct:+.1f}%)</b>\n"
+        f"<b>DUMMY PnL (all signals): ₹{total_dummy:,.2f}</b>\n"
         f"<b>TOTAL CAPITAL: ₹{total_capital:,.0f}</b>"
     )
     return send_message(msg)

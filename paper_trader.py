@@ -58,6 +58,7 @@ MAX_EQUITY_PER_TRADE = EQUITY_CAPITAL * MAX_RISK_PCT / 100    # Rs 50,000
 MAX_COMMODITY_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 25,000
 MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
 MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
+MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
 
 # OI + IV Exit Thresholds
 OI_SURGE_PCT = 15       # Exit if OI changes >15% from entry
@@ -432,6 +433,12 @@ class PaperPortfolio:
             logger.warning(f"  RISK_LIMIT: Daily loss Rs {daily_loss:,.0f} exceeds limit Rs {max_daily:,.0f}. SKIPPED.")
             return None
 
+        # Check 4: Max positions per symbol (prevent cascade)
+        same_symbol = [p for p in self.positions if p['symbol'] == symbol]
+        if len(same_symbol) >= MAX_POSITIONS_PER_SYMBOL:
+            logger.warning(f"  RISK_LIMIT: Max {MAX_POSITIONS_PER_SYMBOL} positions for {symbol}. SKIPPED.")
+            return None
+
         sig = {
             'timestamp': datetime.now().isoformat(),
             'strategy': strategy,
@@ -633,20 +640,7 @@ class StrategyEngine:
             logger.info(f"Loaded {len(df)} historical days for {symbol}")
             return df
 
-        # Try Yahoo data
-        yahoo_map = {
-            'NIFTY': 'NIFTY50_1d_5y.csv',
-            'BANKNIFTY': 'BANKNIFTY_1d_5y.csv',
-            'SENSEX': 'SENSEX_1d_5y.csv',
-        }
-        ypath = os.path.join(DATA_DIR, yahoo_map.get(symbol, ''))
-        if os.path.exists(ypath):
-            df = pd.read_csv(ypath, parse_dates=['Date'], index_col='Date')
-            self.historical_data[symbol] = df
-            logger.info(f"Loaded {len(df)} Yahoo days for {symbol}")
-            return df
-
-        logger.error(f"No historical data found for {symbol} — indicators will not work")
+        logger.error(f"No historical data found for {symbol} (Angel SmartAPI only) — indicators will not work")
         return None
 
     def _download_historical_equity(self, symbol, save_path):
@@ -1111,6 +1105,9 @@ class PaperTrader:
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
             'SENSEX': {'exchange': 'BSE', 'token': '99919000'},
         }
+        # EOD signal tracking
+        self.daily_signal_count = 0
+        self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
 
     def connect(self):
         """Connect to Angel API."""
@@ -1271,14 +1268,20 @@ class PaperTrader:
         executed = 0
         skipped = 0
         for sig in signals:
-            # Check for duplicate: same strategy + symbol + strike already open
+            # Track ALL signals for dummy PnL at EOD
+            self.daily_signal_count += 1
+            self.daily_signals_all.append(sig)
+
+            # Check for duplicate: same strategy + symbol + NEARBY strike
+            strike_tolerance = {'NIFTY': 100, 'BANKNIFTY': 200, 'SENSEX': 200}
+            tol = strike_tolerance.get(sig['symbol'], 100)
             existing = [p for p in self.portfolio.positions
                         if p['strategy'] == sig['strategy']
                         and p['symbol'] == sig['symbol']
-                        and p['strike'] == sig['strike']]
+                        and abs(p['strike'] - sig['strike']) <= tol]
             if existing:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['symbol']} "
-                           f"{sig['strike']} already open")
+                           f"{sig['strike']} near existing {existing[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -1299,7 +1302,8 @@ class PaperTrader:
                     'target': sig.get('target'),
                     'sl': sig.get('sl'),
                     'spot': sig.get('spot'),
-                }
+                },
+                spot_price=sig.get('spot', 0),
             )
             executed += 1
 
@@ -1506,23 +1510,23 @@ class PaperTrader:
             if not spot:
                 continue
 
-            T = max(pos['dte'] - 0.5, 0.01) / 365
+            # Delta+Gamma+Theta premium approximation (replaces broken BS recalculation)
+            entry_spot = pos.get('entry_spot', 0)
+            if entry_spot == 0:
+                entry_spot = pos.get('details', {}).get('spot', spot)
+            spot_change = spot - entry_spot
+            delta_val = pos.get('delta', 0.5)
+            gamma_val = pos.get('gamma', 0)
 
-            df = self.engine.historical_data.get(symbol)
-            if df is not None and len(df) > 20:
-                log_ret = np.log(df['Close'] / df['Close'].shift(1))
-                hv = log_ret.tail(20).std() * np.sqrt(252)
-                iv = max(min(hv * 1.15, 0.60), 0.08)
-            else:
-                iv = pos['iv'] / 100
+            # Premium change from delta + gamma curvature
+            premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
 
-            opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
-            current_g = bs_greeks(spot, pos['strike'], T, RISK_FREE_RATE, iv, opt_type)
-            current_premium = current_g['price']
+            # Time decay (theta is per day, negative for long options)
+            theta_val = pos.get('theta', 0)
+            hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+            time_decay = theta_val * (hours_held / 24)
 
-            # Update position Greeks
-            pos['gamma'] = round(current_g.get('gamma', pos.get('gamma', 0)), 6)
-            pos['delta'] = round(current_g.get('delta', pos.get('delta', 0)), 4)
+            current_premium = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
 
             self.portfolio.update_position(pos['id'], current_premium)
 
@@ -1571,6 +1575,9 @@ class PaperTrader:
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
             target = details.get('target', pos['entry_premium'] * 2)
             sl = details.get('sl', pos['entry_premium'] * 0.3)
+
+            logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current_premium:.2f} | "
+                       f"Target: {target:.2f} SL: {sl:.2f} | Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f}")
 
             exit_reason = None
 
@@ -1621,6 +1628,47 @@ class PaperTrader:
                     )
                 except Exception as e:
                     logger.warning(f"  Telegram exit notify failed: {e}")
+
+        # Persist updated PnL/Greeks to disk after exit check cycle
+        self.portfolio.save_state()
+
+    def get_eod_summary(self):
+        """Return end-of-day summary with actual PnL (our trades) + dummy PnL (all signals)."""
+        # Actual PnL: from portfolio closed_trades + open positions unrealized PnL
+        actual_closed_pnl = sum(t.get('pnl', 0) for t in self.portfolio.closed_trades)
+        actual_open_pnl = sum(p.get('unrealized_pnl', 0) for p in self.portfolio.positions)
+        actual_total = actual_closed_pnl + actual_open_pnl
+
+        # Dummy PnL: estimate PnL for ALL signals as if unlimited capital
+        dummy_pnl = 0
+        for sig in self.daily_signals_all:
+            spot_now = self.get_index_spot(sig['symbol']) or sig.get('spot', 0)
+            entry_spot = sig.get('spot', spot_now)
+            if not entry_spot or not spot_now:
+                continue
+            spot_change = spot_now - entry_spot
+            delta = sig.get('greeks', {}).get('delta', 0.5)
+            premium_change = delta * spot_change
+            lot_size = LOT_SIZES.get(sig['symbol'], 50)
+            dummy_pnl += premium_change * lot_size
+
+        # Capital used in open positions
+        capital_used = 0
+        for p in self.portfolio.positions:
+            if p.get('is_sell', False):
+                capital_used += MARGIN_PER_LOT.get(p['symbol'], 120000)
+            else:
+                capital_used += p['entry_premium'] * p['lot_size']
+
+        return {
+            'total_signals': self.daily_signal_count,
+            'trades_taken': len(self.portfolio.closed_trades) + len(self.portfolio.positions),
+            'open_positions': len(self.portfolio.positions),
+            'closed_trades': len(self.portfolio.closed_trades),
+            'actual_pnl': round(actual_total, 2),
+            'dummy_pnl': round(dummy_pnl, 2),
+            'capital_used': round(capital_used, 2),
+        }
 
     def run_once(self):
         """Run one scan cycle."""

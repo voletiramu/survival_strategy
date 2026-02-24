@@ -279,6 +279,7 @@ class CommodityPortfolio:
             'unrealized_pnl': 0,
             'status': 'OPEN',
             'details': details or {},
+            'entry_spot': details.get('spot', 0) if details else 0,
         }
         self.positions.append(pos)
 
@@ -726,6 +727,9 @@ class CommodityPaperTrader:
         self.portfolio = CommodityPortfolio()
         self.engine = CommodityStrategyEngine(self.portfolio, self.angel)
         self._running = False
+        # EOD signal tracking
+        self.daily_signal_count = 0
+        self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
 
     def connect(self):
         return self.angel.connect()
@@ -821,14 +825,20 @@ class CommodityPaperTrader:
         executed = 0
         skipped = 0
         for sig in signals:
-            # Check for duplicate: same strategy + commodity + strike already open
+            # Track ALL signals for dummy PnL at EOD
+            self.daily_signal_count += 1
+            self.daily_signals_all.append(sig)
+
+            # Check for duplicate: same strategy + commodity + NEARBY strike
+            strike_tolerance = {'GOLDM': 200, 'SILVERM': 1000, 'CRUDEOILM': 100}
+            tol = strike_tolerance.get(sig['commodity'], 100)
             existing = [p for p in self.portfolio.positions
                         if p['strategy'] == sig['strategy']
                         and p['commodity'] == sig['commodity']
-                        and p['strike'] == sig['strike']]
+                        and abs(p['strike'] - sig['strike']) <= tol]
             if existing:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['commodity']} "
-                           f"{sig['strike']} already open")
+                           f"{sig['strike']} near existing {existing[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -896,21 +906,21 @@ class CommodityPaperTrader:
             if not spot:
                 continue
 
-            # Use the same IV that was used at entry for consistency
-            T = max(pos['dte'] - 0.5, 0.01) / 365
             spec = COMMODITIES[commodity]
-            # Compute IV from historical data (same as entry)
-            df = self.engine.historical_data.get(commodity)
-            if df is not None and len(df) > 20:
-                log_ret = np.log(df['Close'] / df['Close'].shift(1))
-                hv = log_ret.tail(20).std() * np.sqrt(252)
-                iv = max(min(hv * 1.15 * spec['vol_adj'], 0.80), 0.08)
-            else:
-                iv = 0.20 * spec['vol_adj']
 
-            opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
-            g = black76_greeks(spot, pos['strike'], T, RISK_FREE_RATE, iv, opt_type)
-            current = g['price']
+            # Delta+Gamma+Theta premium approximation (replaces broken Black-76 recalculation)
+            entry_spot = pos.get('entry_spot', 0)
+            if entry_spot == 0:
+                entry_spot = pos.get('details', {}).get('spot', spot)
+            spot_change = spot - entry_spot
+            delta_val = pos.get('delta', 0.5)
+            gamma_val = pos.get('gamma', 0)
+            theta_val = pos.get('theta', 0)
+            hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+
+            premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
+            time_decay = theta_val * (hours_held / 24)
+            current = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
             pos['current_premium'] = round(current, 2)
 
             # Update unrealized PnL
@@ -926,6 +936,9 @@ class CommodityPaperTrader:
             details = pos.get('details', {})
             target = details.get('target', pos['entry_premium'] * 2)
             sl = details.get('sl', pos['entry_premium'] * 0.3)
+
+            logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current:.2f} | "
+                       f"Target: {target:.2f} SL: {sl:.2f} | Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f}")
 
             exit_reason = None
             if pos['is_sell']:
@@ -968,6 +981,48 @@ class CommodityPaperTrader:
                     )
                 except Exception as e:
                     logger.warning(f"  Telegram exit notify failed: {e}")
+
+        # Persist updated PnL to disk after exit check cycle
+        self.portfolio.save_state()
+
+    def get_eod_summary(self):
+        """Return end-of-day summary with actual PnL (our trades) + dummy PnL (all signals)."""
+        actual_closed_pnl = sum(t.get('pnl', 0) for t in self.portfolio.closed_trades)
+        actual_open_pnl = sum(p.get('unrealized_pnl', 0) for p in self.portfolio.positions)
+        actual_total = actual_closed_pnl + actual_open_pnl
+
+        # Dummy PnL: estimate for ALL signals as if unlimited capital
+        dummy_pnl = 0
+        for sig in self.daily_signals_all:
+            spot_now = self.get_spot(sig['commodity']) or sig.get('spot', 0)
+            entry_spot = sig.get('spot', spot_now)
+            if not entry_spot or not spot_now:
+                continue
+            spot_change = spot_now - entry_spot
+            delta = sig.get('greeks', {}).get('delta', 0.5)
+            premium_change = delta * spot_change
+            spec = COMMODITIES.get(sig['commodity'], {})
+            lot = spec.get('lot_size', 1)
+            mult = spec.get('multiplier', 1)
+            dummy_pnl += premium_change * lot * mult
+
+        capital_used = 0
+        for p in self.portfolio.positions:
+            spec = COMMODITIES.get(p['commodity'], {})
+            if p.get('is_sell', False):
+                capital_used += spec.get('margin', 15000)
+            else:
+                capital_used += p['entry_premium'] * p['lot_size'] * p['multiplier']
+
+        return {
+            'total_signals': self.daily_signal_count,
+            'trades_taken': len(self.portfolio.closed_trades) + len(self.portfolio.positions),
+            'open_positions': len(self.portfolio.positions),
+            'closed_trades': len(self.portfolio.closed_trades),
+            'actual_pnl': round(actual_total, 2),
+            'dummy_pnl': round(dummy_pnl, 2),
+            'capital_used': round(capital_used, 2),
+        }
 
     def run_once(self):
         signals = self.scan_all()

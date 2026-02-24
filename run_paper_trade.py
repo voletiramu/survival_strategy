@@ -201,6 +201,9 @@ def run_commodity_scan(offline=False):
 # THREADED LOOP FUNCTIONS
 # ====================================================================
 
+# Shared dict for passing trader references from threads to main (for EOD report)
+_trader_refs = {}
+
 def equity_loop(interval_sec=45, offline=False, stop_event=None):
     """Equity scanning thread: NIFTY, BANKNIFTY, SENSEX every 45 seconds.
     Creates ONE PaperTrader instance and reuses it across scans.
@@ -212,6 +215,7 @@ def equity_loop(interval_sec=45, offline=False, stop_event=None):
         from paper_trader import PaperTrader
 
         trader = PaperTrader()
+        _trader_refs['equity'] = trader  # Share for EOD report
         for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
             trader.engine.load_historical(symbol)
 
@@ -266,6 +270,7 @@ def commodity_loop(interval_sec=30, offline=False, stop_event=None):
         from commodity_paper_trader import CommodityPaperTrader, PAPER_TRADE_COMMODITIES
 
         trader = CommodityPaperTrader()
+        _trader_refs['commodity'] = trader  # Share for EOD report
         for comm in PAPER_TRADE_COMMODITIES:
             trader.engine.load_historical(comm)
 
@@ -334,47 +339,8 @@ def crypto_loop(interval_sec=300, stop_event=None):
 
 
 def _send_heartbeat(instance_id='local'):
-    """Send heartbeat + active trades to Telegram."""
-    try:
-        from trade_notifier import notify_active_trades, send_message
-        notify_active_trades()
-
-        # Get position counts and capital
-        eq_count = 0
-        eq_capital = 200000
-        comm_count = 0
-        comm_capital = 100000
-
-        try:
-            from paper_trader import PaperPortfolio
-            eq_port = PaperPortfolio()
-            eq_count = len(eq_port.positions)
-            eq_capital = eq_port.capital
-        except Exception:
-            pass
-
-        try:
-            from commodity_paper_trader import CommodityPortfolio
-            comm_port = CommodityPortfolio()
-            comm_count = len(comm_port.positions)
-            comm_capital = comm_port.capital
-        except Exception:
-            pass
-
-        now = datetime.now()
-        instance_label = get_instance_label(instance_id)
-        heartbeat = (
-            f"<b>💓 HEARTBEAT</b> | {now.strftime('%H:%M')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>📍 Running on:</b> {instance_label}\n"
-            f"Equity: {eq_count} positions | Capital: Rs {eq_capital:,.0f}\n"
-            f"Commodity: {comm_count} positions | Capital: Rs {comm_capital:,.0f}\n"
-            f"Total Capital: Rs {eq_capital + comm_capital:,.0f}"
-        )
-        send_message(heartbeat)
-        logger.info("Heartbeat + active trades pushed to Telegram")
-    except Exception as e:
-        logger.warning(f"Telegram heartbeat failed: {e}")
+    """Log heartbeat locally (no Telegram spam — user wants fewer messages)."""
+    logger.info(f"  [Heartbeat] System alive at {datetime.now().strftime('%H:%M')}")
 
 
 def show_combined_status():
@@ -551,19 +517,60 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
             if not t_equity.is_alive() and not t_commodity.is_alive():
                 logger.info("All market threads finished for today. Shutting down.")
 
-                # Save end-of-day report
+                # Save end-of-day report with actual + dummy PnL
                 try:
                     now = datetime.now()
+                    eq_trader = _trader_refs.get('equity')
+                    comm_trader = _trader_refs.get('commodity')
+
+                    eq_summary = eq_trader.get_eod_summary() if eq_trader else {}
+                    comm_summary = comm_trader.get_eod_summary() if comm_trader else {}
+
+                    # Calculate win rates
+                    eq_wins = sum(1 for t in (eq_trader.portfolio.closed_trades if eq_trader else []) if t.get('pnl', 0) > 0)
+                    eq_closed = eq_summary.get('closed_trades', 0)
+                    eq_win_rate = (eq_wins / eq_closed * 100) if eq_closed > 0 else 0
+
+                    comm_wins = sum(1 for t in (comm_trader.portfolio.closed_trades if comm_trader else []) if t.get('pnl', 0) > 0)
+                    comm_closed = comm_summary.get('closed_trades', 0)
+                    comm_win_rate = (comm_wins / comm_closed * 100) if comm_closed > 0 else 0
+
+                    # Send Telegram EOD summary
+                    from trade_notifier import notify_daily_summary
+                    notify_daily_summary(
+                        equity_capital=200000,
+                        equity_pnl=eq_summary.get('actual_pnl', 0),
+                        equity_positions=eq_summary.get('open_positions', 0),
+                        equity_closed=eq_closed,
+                        commodity_capital=100000,
+                        commodity_pnl=comm_summary.get('actual_pnl', 0),
+                        commodity_positions=comm_summary.get('open_positions', 0),
+                        commodity_closed=comm_closed,
+                        equity_win_rate=eq_win_rate,
+                        commodity_win_rate=comm_win_rate,
+                        equity_signals=eq_summary.get('total_signals', 0),
+                        equity_dummy_pnl=eq_summary.get('dummy_pnl', 0),
+                        commodity_signals=comm_summary.get('total_signals', 0),
+                        commodity_dummy_pnl=comm_summary.get('dummy_pnl', 0),
+                        equity_capital_used=eq_summary.get('capital_used', 0),
+                        commodity_capital_used=comm_summary.get('capital_used', 0),
+                    )
+
+                    # Also save JSON report
                     report = {
                         'date': now.strftime('%Y-%m-%d'),
                         'timestamp': now.isoformat(),
+                        'equity': eq_summary,
+                        'commodity': comm_summary,
                     }
                     report_file = os.path.join(LOG_DIR, f'eod_report_{today_str}.json')
                     with open(report_file, 'w') as f:
                         json.dump(report, f, indent=2)
                     logger.info(f"EOD report saved: {report_file}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"EOD report error: {e}")
+                    import traceback
+                    traceback.print_exc()
 
                 stop_event.set()
 
