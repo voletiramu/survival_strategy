@@ -38,7 +38,7 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 for d in [PAPER_DIR, LOG_DIR, OPTIONS_DIR]:
     os.makedirs(d, exist_ok=True)
 
-INITIAL_CAPITAL = 300000
+INITIAL_CAPITAL = 200000  # Rs 2L for equity (all strategies share this pool)
 RISK_FREE_RATE = 0.065
 LOT_SIZES = {'NIFTY': 65, 'BANKNIFTY': 30, 'SENSEX': 20}  # NSE revised Jan 2026
 MARGIN_PER_LOT = {'NIFTY': 180000, 'BANKNIFTY': 200000, 'SENSEX': 150000}  # Adjusted for new lot sizes
@@ -476,6 +476,7 @@ class PaperPortfolio:
             'entry_iv': round(iv * 100, 1),
             'entry_spot': round(spot_price, 2),
             'max_risk': round(max_per_trade, 2),
+            'details': details or {},  # Store target/SL from strategy signals
         }
         self.positions.append(pos)
 
@@ -1320,7 +1321,7 @@ class PaperTrader:
                     else:
                         locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                 total_invested = locked
-                capital_available = self.portfolio.capital - locked
+                capital_available = EQUITY_CAPITAL - locked
                 notify_trade_entry(
                     market="EQUITY", strategy=sig['strategy'],
                     symbol=sig['symbol'], signal_type=sig['type'],
@@ -1547,7 +1548,7 @@ class PaperTrader:
                         else:
                             locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                     total_invested = locked
-                    capital_available = self.portfolio.capital - locked
+                    capital_available = EQUITY_CAPITAL - locked
                     notify_trade_exit(
                         market="EQUITY", strategy=pos['strategy'],
                         symbol=symbol, signal_type=pos['signal_type'],
@@ -1607,7 +1608,7 @@ class PaperTrader:
                         else:
                             locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                     total_invested = locked
-                    capital_available = self.portfolio.capital - locked
+                    capital_available = EQUITY_CAPITAL - locked
                     notify_trade_exit(
                         market="EQUITY", strategy=pos['strategy'],
                         symbol=symbol, signal_type=pos['signal_type'],

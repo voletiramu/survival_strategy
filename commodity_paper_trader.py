@@ -41,7 +41,7 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 for d in [PAPER_DIR, LOG_DIR]:
     os.makedirs(d, exist_ok=True)
 
-INITIAL_CAPITAL = 300000
+INITIAL_CAPITAL = 100000  # Rs 1L for commodities (all strategies share this pool)
 RISK_FREE_RATE = 0.065
 
 # Focus on MINI contracts (affordable with Rs 3L capital)
@@ -864,7 +864,7 @@ class CommodityPaperTrader:
                     else:
                         locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
                 total_invested = locked
-                capital_available = self.portfolio.capital - locked
+                capital_available = COMMODITY_CAPITAL - locked
                 notify_trade_entry(
                     market="COMMODITY", strategy=sig['strategy'],
                     symbol=sig['commodity'], signal_type=sig['type'],
@@ -955,7 +955,7 @@ class CommodityPaperTrader:
                         else:
                             locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
                     total_invested = locked
-                    capital_available = self.portfolio.capital - locked
+                    capital_available = COMMODITY_CAPITAL - locked
                     notify_trade_exit(
                         market="COMMODITY", strategy=pos['strategy'],
                         symbol=commodity, signal_type=pos['signal_type'],
