@@ -216,8 +216,11 @@ def equity_loop(interval_sec=45, offline=False, stop_event=None):
             trader.engine.load_historical(symbol)
 
         if not offline:
-            if not trader.connect():
-                logger.warning("[EquityThread] Angel API failed, using offline data")
+            try:
+                if not trader.connect():
+                    logger.warning("[EquityThread] Angel API connect returned False, continuing with offline data")
+            except Exception as e:
+                logger.warning(f"[EquityThread] Angel connection error: {e}. Continuing with offline data.")
 
         scan_count = 0
 
@@ -267,8 +270,11 @@ def commodity_loop(interval_sec=30, offline=False, stop_event=None):
             trader.engine.load_historical(comm)
 
         if not offline:
-            if not trader.connect():
-                logger.warning("[CommodityThread] Angel API failed, using offline data")
+            try:
+                if not trader.connect():
+                    logger.warning("[CommodityThread] Angel API connect returned False, continuing with offline data")
+            except Exception as e:
+                logger.warning(f"[CommodityThread] Angel connection error: {e}. Continuing with offline data.")
 
         scan_count = 0
 
@@ -527,10 +533,12 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
 
     threads = [t_equity, t_commodity, t_crypto]
 
-    # Start all threads
-    for t in threads:
+    # Start threads with stagger to avoid Angel API rate limiting
+    for i, t in enumerate(threads):
         t.start()
         logger.info(f"  Started thread: {t.name}")
+        if i < len(threads) - 1:
+            time.sleep(5)  # 5s gap between thread starts to avoid API rate limit
 
     # Main thread: heartbeat + monitor
     heartbeat_interval = 1800  # 30 minutes

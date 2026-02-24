@@ -178,7 +178,7 @@ class AngelConnection:
         return creds
 
     def connect(self, app_type='Historical'):
-        """Connect to Angel SmartAPI."""
+        """Connect to Angel SmartAPI with retry on rate limit."""
         try:
             from SmartApi import SmartConnect
             import pyotp
@@ -195,19 +195,30 @@ class AngelConnection:
         pin = app.get('ANGEL_PIN', '')
         totp_secret = app.get('ANGEL_TOTP_KEY', '')
 
-        logger.info(f"Connecting to Angel One ({app_type})...")
-        self.obj = SmartConnect(api_key=api_key)
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Connecting to Angel One ({app_type})... attempt {attempt+1}/{max_retries}")
+                self.obj = SmartConnect(api_key=api_key)
+                totp = pyotp.TOTP(totp_secret).now()
+                self.session = self.obj.generateSession(client, pin, totp)
 
-        totp = pyotp.TOTP(totp_secret).now()
-        self.session = self.obj.generateSession(client, pin, totp)
+                if self.session and self.session.get('status'):
+                    self._connected = True
+                    logger.info(f"Angel One connected: {client}")
+                    return True
+                else:
+                    logger.warning(f"Angel login failed (attempt {attempt+1}): {self.session}")
+            except Exception as e:
+                logger.warning(f"Angel connection error (attempt {attempt+1}): {e}")
 
-        if self.session and self.session.get('status'):
-            self._connected = True
-            logger.info(f"Angel One connected: {client}")
-            return True
-        else:
-            logger.error(f"Angel login failed: {self.session}")
-            return False
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s, 16s, 32s
+                logger.info(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+
+        logger.error(f"Angel One connection failed after {max_retries} attempts")
+        return False
 
     def get_ltp(self, exchange, symbol_token):
         """Get Last Traded Price."""

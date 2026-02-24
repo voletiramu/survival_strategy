@@ -590,15 +590,31 @@ class AngelMCXConnection:
                         current_app = {}
 
         app = creds.get('Historical', creds.get('Market', {}))
-        self.obj = SmartConnect(api_key=app['ANGEL_API_KEY'])
-        totp = pyotp.TOTP(app['ANGEL_TOTP_KEY']).now()
-        session = self.obj.generateSession(app['ANGEL_CLIENT_CODE'], app['ANGEL_PIN'], totp)
 
-        if session and session.get('status'):
-            self._connected = True
-            logger.info(f"Angel MCX connected")
-            self._load_mcx_tokens()
-            return True
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Connecting to Angel MCX... attempt {attempt+1}/{max_retries}")
+                self.obj = SmartConnect(api_key=app['ANGEL_API_KEY'])
+                totp = pyotp.TOTP(app['ANGEL_TOTP_KEY']).now()
+                session = self.obj.generateSession(app['ANGEL_CLIENT_CODE'], app['ANGEL_PIN'], totp)
+
+                if session and session.get('status'):
+                    self._connected = True
+                    logger.info(f"Angel MCX connected")
+                    self._load_mcx_tokens()
+                    return True
+                else:
+                    logger.warning(f"Angel MCX login failed (attempt {attempt+1}): {session}")
+            except Exception as e:
+                logger.warning(f"Angel MCX connection error (attempt {attempt+1}): {e}")
+
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s, 16s, 32s
+                logger.info(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+
+        logger.error(f"Angel MCX connection failed after {max_retries} attempts")
         return False
 
     def _load_mcx_tokens(self):
