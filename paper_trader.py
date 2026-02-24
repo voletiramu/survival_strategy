@@ -600,13 +600,29 @@ class StrategyEngine:
         self.historical_data = {}  # symbol -> DataFrame
 
     def load_historical(self, symbol):
-        """Load historical data for indicators."""
+        """Load historical data for indicators. Auto-download if missing/stale."""
         angel_map = {
             'NIFTY': 'NIFTY_spot_one_day_2000d.csv',
             'BANKNIFTY': 'BANKNIFTY_spot_one_day_2000d.csv',
             'SENSEX': 'SENSEX_spot_one_day_2000d.csv',
         }
         fpath = os.path.join(OPTIONS_DIR, angel_map.get(symbol, ''))
+
+        # Check if file needs downloading (missing or stale >7 days)
+        needs_download = False
+        if os.path.exists(fpath):
+            mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
+            age_days = (datetime.now() - mod_time).days
+            if age_days >= 7:
+                needs_download = True
+                logger.info(f"Historical data for {symbol} is stale ({age_days}d old), refreshing...")
+        else:
+            needs_download = True
+            logger.info(f"Historical data for {symbol} not found, downloading...")
+
+        if needs_download and self.angel and self.angel._connected:
+            self._download_historical_equity(symbol, fpath)
+
         if os.path.exists(fpath):
             df = pd.read_csv(fpath, parse_dates=['DateTime'], index_col='DateTime')
             if df.index.tz is not None:
@@ -628,7 +644,58 @@ class StrategyEngine:
             self.historical_data[symbol] = df
             logger.info(f"Loaded {len(df)} Yahoo days for {symbol}")
             return df
+
+        logger.error(f"No historical data found for {symbol} — indicators will not work")
         return None
+
+    def _download_historical_equity(self, symbol, save_path):
+        """Download daily OHLC data from Angel SmartAPI for equity indices."""
+        try:
+            # Well-known Angel One tokens for indices
+            token_map = {'NIFTY': '99926000', 'BANKNIFTY': '99926009', 'SENSEX': '99919000'}
+            token = token_map.get(symbol)
+
+            if not token:
+                # Fallback: look up from instrument master
+                if self.angel.instruments is None:
+                    self.angel.load_instruments()
+                if self.angel.instruments is not None:
+                    nse_df = self.angel.instruments[
+                        (self.angel.instruments['name'] == symbol) &
+                        (self.angel.instruments['exch_seg'] == 'NSE')
+                    ]
+                    if len(nse_df) > 0:
+                        token = str(nse_df.iloc[0]['token'])
+
+            if not token:
+                logger.warning(f"Could not find Angel token for {symbol}, skipping download")
+                return
+
+            logger.info(f"Downloading historical data for {symbol} (token={token})...")
+            all_data = []
+            chunk_start = datetime.now() - timedelta(days=2000)
+
+            while chunk_start < datetime.now():
+                chunk_end = min(chunk_start + timedelta(days=500), datetime.now())
+                data = self.angel.get_historical(
+                    'NSE', token, 'ONE_DAY',
+                    chunk_start.strftime('%Y-%m-%d 09:15'),
+                    chunk_end.strftime('%Y-%m-%d 15:30')
+                )
+                if data:
+                    all_data.extend(data)
+                chunk_start = chunk_end + timedelta(days=1)
+                time.sleep(0.5)  # Rate limit between API calls
+
+            if all_data:
+                df = pd.DataFrame(all_data, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                df.to_csv(save_path, index=False)
+                logger.info(f"Downloaded {len(df)} days for {symbol} → {save_path}")
+            else:
+                logger.warning(f"No data returned from Angel API for {symbol}")
+        except Exception as e:
+            logger.error(f"Download failed for {symbol}: {e}")
 
     def compute_indicators(self, symbol, current_ohlc=None):
         """Compute all indicators needed for strategies."""

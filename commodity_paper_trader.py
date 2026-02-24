@@ -350,13 +350,31 @@ class CommodityPortfolio:
 class CommodityStrategyEngine:
     """Generate signals from strategies adapted for commodities."""
 
-    def __init__(self, portfolio):
+    def __init__(self, portfolio, angel=None):
         self.portfolio = portfolio
+        self.angel = angel
         self.historical_data = {}
 
     def load_historical(self, commodity):
+        """Load historical data for commodity. Auto-download if missing/stale."""
         spec = COMMODITIES[commodity]
         fpath = os.path.join(DATA_DIR, spec['file'])
+
+        # Check if file needs downloading (missing or stale >7 days)
+        needs_download = False
+        if os.path.exists(fpath):
+            mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
+            age_days = (datetime.now() - mod_time).days
+            if age_days >= 7:
+                needs_download = True
+                logger.info(f"Historical data for {commodity} is stale ({age_days}d old), refreshing...")
+        else:
+            needs_download = True
+            logger.info(f"Historical data for {commodity} not found, downloading...")
+
+        if needs_download and self.angel and self.angel._connected:
+            self._download_historical_commodity(commodity, fpath)
+
         if os.path.exists(fpath):
             df = pd.read_csv(fpath, parse_dates=['DateTime'], index_col='DateTime')
             if df.index.tz is not None:
@@ -365,7 +383,44 @@ class CommodityStrategyEngine:
             self.historical_data[commodity] = df
             logger.info(f"Loaded {len(df)} days for {commodity}")
             return df
+
+        logger.error(f"No historical data found for {commodity} — indicators will not work")
         return None
+
+    def _download_historical_commodity(self, commodity, save_path):
+        """Download daily OHLC data from Angel SmartAPI for MCX commodity."""
+        try:
+            # Use the futures token from angel connection
+            token = self.angel._futures_tokens.get(commodity)
+            if not token:
+                logger.warning(f"No futures token for {commodity}, skipping download")
+                return
+
+            logger.info(f"Downloading historical data for {commodity} (token={token})...")
+            all_data = []
+            chunk_start = datetime.now() - timedelta(days=2000)
+
+            while chunk_start < datetime.now():
+                chunk_end = min(chunk_start + timedelta(days=500), datetime.now())
+                data = self.angel.get_historical(
+                    'MCX', token, 'ONE_DAY',
+                    chunk_start.strftime('%Y-%m-%d 09:00'),
+                    chunk_end.strftime('%Y-%m-%d 23:30')
+                )
+                if data:
+                    all_data.extend(data)
+                chunk_start = chunk_end + timedelta(days=1)
+                time.sleep(0.5)  # Rate limit between API calls
+
+            if all_data:
+                df = pd.DataFrame(all_data, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                df.to_csv(save_path, index=False)
+                logger.info(f"Downloaded {len(df)} days for {commodity} → {save_path}")
+            else:
+                logger.warning(f"No data returned from Angel API for {commodity}")
+        except Exception as e:
+            logger.error(f"Download failed for {commodity}: {e}")
 
     def compute_indicators(self, commodity, current_ohlc=None):
         df = self.historical_data.get(commodity)
@@ -629,6 +684,25 @@ class AngelMCXConnection:
                     futs_sorted = futs.sort_values('expiry')
                     self._futures_tokens[comm] = str(futs_sorted.iloc[0]['token'])
 
+    def get_historical(self, exchange, token, interval, from_date, to_date):
+        """Get historical candle data from Angel SmartAPI."""
+        if not self._connected:
+            return None
+        try:
+            params = {
+                "exchange": exchange,
+                "symboltoken": token,
+                "interval": interval,
+                "fromdate": from_date,
+                "todate": to_date
+            }
+            data = self.obj.getCandleData(params)
+            if data and data.get('data'):
+                return data['data']
+        except Exception as e:
+            logger.error(f"MCX Historical error: {e}")
+        return None
+
     def get_ltp(self, commodity):
         if not self._connected or commodity not in self._futures_tokens:
             return None
@@ -650,7 +724,7 @@ class CommodityPaperTrader:
     def __init__(self):
         self.angel = AngelMCXConnection()
         self.portfolio = CommodityPortfolio()
-        self.engine = CommodityStrategyEngine(self.portfolio)
+        self.engine = CommodityStrategyEngine(self.portfolio, self.angel)
         self._running = False
 
     def connect(self):
@@ -702,6 +776,7 @@ class CommodityPaperTrader:
 
             indicators = self.engine.compute_indicators(commodity, ohlc)
             if not indicators:
+                logger.warning(f"  No indicators for {commodity}")
                 continue
 
             logger.info(f"  ATR: {indicators['atr']:,.2f} | IV: {indicators['iv']*100:.1f}% | "
