@@ -842,7 +842,7 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
-            self.portfolio.add_signal(
+            result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
                 commodity=sig['commodity'],
                 signal_type=sig['type'],
@@ -853,6 +853,9 @@ class CommodityPaperTrader:
                 details={'reason': sig['reason'], 'target': sig.get('target'),
                          'sl': sig.get('sl'), 'spot': sig.get('spot')},
             )
+            if result is None:
+                skipped += 1
+                continue
             executed += 1
 
             # Send Telegram notification

@@ -1286,7 +1286,7 @@ class PaperTrader:
                 continue
 
             g = sig['greeks']
-            self.portfolio.add_signal(
+            result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
                 symbol=sig['symbol'],
                 signal_type=sig['type'],
@@ -1305,6 +1305,9 @@ class PaperTrader:
                 },
                 spot_price=sig.get('spot', 0),
             )
+            if result is None:
+                skipped += 1
+                continue
             executed += 1
 
             # Send Telegram notification
