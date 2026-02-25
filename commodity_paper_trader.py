@@ -722,22 +722,39 @@ class AngelMCXConnection:
 # ====================================================================
 class CommodityPaperTrader:
 
-    def __init__(self):
+    def __init__(self, ws_feed=None):
         self.angel = AngelMCXConnection()
         self.portfolio = CommodityPortfolio()
         self.engine = CommodityStrategyEngine(self.portfolio, self.angel)
         self._running = False
+        self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
 
     def connect(self):
-        return self.angel.connect()
+        connected = self.angel.connect()
+        # Share MCX futures tokens with WebSocket feed for subscription
+        if connected and self.ws_feed and self.angel._futures_tokens:
+            self.ws_feed.set_mcx_tokens(self.angel._futures_tokens)
+        return connected
 
     def get_spot(self, commodity):
+        """Get current spot price for commodity.
+        Priority: WebSocket cache -> REST API -> historical close.
+        """
+        # 1. Try WebSocket cache (instant, no API call)
+        if self.ws_feed and commodity in self.angel._futures_tokens:
+            ws_ltp = self.ws_feed.get_ltp(self.angel._futures_tokens[commodity])
+            if ws_ltp:
+                return ws_ltp
+
+        # 2. Fallback: REST API
         ltp = self.angel.get_ltp(commodity)
         if ltp:
             return ltp
+
+        # 3. Fallback: historical close
         df = self.engine.historical_data.get(commodity)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]

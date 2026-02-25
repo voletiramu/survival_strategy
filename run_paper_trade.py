@@ -52,9 +52,10 @@ MCX_CLOSE = dtime(23, 30)
 COMMODITY_TRADE_START = dtime(9, 15)  # Commodity trades from 9:15 AM (no time barrier)
 
 # Default scan intervals (seconds)
-DEFAULT_EQUITY_INTERVAL = 45    # 45 seconds for NIFTY, BANKNIFTY, SENSEX
-DEFAULT_COMMODITY_INTERVAL = 30  # 30 seconds for GOLDM, SILVERM, CRUDEOILM
-DEFAULT_CRYPTO_INTERVAL = 300    # 5 minutes for BTC, ETH, SOL
+# With WebSocket real-time LTP, we can scan faster (no REST API call for spot prices)
+DEFAULT_EQUITY_INTERVAL = 15    # 15 seconds — was 45s before WebSocket
+DEFAULT_COMMODITY_INTERVAL = 10  # 10 seconds — was 30s before WebSocket
+DEFAULT_CRYPTO_INTERVAL = 300    # 5 minutes for BTC, ETH, SOL (Binance, not Angel)
 
 # Instance identification & PID lock
 LOCK_DIR = os.path.join(BASE_DIR, 'locks')
@@ -133,11 +134,11 @@ def print_banner():
     print("  " + "-" * 64)
     print("  EQUITY:     NIFTY | BANKNIFTY | SENSEX")
     print("              Strategies: CPR, Gamma Blast, Ghost Zone, PCR+VWAP, Survivor")
-    print(f"              Scan: Every {DEFAULT_EQUITY_INTERVAL}s | Hours: 9:15 AM - 3:30 PM IST")
+    print(f"              Scan: Every {DEFAULT_EQUITY_INTERVAL}s (WebSocket LTP) | Hours: 9:15 AM - 3:30 PM IST")
     print("  " + "-" * 64)
     print("  COMMODITY:  Gold Mini | Silver Mini | Crude Oil Mini")
     print("              Strategies: CPR, Gamma Blast, Ghost Zone")
-    print(f"              Scan: Every {DEFAULT_COMMODITY_INTERVAL}s | Hours: 9:00 AM - 11:30 PM IST")
+    print(f"              Scan: Every {DEFAULT_COMMODITY_INTERVAL}s (WebSocket LTP) | Hours: 9:00 AM - 11:30 PM IST")
     print("  " + "-" * 64)
     print("  CRYPTO:     BTC | ETH | SOL (24/7)")
     print("  " + "-" * 64)
@@ -204,9 +205,10 @@ def run_commodity_scan(offline=False):
 # Shared dict for passing trader references from threads to main (for EOD report)
 _trader_refs = {}
 
-def equity_loop(interval_sec=45, offline=False, stop_event=None):
-    """Equity scanning thread: NIFTY, BANKNIFTY, SENSEX every 45 seconds.
+def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
+    """Equity scanning thread: NIFTY, BANKNIFTY, SENSEX every 15 seconds.
     Creates ONE PaperTrader instance and reuses it across scans.
+    Uses WebSocket feed for real-time LTP (falls back to REST if WS unavailable).
     """
     logger.info(f"[EquityThread] Starting | Interval: {interval_sec}s | Hours: {EQUITY_OPEN}-{EQUITY_CLOSE}")
 
@@ -214,7 +216,7 @@ def equity_loop(interval_sec=45, offline=False, stop_event=None):
         sys.path.insert(0, BASE_DIR)
         from paper_trader import PaperTrader
 
-        trader = PaperTrader()
+        trader = PaperTrader(ws_feed=ws_feed)
         _trader_refs['equity'] = trader  # Share for EOD report
         for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
             trader.engine.load_historical(symbol)
@@ -259,9 +261,10 @@ def equity_loop(interval_sec=45, offline=False, stop_event=None):
     logger.info(f"[EquityThread] Exited after {scan_count if 'scan_count' in dir() else 0} scans")
 
 
-def commodity_loop(interval_sec=30, offline=False, stop_event=None):
-    """Commodity scanning thread: GOLDM, SILVERM, CRUDEOILM every 30 seconds.
+def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None):
+    """Commodity scanning thread: GOLDM, SILVERM, CRUDEOILM every 10 seconds.
     Creates ONE CommodityPaperTrader instance and reuses it across scans.
+    Uses WebSocket feed for real-time LTP (falls back to REST if WS unavailable).
     """
     logger.info(f"[CommodityThread] Starting | Interval: {interval_sec}s | Hours: {MCX_OPEN}-{MCX_CLOSE}")
 
@@ -269,7 +272,7 @@ def commodity_loop(interval_sec=30, offline=False, stop_event=None):
         sys.path.insert(0, BASE_DIR)
         from commodity_paper_trader import CommodityPaperTrader, PAPER_TRADE_COMMODITIES
 
-        trader = CommodityPaperTrader()
+        trader = CommodityPaperTrader(ws_feed=ws_feed)
         _trader_refs['commodity'] = trader  # Share for EOD report
         for comm in PAPER_TRADE_COMMODITIES:
             trader.engine.load_historical(comm)
@@ -426,13 +429,13 @@ def reset_all():
 # MAIN CONTINUOUS RUNNER (Threaded)
 # ====================================================================
 
-def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=300,
+def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=300,
                    offline=False, instance_id='local', force=False):
     """Run all systems in SEPARATE THREADS with independent scan intervals.
 
     Args:
-        equity_interval: Seconds between equity scans (default 45)
-        commodity_interval: Seconds between commodity scans (default 30)
+        equity_interval: Seconds between equity scans (default 15 — fast with WebSocket LTP)
+        commodity_interval: Seconds between commodity scans (default 10 — fast with WebSocket LTP)
         crypto_interval: Seconds between crypto scans (default 300)
         offline: If True, don't connect to Angel API
         instance_id: 'local' or 'gcloud' (identifies this instance)
@@ -452,6 +455,21 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # ---- Start WebSocket real-time feed (shared by equity + commodity) ----
+    ws_feed = None
+    if not offline:
+        try:
+            from ws_feed import create_ws_feed_from_creds
+            ws_feed, _ws_obj = create_ws_feed_from_creds()
+            if ws_feed and ws_feed.is_connected:
+                logger.info("[MAIN] WebSocket real-time feed ACTIVE — LTP from WebSocket")
+            else:
+                logger.warning("[MAIN] WebSocket feed failed to start — using REST API fallback")
+                ws_feed = None
+        except Exception as e:
+            logger.warning(f"[MAIN] WebSocket setup failed: {e} — using REST API fallback")
+            ws_feed = None
+
     # Send Telegram startup notification with instance ID
     instance_label = get_instance_label(instance_id)
     try:
@@ -460,10 +478,12 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
 
+    ws_status = "WebSocket" if ws_feed else "REST API polling"
     logger.info("=" * 70)
     logger.info(f"THREADED PAPER TRADING SYSTEM STARTING — {instance_label}")
     logger.info("=" * 70)
     logger.info(f"  Instance:           {instance_id} ({instance_label})")
+    logger.info(f"  Data feed:          {ws_status}")
     logger.info(f"  Equity interval:    {equity_interval}s ({equity_interval/60:.1f} min)")
     logger.info(f"  Commodity interval: {commodity_interval}s ({commodity_interval/60:.1f} min)")
     logger.info(f"  Crypto interval:    {crypto_interval}s ({crypto_interval/60:.1f} min)")
@@ -475,17 +495,17 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
     logger.info(f"  Press Ctrl+C to stop")
     logger.info("=" * 70 + "\n")
 
-    # Create threads
+    # Create threads (pass ws_feed to equity and commodity)
     t_equity = threading.Thread(
         target=equity_loop,
-        args=(equity_interval, offline, stop_event),
+        args=(equity_interval, offline, stop_event, ws_feed),
         name="EquityThread",
         daemon=True
     )
 
     t_commodity = threading.Thread(
         target=commodity_loop,
-        args=(commodity_interval, offline, stop_event),
+        args=(commodity_interval, offline, stop_event, ws_feed),
         name="CommodityThread",
         daemon=True
     )
@@ -582,6 +602,10 @@ def run_continuous(equity_interval=45, commodity_interval=30, crypto_interval=30
         else:
             logger.info(f"  Thread {t.name} exited")
 
+    # Shutdown WebSocket feed
+    if ws_feed:
+        ws_feed.stop()
+
     # Release PID lock
     release_lock()
 
@@ -597,10 +621,10 @@ def main():
     parser.add_argument('--once', action='store_true', help='Single scan both markets')
     parser.add_argument('--interval', type=float, default=None,
                         help='Legacy: set ALL intervals (minutes). Overridden by per-market args.')
-    parser.add_argument('--equity-interval', type=float, default=0.75,
-                        help='Equity scan interval in minutes (default: 0.75 = 45s)')
-    parser.add_argument('--commodity-interval', type=float, default=0.5,
-                        help='Commodity scan interval in minutes (default: 0.5 = 30s)')
+    parser.add_argument('--equity-interval', type=float, default=0.25,
+                        help='Equity scan interval in minutes (default: 0.25 = 15s with WebSocket)')
+    parser.add_argument('--commodity-interval', type=float, default=0.167,
+                        help='Commodity scan interval in minutes (default: 0.167 = 10s with WebSocket)')
     parser.add_argument('--crypto-interval', type=float, default=5,
                         help='Crypto scan interval in minutes (default: 5)')
     parser.add_argument('--offline', action='store_true', help='Run offline (no API)')

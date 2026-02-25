@@ -1095,11 +1095,12 @@ class StrategyEngine:
 class PaperTrader:
     """Main paper trading orchestrator."""
 
-    def __init__(self):
+    def __init__(self, ws_feed=None):
         self.angel = AngelConnection()
         self.portfolio = PaperPortfolio()
         self.engine = StrategyEngine(self.angel, self.portfolio)
         self._running = False
+        self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         self._index_tokens = {
             'NIFTY': {'exchange': 'NSE', 'token': '99926000'},
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
@@ -1122,16 +1123,25 @@ class PaperTrader:
         return False
 
     def get_index_spot(self, symbol):
-        """Get current spot price for index."""
+        """Get current spot price for index.
+        Priority: WebSocket cache → REST API → historical close.
+        """
         info = self._index_tokens.get(symbol)
         if not info:
             return None
 
+        # 1. Try WebSocket cache (instant, no API call)
+        if self.ws_feed:
+            ws_ltp = self.ws_feed.get_ltp(info['token'])
+            if ws_ltp:
+                return ws_ltp
+
+        # 2. Fallback: REST API
         ltp = self.angel.get_ltp(info['exchange'], info['token'])
         if ltp:
             return ltp
 
-        # Fallback: use last close from historical data
+        # 3. Fallback: use last close from historical data
         df = self.engine.historical_data.get(symbol)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
