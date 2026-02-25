@@ -1,0 +1,97 @@
+//@version=5
+// ============================================================================
+// PCR + VWAP Strategy - CA Nitin Muraka Method
+// Direction from PCR proxy, Entry from VWAP
+// ============================================================================
+// DISCLAIMER: Educational purposes only. Not financial advice.
+// ============================================================================
+
+indicator("PCR+VWAP Strategy - CA Nitin Muraka", overlay=true)
+
+// === INPUTS ===
+pcrLookback     = input.int(5, "PCR Lookback (days)", minval=2, maxval=20)
+vwapTolerance   = input.float(0.3, "VWAP Tolerance %", step=0.05)
+showVWAP        = input.bool(true, "Show VWAP")
+showPCR         = input.bool(true, "Show PCR Panel")
+showSignals     = input.bool(true, "Show Trade Signals")
+sessionStart    = input.session("1030-1530", "Trading Session")
+
+// === VWAP CALCULATION ===
+// Using built-in VWAP
+vwapValue = ta.vwap(hlc3)
+
+// === PCR PROXY (Volume-based sentiment) ===
+// Since real PCR needs OI data, we use volume on up/down candles as proxy
+isUpCandle   = close > open
+isDownCandle = close < open
+
+upVolume   = ta.sma(isUpCandle ? volume : 0, pcrLookback)
+downVolume = ta.sma(isDownCandle ? volume : 0, pcrLookback)
+pcrProxy   = upVolume / math.max(downVolume, 1)
+
+isBullish = pcrProxy > 1.0
+isBearish = pcrProxy < 1.0
+
+// === SESSION FILTER ===
+inSession = not na(time(timeframe.period, sessionStart))
+
+// === ENTRY CONDITIONS ===
+nearVWAP = math.abs(close - vwapValue) / vwapValue * 100 < vwapTolerance
+
+// Buy CE: PCR bullish + price dips to VWAP and bounces
+buyCE = isBullish and low <= vwapValue * 1.003 and close > vwapValue and inSession
+// Buy PE: PCR bearish + price rallies to VWAP and rejects
+buyPE = isBearish and high >= vwapValue * 0.997 and close < vwapValue and inSession
+
+// === STOP LOSS & TARGET LEVELS ===
+ceStopLoss = vwapValue * (1 - vwapTolerance / 100)
+ceTarget   = close + (close - ceStopLoss) * 2  // 2:1 RR
+
+peStopLoss = vwapValue * (1 + vwapTolerance / 100)
+peTarget   = close - (peStopLoss - close) * 2
+
+// === PLOTTING ===
+plot(showVWAP ? vwapValue : na, "VWAP", color.new(color.purple, 0), 2)
+
+// VWAP bands
+vwapUpper = vwapValue * (1 + vwapTolerance / 100)
+vwapLower = vwapValue * (1 - vwapTolerance / 100)
+p1 = plot(showVWAP ? vwapUpper : na, "VWAP Upper", color.new(color.purple, 70), 1)
+p2 = plot(showVWAP ? vwapLower : na, "VWAP Lower", color.new(color.purple, 70), 1)
+fill(p1, p2, color=color.new(color.purple, 92), title="VWAP Zone")
+
+// Signals
+plotshape(showSignals and buyCE, "Buy CE", shape.triangleup, location.belowbar,
+          color.new(color.green, 0), size=size.normal, text="BUY CE\n(PCR Bullish)")
+plotshape(showSignals and buyPE, "Buy PE", shape.triangledown, location.abovebar,
+          color.new(color.red, 0), size=size.normal, text="BUY PE\n(PCR Bearish)")
+
+// SL and Target lines on signal
+plot(buyCE ? ceStopLoss : na, "CE Stop Loss", color.red, 1, plot.style_linebr)
+plot(buyCE ? ceTarget : na, "CE Target", color.green, 1, plot.style_linebr)
+plot(buyPE ? peStopLoss : na, "PE Stop Loss", color.red, 1, plot.style_linebr)
+plot(buyPE ? peTarget : na, "PE Target", color.green, 1, plot.style_linebr)
+
+// Background
+bgcolor(isBullish ? color.new(color.green, 95) : isBearish ? color.new(color.red, 95) : na,
+        title="PCR Bias")
+
+// === PCR INFO TABLE ===
+if showPCR
+    var table pcrTable = table.new(position.bottom_right, 2, 4, border_width=1)
+    if barstate.islast
+        table.cell(pcrTable, 0, 0, "PCR Proxy", bgcolor=color.new(color.gray, 80))
+        table.cell(pcrTable, 1, 0, str.tostring(pcrProxy, "#.##"),
+                   bgcolor=isBullish ? color.new(color.green, 80) : color.new(color.red, 80))
+        table.cell(pcrTable, 0, 1, "Bias", bgcolor=color.new(color.gray, 80))
+        table.cell(pcrTable, 1, 1, isBullish ? "BULLISH (Buy CE)" : "BEARISH (Buy PE)",
+                   bgcolor=isBullish ? color.new(color.green, 80) : color.new(color.red, 80))
+        table.cell(pcrTable, 0, 2, "VWAP", bgcolor=color.new(color.gray, 80))
+        table.cell(pcrTable, 1, 2, str.tostring(vwapValue, "#.##"))
+        table.cell(pcrTable, 0, 3, "Session", bgcolor=color.new(color.gray, 80))
+        table.cell(pcrTable, 1, 3, inSession ? "ACTIVE" : "CLOSED",
+                   bgcolor=inSession ? color.new(color.green, 80) : color.new(color.gray, 80))
+
+// === ALERTS ===
+alertcondition(buyCE, "Buy CE Signal", "PCR+VWAP: Buy Call Option - Bullish PCR + VWAP Bounce")
+alertcondition(buyPE, "Buy PE Signal", "PCR+VWAP: Buy Put Option - Bearish PCR + VWAP Reject")

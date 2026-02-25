@@ -1,0 +1,7 @@
+Strategy,Symbol,Trades,Win %,Total PnL,Return %,Ann Ret %,Max DD %,Sharpe,Sortino,PF,Calmar
+Survivor (Raahi Bhushan),BANKNIFTY,1820,91.8,"23,359,943",7786.6,140.1,-4.0,5.13,9.66,69.03,35.34
+Survivor V2 (OI+Gamma),BANKNIFTY,2155,95.7,"49,122,482",16374.2,181.4,-1.0,5.81,19.53,336.50,173.78
+Gamma Blast (Expiry),BANKNIFTY,6,100.0,"14,485",4.8,1.0,0.0,-5.39,0.00,inf,0.00
+PCR+VWAP (CA Nitin Muraka),NIFTY50,449,98.0,"530,629",176.9,23.7,-0.0,7.85,189.72,1138.19,1080.83
+PCR+VWAP V2 (OI Enhanced),NIFTY50,72,98.6,"117,555",39.2,7.2,-0.0,0.53,0.00,5480.26,1001.39
+PCR+VWAP V2 (OI Enhanced),BANKNIFTY,87,100.0,"230,960",77.0,12.7,0.0,1.96,0.00,inf,0.00

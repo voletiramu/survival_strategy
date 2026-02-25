@@ -1,0 +1,125 @@
+//@version=5
+// ============================================================================
+// CPR (Central Pivot Range) Strategy - Gomathi Shankar Method
+// For Nifty50, BankNifty, Sensex - Intraday Options Trading
+// ============================================================================
+// DISCLAIMER: Educational purposes only. Not financial advice.
+// ============================================================================
+
+indicator("CPR Strategy - Gomathi Shankar", overlay=true, max_lines_count=500)
+
+// === INPUTS ===
+showCPR         = input.bool(true, "Show CPR Levels")
+showPivots      = input.bool(true, "Show Standard Pivots (S1/S2/R1/R2)")
+showCamarilla   = input.bool(true, "Show Camarilla Levels")
+narrowThreshold = input.float(0.3, "Narrow CPR Threshold %", step=0.05)
+showSignals     = input.bool(true, "Show Buy/Sell Signals")
+alertOn         = input.bool(true, "Enable Alerts")
+
+// === CPR CALCULATION (Previous Day OHLC) ===
+prevHigh  = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+prevLow   = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+prevClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+
+// Central Pivot Range
+pivot = (prevHigh + prevLow + prevClose) / 3
+bc    = (prevHigh + prevLow) / 2           // Bottom CPR
+tc    = (pivot - bc) + pivot                // Top CPR
+
+// Standard Pivot Levels
+r1 = (2 * pivot) - prevLow
+r2 = pivot + (prevHigh - prevLow)
+r3 = prevHigh + 2 * (pivot - prevLow)
+s1 = (2 * pivot) - prevHigh
+s2 = pivot - (prevHigh - prevLow)
+s3 = prevLow - 2 * (prevHigh - pivot)
+
+// Camarilla Pivots
+rangeHL = prevHigh - prevLow
+cam_r3 = prevClose + rangeHL * 1.1 / 4
+cam_r4 = prevClose + rangeHL * 1.1 / 2
+cam_s3 = prevClose - rangeHL * 1.1 / 4
+cam_s4 = prevClose - rangeHL * 1.1 / 2
+
+// === CPR WIDTH ANALYSIS ===
+cprWidth    = math.abs(tc - bc)
+cprWidthPct = (cprWidth / pivot) * 100
+isNarrowCPR = cprWidthPct < narrowThreshold
+
+// === PLOTTING CPR ===
+pivotColor = color.new(color.orange, 0)
+tcColor    = color.new(color.blue, 0)
+bcColor    = color.new(color.blue, 0)
+
+plot(showCPR ? pivot : na, "Pivot", pivotColor, 2, plot.style_circles)
+plot(showCPR ? tc : na, "TC (Top CPR)", tcColor, 1, plot.style_cross)
+plot(showCPR ? bc : na, "BC (Bottom CPR)", bcColor, 1, plot.style_cross)
+
+// Fill CPR zone
+p_tc = plot(showCPR ? tc : na, display=display.none)
+p_bc = plot(showCPR ? bc : na, display=display.none)
+fill(p_tc, p_bc, color=isNarrowCPR ? color.new(color.red, 85) : color.new(color.blue, 90),
+     title="CPR Zone")
+
+// === PLOTTING STANDARD PIVOTS ===
+plot(showPivots ? r1 : na, "R1", color.new(color.red, 30), 1, plot.style_stepline)
+plot(showPivots ? r2 : na, "R2", color.new(color.red, 50), 1, plot.style_stepline)
+plot(showPivots ? s1 : na, "S1", color.new(color.green, 30), 1, plot.style_stepline)
+plot(showPivots ? s2 : na, "S2", color.new(color.green, 50), 1, plot.style_stepline)
+
+// === PLOTTING CAMARILLA ===
+plot(showCamarilla ? cam_r3 : na, "Cam R3", color.new(color.purple, 40), 1, plot.style_stepline)
+plot(showCamarilla ? cam_s3 : na, "Cam S3", color.new(color.teal, 40), 1, plot.style_stepline)
+
+// === SIGNAL GENERATION ===
+// Narrow CPR Breakout
+bullishBreakout = isNarrowCPR and close > tc and close > r1 and open > tc
+bearishBreakout = isNarrowCPR and close < bc and close < s1 and open < bc
+
+// Wide CPR Reversal with Camarilla
+camR3insideCPR = cam_r3 >= bc and cam_r3 <= tc
+camS3insideCPR = cam_s3 >= bc and cam_s3 <= tc
+
+bullishReversal = not isNarrowCPR and camS3insideCPR and low <= cam_s3 and close > cam_s3
+bearishReversal = not isNarrowCPR and camR3insideCPR and high >= cam_r3 and close < cam_r3
+
+// Standard CPR bounce
+bullishBounce = not isNarrowCPR and low <= bc * 1.001 and close > pivot
+bearishBounce = not isNarrowCPR and high >= tc * 0.999 and close < pivot
+
+// Combined signals
+buySignal  = (bullishBreakout or bullishReversal or bullishBounce) and showSignals
+sellSignal = (bearishBreakout or bearishReversal or bearishBounce) and showSignals
+
+// === PLOT SIGNALS ===
+plotshape(buySignal, "Buy CE", shape.triangleup, location.belowbar,
+          color.new(color.green, 0), size=size.small,
+          text="BUY CE")
+plotshape(sellSignal, "Buy PE", shape.triangledown, location.abovebar,
+          color.new(color.red, 0), size=size.small,
+          text="BUY PE")
+
+// === TABLE: CPR INFO ===
+var table infoTable = table.new(position.top_right, 2, 6, border_width=1)
+if barstate.islast
+    cprType = isNarrowCPR ? "NARROW (Breakout)" : "WIDE (Range)"
+    table.cell(infoTable, 0, 0, "CPR Type", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTable, 1, 0, cprType,
+               bgcolor=isNarrowCPR ? color.new(color.red, 80) : color.new(color.blue, 80))
+    table.cell(infoTable, 0, 1, "CPR Width %", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTable, 1, 1, str.tostring(cprWidthPct, "#.##") + "%")
+    table.cell(infoTable, 0, 2, "Pivot", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTable, 1, 2, str.tostring(pivot, "#.##"))
+    table.cell(infoTable, 0, 3, "TC", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTable, 1, 3, str.tostring(tc, "#.##"))
+    table.cell(infoTable, 0, 4, "BC", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTable, 1, 4, str.tostring(bc, "#.##"))
+    bias = close > pivot ? "BULLISH" : "BEARISH"
+    table.cell(infoTable, 0, 5, "Bias", bgcolor=color.new(color.gray, 80))
+    table.cell(infoTable, 1, 5, bias,
+               bgcolor=close > pivot ? color.new(color.green, 80) : color.new(color.red, 80))
+
+// === ALERTS ===
+alertcondition(buySignal, "CPR Buy CE Signal", "CPR: Buy Call Option Signal")
+alertcondition(sellSignal, "CPR Buy PE Signal", "CPR: Buy Put Option Signal")
+alertcondition(isNarrowCPR, "Narrow CPR Day", "Tomorrow is Narrow CPR - Expect Trending Day")

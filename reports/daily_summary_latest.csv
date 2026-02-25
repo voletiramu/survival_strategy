@@ -1,0 +1,2 @@
+Date,Equity_PnL,Commodity_PnL,Total_PnL,Equity_Cumulative,Commodity_Cumulative,Total_Cumulative,Equity_Capital,Commodity_Capital,Combined_Capital,Equity_Trades,Commodity_Trades,Total_Trades,Wins,Losses,Win_Rate_Pct,Daily_Return_Pct
+2026-02-16,1331.03,0,1331.03,1331.03,0,1331.03,301331.03,300000,601331.03,1,0,1,1,0,100.0,0.2218
