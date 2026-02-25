@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AllPaper")
 
-broker = AngelBroker()
+broker = Angel_broker()
 order_tracker = OrderTracker()
 
 from strategies.survivor_strategy import SurvivorStrategy
