@@ -24,11 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AllPaper")
 
-# Broker and Tracker
 broker = AngelBroker()
 order_tracker = OrderTracker()
 
-# Import all 7 strategies
 from strategies.survivor_strategy import SurvivorStrategy
 from strategies.survivor_v2_oi_gamma import SurvivorV2Strategy
 from strategies.gamma_blast_strategy import GammaBlastStrategy
@@ -60,7 +58,6 @@ def run_strategy(name, StrategyClass, capital):
         logger.error(f"{name} crashed: {e}", exc_info=True)
         send_telegram(f"❌ {name} crashed: {e}")
 
-# Start all 7 strategies in parallel
 threads = []
 for name, cls, cap in strategies_list:
     t = threading.Thread(target=run_strategy, args=(name, cls, cap), daemon=True, name=name)
@@ -70,6 +67,5 @@ for name, cls, cap in strategies_list:
 logger.info("🎉 ALL 7 STRATEGIES RUNNING IN PAPER MODE")
 send_telegram("🎉 All 7 strategies started in paper trading on GCP!\nNifty + BankNifty + SENSEX active.\nWinner will be picked in 5-10 days.")
 
-# Keep main thread alive
 while True:
     time.sleep(3600)
