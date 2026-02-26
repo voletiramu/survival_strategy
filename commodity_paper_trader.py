@@ -102,10 +102,12 @@ MAX_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
 MAX_POSITIONS_PER_COMMODITY = 3                         # Prevent cascade (e.g., 16 SILVERM trades)
 MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 30,000 (10% daily loss limit)
 
-# Trailing Stop Loss Parameters
-TSL_BREAKEVEN_TRIGGER_PCT = 30   # Lock breakeven when 30% of target distance reached
-TSL_TRAIL_TRIGGER_PCT = 50       # Start trailing when 50% of target distance reached
-TSL_TRAIL_DISTANCE_PCT = 25      # Trail at 25% below peak unrealized profit
+# Trailing Stop Loss Parameters (multi-phase for max profit capture)
+TSL_BREAKEVEN_TRIGGER_PCT = 30   # Phase 1: Lock breakeven when 30% of target reached
+TSL_TRAIL_TRIGGER_PCT = 50       # Phase 2: Start trailing when 50% of target reached
+TSL_TRAIL_DISTANCE_PCT = 25      # Phase 2 trail: 25% below peak
+TSL_TIGHT_TRIGGER_PCT = 100      # Phase 3: Tighter trail once past target
+TSL_TIGHT_DISTANCE_PCT = 15      # Phase 3 trail: 15% below peak (capture max profit)
 
 # Commodity OI/IV Exit Thresholds (wider than equity due to lower liquidity)
 MCX_OI_SURGE_PCT = 20        # Exit if OI changes >20% from entry
@@ -266,8 +268,8 @@ class CommodityPortfolio:
         else:
             trade_capital = entry_premium * lot * mult
 
-        # Check 1: Per-trade limit (25% of commodity capital)
-        if trade_capital > MAX_PER_TRADE:
+        # Check 1: Per-trade limit (25% of commodity capital for BUY; margin check for SELL)
+        if not is_sell and trade_capital > MAX_PER_TRADE:
             logger.warning(f"  RISK_LIMIT: {commodity} {strategy} trade capital Rs {trade_capital:,.0f} "
                           f"> max Rs {MAX_PER_TRADE:,.0f}. SKIPPED.")
             return None
@@ -340,7 +342,7 @@ class CommodityPortfolio:
             'entry_spot': details.get('spot', 0) if details else 0,
             # OI/IV tracking for dynamic exits
             'entry_oi': oi,
-            'entry_iv': round(greeks.get('iv', iv) * 100 if greeks.get('iv', iv) and greeks.get('iv', iv) < 1 else (greeks.get('iv', iv) or 0), 1),
+            'entry_iv': round((greeks.get('iv') or iv or 0) * 100, 1),
             # Trailing Stop Loss tracking
             'peak_premium': round(entry_premium, 2),
             'trough_premium': round(entry_premium, 2),
@@ -578,7 +580,7 @@ class CommodityStrategyEngine:
                         'type': 'BUY_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bullish breakout",
-                        'target': g['price'] * 1.8, 'sl': g['price'] * 0.4,
+                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
                     })
             elif spot < ind['bc']:
                 pe_strike = round(spot / strike_int) * strike_int
@@ -588,7 +590,7 @@ class CommodityStrategyEngine:
                         'type': 'BUY_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bearish breakout",
-                        'target': g['price'] * 1.8, 'sl': g['price'] * 0.4,
+                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
                     })
 
         elif ind['cpr_width'] > 0.6:
@@ -601,7 +603,7 @@ class CommodityStrategyEngine:
                         'type': 'SELL_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at R3",
-                        'target': g['price'] * 0.3, 'sl': g['price'] * 2.0,
+                        'target': g['price'] * 0.15, 'sl': g['price'] * 1.8,
                     })
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_int) * strike_int
@@ -611,7 +613,7 @@ class CommodityStrategyEngine:
                         'type': 'SELL_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at S3",
-                        'target': g['price'] * 0.3, 'sl': g['price'] * 2.0,
+                        'target': g['price'] * 0.15, 'sl': g['price'] * 1.8,
                     })
         return signals
 
@@ -671,7 +673,7 @@ class CommodityStrategyEngine:
                     'type': 'BUY_CE_GTZ', 'strike': ce_strike,
                     'premium': g['price'], 'greeks': g,
                     'reason': f"Ghost Zone: Demand retest bounce={bounce:.2f}x",
-                    'target': g['price'] * 1.8 if bounce > 0.8 else g['price'] * 1.3,
+                    'target': g['price'] * 2.5 if bounce > 0.8 else g['price'] * 1.8,
                     'sl': g['price'] * 0.4,
                 })
 
@@ -683,7 +685,7 @@ class CommodityStrategyEngine:
                     'type': 'BUY_PE_GTZ', 'strike': pe_strike,
                     'premium': g['price'], 'greeks': g,
                     'reason': f"Ghost Zone: Supply retest",
-                    'target': g['price'] * 1.8, 'sl': g['price'] * 0.4,
+                    'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
                 })
         return signals
 
@@ -716,7 +718,7 @@ class CommodityStrategyEngine:
                     'premium': g['price'],
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.0,
+                    'target': g['price'] * 2.5,
                     'sl': g['price'] * 0.4,
                 })
 
@@ -731,7 +733,7 @@ class CommodityStrategyEngine:
                     'premium': g['price'],
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.0,
+                    'target': g['price'] * 2.5,
                     'sl': g['price'] * 0.4,
                 })
 
@@ -787,7 +789,7 @@ class CommodityStrategyEngine:
                     'greeks': g,
                     'reason': f"Survivor: PE sell at {pe_strike:.0f} dist={distance:.0f} "
                               f"gap={gap:.0f} res={resistance:.0f}",
-                    'target': g['price'] * 0.2,
+                    'target': g['price'] * 0.1,
                     'sl': g['price'] * 1.5,
                 })
 
@@ -803,7 +805,7 @@ class CommodityStrategyEngine:
                     'greeks': g,
                     'reason': f"Survivor: CE sell at {ce_strike:.0f} dist={distance:.0f} "
                               f"gap={gap:.0f} sup={support:.0f}",
-                    'target': g['price'] * 0.2,
+                    'target': g['price'] * 0.1,
                     'sl': g['price'] * 1.5,
                 })
 
@@ -946,7 +948,9 @@ class AngelMCXConnection:
         return None
 
     def find_option_tokens(self, commodity, expiry, strike, opt_type):
-        """Find MCX option contract token from instrument master."""
+        """Find MCX option contract token from instrument master.
+        Filters by nearest future expiry to avoid matching wrong/stale contracts.
+        """
         cache = os.path.join(DATA_DIR, 'instrument_master.csv')
         if not os.path.exists(cache):
             return None
@@ -961,6 +965,17 @@ class AngelMCXConnection:
             matches = df[mask]
             if len(matches) == 0:
                 return None
+
+            # Filter by nearest future expiry to avoid stale contracts
+            today = datetime.now().date()
+            matches = matches.copy()
+            matches['expiry_date'] = pd.to_datetime(matches['expiry'], format='mixed', dayfirst=True)
+            matches = matches[matches['expiry_date'].dt.date >= today]
+            if len(matches) == 0:
+                return None
+            nearest_expiry = matches['expiry_date'].min()
+            matches = matches[matches['expiry_date'] == nearest_expiry]
+
             # Try matching strike (MCX may store as strike*100)
             exact = matches[matches['strike'].astype(float) == float(strike * 100)]
             if len(exact) == 0:
@@ -1176,15 +1191,18 @@ class CommodityPaperTrader:
 
         return result
 
-    def check_oi_iv_exit(self, pos, current_premium):
+    def check_oi_iv_exit(self, pos, current_premium, current_iv_pct=None):
         """Check if commodity position should exit based on OI/IV changes.
+        current_iv_pct: if provided (from implied vol back-solve), use instead of HV estimate.
         Returns: (exit_reason, should_reverse) or (None, False)
         """
         entry_oi = pos.get('entry_oi', 0)
         entry_iv = pos.get('entry_iv', 0)
 
-        current_oi, current_iv = self.fetch_current_oi_iv(pos)
+        current_oi, fetched_iv = self.fetch_current_oi_iv(pos)
 
+        # Prefer implied vol from market LTP (passed in), then fetched, then entry
+        current_iv = current_iv_pct if current_iv_pct and current_iv_pct > 0 else fetched_iv
         if current_iv is None or current_iv == 0:
             current_iv = entry_iv
         if current_oi is None:
@@ -1243,15 +1261,56 @@ class CommodityPaperTrader:
             logger.info(f"  MCX_REVERSAL: {pos['id']} → Opening {reverse_type} {commodity} "
                        f"@ strike {pos['strike']} due to {exit_reason}")
 
-            # Use 75% of current premium for reversal (reduced risk)
-            reversal_premium = pos['current_premium'] * 0.75
+            # Get real LTP and option token for the reversed option
+            rev_opt_type = 'CE' if 'CE' in reverse_type else 'PE'
+            reversal_premium = pos['current_premium'] * 0.75  # fallback
+            option_token = None
+            option_exchange = 'MCX'
+            entry_oi = pos.get('entry_oi', 0)
+            spot = pos.get('entry_spot', 0) or self.get_spot(commodity)
 
+            try:
+                expiry = self._get_nearest_mcx_expiry(commodity)
+                if expiry:
+                    option_info = self.angel.find_option_tokens(commodity, expiry, pos['strike'], rev_opt_type)
+                    if option_info:
+                        option_token = str(option_info.get('token', ''))
+                        mkt_data = self.angel.get_market_data('MCX', option_token)
+                        if mkt_data:
+                            real_ltp = float(mkt_data.get('ltp', 0) or 0)
+                            entry_oi = float(mkt_data.get('opnInterest', mkt_data.get('oi', 0)) or 0)
+                            if real_ltp > 0:
+                                reversal_premium = real_ltp
+                                logger.info(f"  MCX_REVERSAL_LTP: {commodity} {pos['strike']}{rev_opt_type} "
+                                           f"Market={real_ltp:.2f}")
+            except Exception as e:
+                logger.warning(f"  MCX Reversal LTP fetch failed: {e}")
+
+            # Compute real Greeks from implied vol
             greeks = {
                 'delta': pos.get('delta', 0),
                 'gamma': pos.get('gamma', 0),
                 'theta': pos.get('theta', 0),
                 'iv': (pos.get('entry_iv', 15) or 15) / 100,
             }
+            if reversal_premium > 0 and spot > 0:
+                T = max(pos.get('dte', 1), 1) / 365
+                real_greeks = greeks_from_market_price_b76(
+                    reversal_premium, spot, pos['strike'], T, RISK_FREE_RATE, rev_opt_type
+                )
+                if real_greeks:
+                    greeks = real_greeks
+                    logger.info(f"  MCX_REVERSAL_GREEKS: {commodity} {pos['strike']}{rev_opt_type} "
+                               f"IV={real_greeks['iv']*100:.1f}%")
+
+            # Set target/SL for reversal (conservative)
+            is_sell_rev = 'SELL' in reverse_type
+            if is_sell_rev:
+                rev_target = round(reversal_premium * 0.1, 2)
+                rev_sl = round(reversal_premium * 1.5, 2)
+            else:
+                rev_target = round(reversal_premium * 2.5, 2)
+                rev_sl = round(reversal_premium * 0.4, 2)
 
             reverse_pos = self.portfolio.add_signal(
                 strategy=strategy + ' (Reversal)',
@@ -1262,9 +1321,11 @@ class CommodityPaperTrader:
                 greeks=greeks,
                 dte=pos.get('dte', 1),
                 details={'origin': 'REVERSAL', 'original_id': pos['id'],
-                         'exit_reason': exit_reason, 'spot': pos.get('entry_spot', 0)},
-                oi=pos.get('entry_oi', 0),
-                iv=(pos.get('entry_iv', 15) or 15) / 100,
+                         'exit_reason': exit_reason, 'spot': spot,
+                         'target': rev_target, 'sl': rev_sl,
+                         'option_token': option_token},
+                oi=entry_oi,
+                iv=greeks.get('iv', 0),
             )
 
             if reverse_pos:
@@ -1609,12 +1670,23 @@ class CommodityPaperTrader:
                 if current > pos.get('peak_premium', pos['entry_premium']):
                     pos['peak_premium'] = round(current, 2)
 
+                # Phase 1: Lock breakeven at 30%
                 if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
                     pos['breakeven_locked'] = True
                     pos['trailing_sl'] = round(pos['entry_premium'] * 1.01, 2)
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} locked SL at Rs {pos['trailing_sl']:.2f}")
 
-                if current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
+                # Phase 3: Tight trail past target (15% from peak)
+                if current_profit_pct >= TSL_TIGHT_TRIGGER_PCT:
+                    peak = pos.get('peak_premium', current)
+                    profit_from_entry = peak - pos['entry_premium']
+                    new_tsl = round(peak - (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
+                    new_tsl = max(new_tsl, pos.get('trailing_sl') or 0)
+                    if new_tsl > (pos.get('trailing_sl') or 0):
+                        pos['trailing_sl'] = new_tsl
+                        logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f}, phase3)")
+                # Phase 2: Standard trail at 50% (25% from peak)
+                elif current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
                     peak = pos.get('peak_premium', current)
                     profit_from_entry = peak - pos['entry_premium']
                     new_tsl = round(peak - (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
@@ -1636,12 +1708,22 @@ class CommodityPaperTrader:
                 if current < pos.get('trough_premium', pos['entry_premium']):
                     pos['trough_premium'] = round(current, 2)
 
+                # Phase 1: Lock breakeven at 30%
                 if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
                     pos['breakeven_locked'] = True
                     pos['trailing_sl'] = round(pos['entry_premium'] * 0.99, 2)
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL locked SL at Rs {pos['trailing_sl']:.2f}")
 
-                if current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
+                # Phase 3: Tight trail past target (15% above trough)
+                if current_profit_pct >= TSL_TIGHT_TRIGGER_PCT:
+                    trough = pos.get('trough_premium', current)
+                    profit_from_entry = pos['entry_premium'] - trough
+                    new_tsl = round(trough + (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
+                    if pos.get('trailing_sl') is None or new_tsl < pos['trailing_sl']:
+                        pos['trailing_sl'] = new_tsl
+                        logger.info(f"  TSL_TIGHT: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f}, phase3)")
+                # Phase 2: Standard trail at 50% (25% above trough)
+                elif current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
                     trough = pos.get('trough_premium', current)
                     profit_from_entry = pos['entry_premium'] - trough
                     new_tsl = round(trough + (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
@@ -1656,7 +1738,15 @@ class CommodityPaperTrader:
                     continue
 
             # ---- OI+IV DYNAMIC EXIT CHECK ----
-            oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current)
+            # Compute current IV from implied vol back-solve (same method as entry)
+            current_iv_pct = None
+            if current > 0 and spot > 0:
+                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                T_iv = max(pos.get('dte', 1), 1) / 365
+                iv_solved = implied_vol_b76(current, spot, pos['strike'], T_iv, RISK_FREE_RATE, opt_type)
+                if iv_solved:
+                    current_iv_pct = round(iv_solved * 100, 1)
+            oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current, current_iv_pct)
             if oi_iv_reason:
                 self.portfolio.close_position(pos['id'], current, oi_iv_reason)
                 self._notify_commodity_exit(pos, commodity, current, oi_iv_reason)
