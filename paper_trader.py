@@ -129,7 +129,53 @@ def bs_greeks(S, K, T, r, sigma, opt_type='CE'):
     theta /= 365
     vega = S*np.sqrt(T)*norm.pdf(d1) / 100
     return {'price': max(price, 0.05), 'delta': delta, 'gamma': gamma,
-            'theta': theta, 'vega': vega}
+            'theta': theta, 'vega': vega, 'iv': sigma}
+
+
+def implied_vol(market_price, S, K, T, r, opt_type='CE', max_iter=50, tol=1e-4):
+    """Back-solve for implied volatility from real market option price.
+    Uses Newton-Raphson method with vega as derivative.
+    Returns IV (decimal) or None if convergence fails.
+    """
+    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return None
+    # Intrinsic value check
+    if opt_type == 'CE':
+        intrinsic = max(S - K * np.exp(-r * T), 0)
+    else:
+        intrinsic = max(K * np.exp(-r * T) - S, 0)
+    if market_price < intrinsic * 0.9:
+        return None  # Price below intrinsic, likely bad data
+
+    # Initial guess: use ATM approximation (Brenner-Subrahmanyam)
+    sigma = market_price / S * np.sqrt(2 * np.pi / T)
+    sigma = max(min(sigma, 3.0), 0.01)  # Clamp between 1% and 300%
+
+    for _ in range(max_iter):
+        g = bs_greeks(S, K, T, r, sigma, opt_type)
+        diff = g['price'] - market_price
+        vega_full = g['vega'] * 100  # vega was divided by 100
+        if abs(vega_full) < 1e-10:
+            break
+        sigma -= diff / vega_full
+        sigma = max(min(sigma, 3.0), 0.005)
+        if abs(diff) < tol:
+            return sigma
+    # Return best guess even if not fully converged
+    return sigma if 0.005 < sigma < 3.0 else None
+
+
+def greeks_from_market_price(market_price, S, K, T, r, opt_type='CE'):
+    """Compute accurate Greeks by first solving for IV from real market LTP.
+    Returns full Greeks dict with real IV, or None if IV solve fails.
+    """
+    iv = implied_vol(market_price, S, K, T, r, opt_type)
+    if iv is None:
+        return None
+    g = bs_greeks(S, K, T, r, iv, opt_type)
+    g['iv'] = iv  # Store the real implied volatility
+    g['price'] = market_price  # Use actual market price, not BS-computed
+    return g
 
 
 def calc_costs(premium, qty, is_sell=False):
@@ -1432,7 +1478,7 @@ class PaperTrader:
             except Exception as e:
                 logger.info(f"  OI/LTP fetch at entry failed for {sig['symbol']}: {e}")
 
-            # Replace BS premium with real market LTP (if available)
+            # Replace BS premium with real market LTP + compute real Greeks
             bs_premium = sig['premium']
             if real_ltp and real_ltp > 0:
                 # Preserve target/SL ratios from strategy, apply to real premium
@@ -1442,13 +1488,28 @@ class PaperTrader:
                 else:
                     target_ratio = 1.5
                     sl_ratio = 0.4
-                logger.info(f"  REAL_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
-                           f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
-                           f"(ratio={real_ltp/bs_premium:.2f}x)")
                 sig['premium'] = real_ltp
                 sig['target'] = round(real_ltp * target_ratio, 2)
                 sig['sl'] = round(real_ltp * sl_ratio, 2)
-                logger.info(f"  REAL_LTP: Target={sig['target']:.2f} SL={sig['sl']:.2f}")
+
+                # Back-solve for real implied volatility and compute accurate Greeks
+                T = max(sig['dte'], 1) / 365
+                spot = sig.get('spot', 0)
+                if spot > 0:
+                    real_greeks = greeks_from_market_price(
+                        real_ltp, spot, sig['strike'], T, RISK_FREE_RATE, opt_type
+                    )
+                    if real_greeks:
+                        g = real_greeks  # Replace BS greeks with market-derived greeks
+                        logger.info(f"  REAL_GREEKS: {sig['symbol']} {sig['strike']}{opt_type} "
+                                   f"IV={g['iv']*100:.1f}% Δ={g['delta']:.3f} Γ={g['gamma']:.6f} "
+                                   f"Θ={g['theta']:.2f} | LTP={real_ltp:.2f}")
+                    else:
+                        logger.info(f"  REAL_GREEKS: IV solve failed, using BS Greeks "
+                                   f"IV={g['iv']*100:.1f}% Δ={g['delta']:.3f}")
+                logger.info(f"  REAL_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                           f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
+                           f"Target={sig['target']:.2f} SL={sig['sl']:.2f}")
             else:
                 logger.warning(f"  REAL_LTP: Unavailable for {sig['symbol']} {sig['strike']}{opt_type}, "
                               f"using BS premium Rs {bs_premium:.2f}")

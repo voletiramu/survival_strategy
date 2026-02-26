@@ -162,7 +162,40 @@ def black76_greeks(F, K, T, r, sigma, opt_type='CE'):
     theta = -(F * sigma * norm.pdf(d1) * disc) / (2 * np.sqrt(T)) / 365
     vega = F * np.sqrt(T) * norm.pdf(d1) * disc / 100
     return {'price': max(price, 0.01), 'delta': delta, 'gamma': gamma,
-            'theta': theta, 'vega': vega}
+            'theta': theta, 'vega': vega, 'iv': sigma}
+
+
+def implied_vol_b76(market_price, F, K, T, r, opt_type='CE', max_iter=50, tol=1e-4):
+    """Back-solve for implied volatility from real market price using Black-76.
+    Returns IV (decimal) or None if convergence fails.
+    """
+    if market_price <= 0 or F <= 0 or K <= 0 or T <= 0:
+        return None
+    # Initial guess: ATM approximation
+    sigma = market_price / F * np.sqrt(2 * np.pi / T)
+    sigma = max(min(sigma, 3.0), 0.01)
+    for _ in range(max_iter):
+        g = black76_greeks(F, K, T, r, sigma, opt_type)
+        diff = g['price'] - market_price
+        vega_full = g['vega'] * 100  # vega was divided by 100
+        if abs(vega_full) < 1e-10:
+            break
+        sigma -= diff / vega_full
+        sigma = max(min(sigma, 3.0), 0.005)
+        if abs(diff) < tol:
+            return sigma
+    return sigma if 0.005 < sigma < 3.0 else None
+
+
+def greeks_from_market_price_b76(market_price, F, K, T, r, opt_type='CE'):
+    """Compute accurate commodity Greeks from real market price using Black-76."""
+    iv = implied_vol_b76(market_price, F, K, T, r, opt_type)
+    if iv is None:
+        return None
+    g = black76_greeks(F, K, T, r, iv, opt_type)
+    g['iv'] = iv
+    g['price'] = market_price
+    return g
 
 
 def calc_mcx_costs(premium, qty, multiplier, is_sell=False):
@@ -1384,8 +1417,9 @@ class CommodityPaperTrader:
             except Exception as e:
                 logger.info(f"  MCX OI/LTP fetch at entry failed for {sig['commodity']}: {e}")
 
-            # Replace BS premium with real market LTP (if available)
+            # Replace BS premium with real market LTP + compute real Greeks
             bs_premium = sig['premium']
+            commodity_greeks = sig['greeks']
             if real_ltp and real_ltp > 0:
                 # Preserve target/SL ratios from strategy, apply to real premium
                 if bs_premium > 0:
@@ -1394,16 +1428,31 @@ class CommodityPaperTrader:
                 else:
                     target_ratio = 1.5
                     sl_ratio = 0.4
-                logger.info(f"  MCX_REAL_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
-                           f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
-                           f"(ratio={real_ltp/bs_premium:.2f}x)")
                 sig['premium'] = real_ltp
                 sig['target'] = round(real_ltp * target_ratio, 2)
                 sig['sl'] = round(real_ltp * sl_ratio, 2)
-                logger.info(f"  MCX_REAL_LTP: Target={sig['target']:.2f} SL={sig['sl']:.2f}")
+
+                # Back-solve for real implied volatility and compute accurate Greeks (Black-76)
+                T = max(sig['dte'], 1) / 365
+                spot = sig.get('spot', 0)
+                if spot > 0:
+                    real_greeks = greeks_from_market_price_b76(
+                        real_ltp, spot, sig['strike'], T, RISK_FREE_RATE, opt_type
+                    )
+                    if real_greeks:
+                        commodity_greeks = real_greeks
+                        sig['greeks'] = real_greeks
+                        logger.info(f"  MCX_REAL_GREEKS: {sig['commodity']} {sig['strike']}{opt_type} "
+                                   f"IV={real_greeks['iv']*100:.1f}% Δ={real_greeks['delta']:.3f} "
+                                   f"Γ={real_greeks['gamma']:.6f} Θ={real_greeks['theta']:.2f}")
+                    else:
+                        logger.info(f"  MCX_REAL_GREEKS: IV solve failed, using Black-76 Greeks")
+                logger.info(f"  MCX_REAL_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
+                           f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
+                           f"Target={sig['target']:.2f} SL={sig['sl']:.2f}")
             else:
                 logger.warning(f"  MCX_REAL_LTP: Unavailable for {sig['commodity']} {sig['strike']}{opt_type}, "
-                              f"using BS premium Rs {bs_premium:.2f}")
+                              f"using Black-76 premium Rs {bs_premium:.2f}")
 
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
