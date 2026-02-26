@@ -41,7 +41,7 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 for d in [PAPER_DIR, LOG_DIR]:
     os.makedirs(d, exist_ok=True)
 
-INITIAL_CAPITAL = 100000  # Rs 1L for commodities (all strategies share this pool)
+INITIAL_CAPITAL = 300000  # Rs 3L for commodities (all strategies share this pool)
 RISK_FREE_RATE = 0.065
 
 # Focus on MINI contracts (affordable with Rs 3L capital)
@@ -96,11 +96,11 @@ PAPER_TRADE_COMMODITIES = ['GOLDM', 'SILVERM', 'CRUDEOILM']
 # ====================================================================
 # CAPITAL & RISK MANAGEMENT FOR COMMODITY TRADING
 # ====================================================================
-COMMODITY_CAPITAL = 100000                              # Rs 1L for commodities
+COMMODITY_CAPITAL = 300000                              # Rs 3L for commodities
 MAX_RISK_PCT = 25                                       # Max 25% of capital per trade
-MAX_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 25,000
+MAX_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
 MAX_POSITIONS_PER_COMMODITY = 3                         # Prevent cascade (e.g., 16 SILVERM trades)
-MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 10,000 (10% daily loss limit)
+MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 30,000 (10% daily loss limit)
 
 # Trailing Stop Loss Parameters
 TSL_BREAKEVEN_TRIGGER_PCT = 30   # Lock breakeven when 30% of target distance reached
@@ -964,6 +964,8 @@ class CommodityPaperTrader:
         self.engine = CommodityStrategyEngine(self.portfolio, self.angel)
         self._running = False
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
+        # Caches to reduce REST API calls
+        self._option_ltp_cache = {}  # {cache_key: {'ltp': float, 'time': datetime}}
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
@@ -994,6 +996,50 @@ class CommodityPaperTrader:
         df = self.engine.historical_data.get(commodity)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
+        return None
+
+    def _get_commodity_option_ltp(self, pos):
+        """Get real-time option LTP for a commodity position, with 15s cache.
+        Returns LTP float or None if unavailable.
+        """
+        details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
+        option_token = details.get('option_token')
+
+        # Backfill for positions opened before this fix (no stored token)
+        if not option_token:
+            commodity = pos['commodity']
+            opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+            expiry = self._get_nearest_mcx_expiry(commodity)
+            if expiry:
+                option_info = self.angel.find_option_tokens(commodity, expiry, pos['strike'], opt_type)
+                if option_info:
+                    option_token = str(option_info.get('token', ''))
+                    # Store in position so we don't re-lookup every cycle
+                    if isinstance(details, dict):
+                        details['option_token'] = option_token
+                    else:
+                        pos['details'] = {'option_token': option_token}
+
+        if not option_token:
+            return None
+
+        # Check cache (15-second TTL)
+        cache_key = f"MCX_{option_token}"
+        cached = self._option_ltp_cache.get(cache_key)
+        if cached and (datetime.now() - cached['time']).total_seconds() < 15:
+            return cached['ltp']
+
+        try:
+            # Use get_market_data for MCX option LTP (commodity get_ltp is futures only)
+            mkt_data = self.angel.get_market_data('MCX', option_token)
+            if mkt_data:
+                ltp = float(mkt_data.get('ltp', 0) or 0)
+                if ltp > 0:
+                    self._option_ltp_cache[cache_key] = {'ltp': ltp, 'time': datetime.now()}
+                    return ltp
+        except Exception as e:
+            logger.debug(f"  MCX Option LTP fetch failed for {cache_key}: {e}")
+
         return None
 
     def is_mcx_open(self):
@@ -1284,16 +1330,18 @@ class CommodityPaperTrader:
             self.daily_signal_count += 1
             self.daily_signals_all.append(sig)
 
-            # Check for duplicate: same strategy + commodity + NEARBY strike
+            # Check for duplicate: same strategy + commodity + NEARBY strike + SAME option type
             strike_tolerance = {'GOLDM': 200, 'SILVERM': 1000, 'CRUDEOILM': 100}
             tol = strike_tolerance.get(sig['commodity'], 100)
+            sig_opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
             existing = [p for p in self.portfolio.positions
                         if p['strategy'] == sig['strategy']
                         and p['commodity'] == sig['commodity']
-                        and abs(p['strike'] - sig['strike']) <= tol]
+                        and abs(p['strike'] - sig['strike']) <= tol
+                        and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)]
             if existing:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['commodity']} "
-                           f"{sig['strike']} near existing {existing[0]['strike']}")
+                           f"{sig['strike']}{sig_opt_type} near existing {existing[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -1311,8 +1359,11 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
-            # Fetch entry OI for dynamic OI/IV exit tracking
+            # Fetch entry OI + real option LTP from market data
             entry_oi = 0
+            option_token = None
+            mkt_data = None
+            real_ltp = None
             try:
                 opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
                 expiry = self._get_nearest_mcx_expiry(sig['commodity'])
@@ -1321,13 +1372,38 @@ class CommodityPaperTrader:
                         sig['commodity'], expiry, sig['strike'], opt_type
                     )
                     if option_info:
-                        token = str(option_info.get('token', ''))
-                        mkt_data = self.angel.get_market_data('MCX', token)
+                        option_token = str(option_info.get('token', ''))
+                        mkt_data = self.angel.get_market_data('MCX', option_token)
                         if mkt_data:
                             entry_oi = float(mkt_data.get('opnInterest', mkt_data.get('oi', 0)) or 0)
                             logger.info(f"  MCX_ENTRY_OI: {sig['commodity']} {sig['strike']}{opt_type} OI={entry_oi}")
+                            # Extract real option LTP from same API response (zero extra calls)
+                            fetched_ltp = float(mkt_data.get('ltp', 0) or 0)
+                            if fetched_ltp > 0:
+                                real_ltp = fetched_ltp
             except Exception as e:
-                logger.info(f"  MCX OI fetch at entry failed for {sig['commodity']}: {e}")
+                logger.info(f"  MCX OI/LTP fetch at entry failed for {sig['commodity']}: {e}")
+
+            # Replace BS premium with real market LTP (if available)
+            bs_premium = sig['premium']
+            if real_ltp and real_ltp > 0:
+                # Preserve target/SL ratios from strategy, apply to real premium
+                if bs_premium > 0:
+                    target_ratio = sig.get('target', bs_premium * 1.5) / bs_premium
+                    sl_ratio = sig.get('sl', bs_premium * 0.4) / bs_premium
+                else:
+                    target_ratio = 1.5
+                    sl_ratio = 0.4
+                logger.info(f"  MCX_REAL_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
+                           f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
+                           f"(ratio={real_ltp/bs_premium:.2f}x)")
+                sig['premium'] = real_ltp
+                sig['target'] = round(real_ltp * target_ratio, 2)
+                sig['sl'] = round(real_ltp * sl_ratio, 2)
+                logger.info(f"  MCX_REAL_LTP: Target={sig['target']:.2f} SL={sig['sl']:.2f}")
+            else:
+                logger.warning(f"  MCX_REAL_LTP: Unavailable for {sig['commodity']} {sig['strike']}{opt_type}, "
+                              f"using BS premium Rs {bs_premium:.2f}")
 
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
@@ -1338,7 +1414,8 @@ class CommodityPaperTrader:
                 greeks=sig['greeks'],
                 dte=sig['dte'],
                 details={'reason': sig['reason'], 'target': sig.get('target'),
-                         'sl': sig.get('sl'), 'spot': sig.get('spot')},
+                         'sl': sig.get('sl'), 'spot': sig.get('spot'),
+                         'option_token': option_token},
                 oi=entry_oi,
                 iv=sig['greeks'].get('iv', 0),
             )
@@ -1428,19 +1505,27 @@ class CommodityPaperTrader:
 
             spec = COMMODITIES[commodity]
 
-            # Delta+Gamma+Theta premium approximation
+            # ---- PREMIUM UPDATE: Real market LTP with fallback to delta+gamma+theta ----
             entry_spot = pos.get('entry_spot', 0)
             if entry_spot == 0:
                 entry_spot = pos.get('details', {}).get('spot', spot)
             spot_change = spot - entry_spot
             delta_val = pos.get('delta', 0.5)
             gamma_val = pos.get('gamma', 0)
-            theta_val = pos.get('theta', 0)
             hours_held = (datetime.now() - entry_time).total_seconds() / 3600
 
-            premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
-            time_decay = theta_val * (hours_held / 24)
-            current = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
+            # Try real option LTP first (15s cached)
+            real_option_ltp = self._get_commodity_option_ltp(pos)
+            if real_option_ltp is not None:
+                current = real_option_ltp
+                premium_source = 'MARKET'
+            else:
+                # Fallback: delta+gamma+theta approximation
+                theta_val = pos.get('theta', 0)
+                premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
+                time_decay = theta_val * (hours_held / 24)
+                current = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
+                premium_source = 'APPROX'
             pos['current_premium'] = round(current, 2)
 
             # Update unrealized PnL
@@ -1531,7 +1616,7 @@ class CommodityPaperTrader:
                 continue
 
             # ---- STATIC EXIT CHECK ----
-            logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current:.2f} | "
+            logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current:.2f} [{premium_source}] | "
                        f"Target: {target:.2f} SL: {sl:.2f} | TSL: {pos.get('trailing_sl', 'N/A')} | "
                        f"Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f}")
 

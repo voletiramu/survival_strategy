@@ -38,7 +38,7 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 for d in [PAPER_DIR, LOG_DIR, OPTIONS_DIR]:
     os.makedirs(d, exist_ok=True)
 
-INITIAL_CAPITAL = 200000  # Rs 2L for equity (all strategies share this pool)
+INITIAL_CAPITAL = 300000  # Rs 3L for equity (all strategies share this pool)
 RISK_FREE_RATE = 0.065
 LOT_SIZES = {'NIFTY': 65, 'BANKNIFTY': 30, 'SENSEX': 20}  # NSE revised Jan 2026
 MARGIN_PER_LOT = {'NIFTY': 180000, 'BANKNIFTY': 200000, 'SENSEX': 150000}  # Adjusted for new lot sizes
@@ -50,12 +50,12 @@ GST_RATE = 0.18
 # ====================================================================
 # CAPITAL ALLOCATION & RISK MANAGEMENT
 # ====================================================================
-TOTAL_CAPITAL = 300000
-EQUITY_CAPITAL = 200000        # Rs 2L for NIFTY, BANKNIFTY, SENSEX
-COMMODITY_CAPITAL = 100000     # Rs 1L for GOLDM, SILVERM, CRUDEOILM
+TOTAL_CAPITAL = 600000
+EQUITY_CAPITAL = 300000        # Rs 3L for NIFTY, BANKNIFTY, SENSEX
+COMMODITY_CAPITAL = 300000     # Rs 3L for GOLDM, SILVERM, CRUDEOILM
 MAX_RISK_PCT = 25              # Max 25% of segment capital per trade
-MAX_EQUITY_PER_TRADE = EQUITY_CAPITAL * MAX_RISK_PCT / 100    # Rs 50,000
-MAX_COMMODITY_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 25,000
+MAX_EQUITY_PER_TRADE = EQUITY_CAPITAL * MAX_RISK_PCT / 100    # Rs 75,000
+MAX_COMMODITY_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
 MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
 MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
 MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
@@ -1144,6 +1144,7 @@ class PaperTrader:
         # Caches to reduce REST API calls (prevents rate limiting AB1004)
         self._ohlc_cache = {}      # {symbol: {'data': ohlc_dict, 'time': datetime}}
         self._greeks_cache = {}    # {cache_key: {'data': greeks, 'time': datetime}}
+        self._option_ltp_cache = {}  # {exchange_token: {'ltp': float, 'time': datetime}}
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
@@ -1183,6 +1184,50 @@ class PaperTrader:
         df = self.engine.historical_data.get(symbol)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
+        return None
+
+    def _get_option_ltp(self, pos):
+        """Get real-time option LTP for a position, with 15s cache.
+        Returns LTP float or None if unavailable.
+        """
+        details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
+        option_token = details.get('option_token')
+        exchange = details.get('option_exchange')
+
+        # Backfill for positions opened before this fix (no stored token)
+        if not option_token:
+            symbol = pos['symbol']
+            opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+            expiry = self._get_nearest_expiry(symbol)
+            if expiry:
+                option_info = self.angel.find_option_tokens(symbol, expiry, pos['strike'], opt_type)
+                if option_info:
+                    option_token = str(option_info.get('token', ''))
+                    exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
+                    # Store in position so we don't re-lookup every cycle
+                    if isinstance(details, dict):
+                        details['option_token'] = option_token
+                        details['option_exchange'] = exchange
+                    else:
+                        pos['details'] = {'option_token': option_token, 'option_exchange': exchange}
+
+        if not option_token or not exchange:
+            return None
+
+        # Check cache (15-second TTL)
+        cache_key = f"{exchange}_{option_token}"
+        cached = self._option_ltp_cache.get(cache_key)
+        if cached and (datetime.now() - cached['time']).total_seconds() < 15:
+            return cached['ltp']
+
+        try:
+            ltp = self.angel.get_ltp(exchange, option_token)
+            if ltp and ltp > 0:
+                self._option_ltp_cache[cache_key] = {'ltp': ltp, 'time': datetime.now()}
+                return ltp
+        except Exception as e:
+            logger.debug(f"  Option LTP fetch failed for {cache_key}: {e}")
+
         return None
 
     def get_intraday_ohlc(self, symbol):
@@ -1329,16 +1374,18 @@ class PaperTrader:
             self.daily_signal_count += 1
             self.daily_signals_all.append(sig)
 
-            # Check for duplicate: same strategy + symbol + NEARBY strike
+            # Check for duplicate: same strategy + symbol + NEARBY strike + SAME option type
             strike_tolerance = {'NIFTY': 100, 'BANKNIFTY': 200, 'SENSEX': 200}
             tol = strike_tolerance.get(sig['symbol'], 100)
+            sig_opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
             existing = [p for p in self.portfolio.positions
                         if p['strategy'] == sig['strategy']
                         and p['symbol'] == sig['symbol']
-                        and abs(p['strike'] - sig['strike']) <= tol]
+                        and abs(p['strike'] - sig['strike']) <= tol
+                        and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)]
             if existing:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['symbol']} "
-                           f"{sig['strike']} near existing {existing[0]['strike']}")
+                           f"{sig['strike']}{sig_opt_type} near existing {existing[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -1358,8 +1405,12 @@ class PaperTrader:
 
             g = sig['greeks']
 
-            # Fetch entry OI for dynamic OI/IV exit tracking
+            # Fetch entry OI + real option LTP from market data
             entry_oi = 0
+            option_token = None
+            option_exchange = None
+            mkt_data = None
+            real_ltp = None
             try:
                 opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
                 expiry = self._get_nearest_expiry(sig['symbol'])
@@ -1368,14 +1419,39 @@ class PaperTrader:
                         sig['symbol'], expiry, sig['strike'], opt_type
                     )
                     if option_info:
-                        token = str(option_info.get('token', ''))
-                        exchange = 'BFO' if sig['symbol'] == 'SENSEX' else 'NFO'
-                        mkt_data = self.angel.get_market_data(exchange, token)
+                        option_token = str(option_info.get('token', ''))
+                        option_exchange = 'BFO' if sig['symbol'] == 'SENSEX' else 'NFO'
+                        mkt_data = self.angel.get_market_data(option_exchange, option_token)
                         if mkt_data:
                             entry_oi = float(mkt_data.get('opnInterest', mkt_data.get('oi', 0)) or 0)
                             logger.info(f"  ENTRY_OI: {sig['symbol']} {sig['strike']}{opt_type} OI={entry_oi}")
+                            # Extract real option LTP from same API response (zero extra calls)
+                            fetched_ltp = float(mkt_data.get('ltp', 0) or 0)
+                            if fetched_ltp > 0:
+                                real_ltp = fetched_ltp
             except Exception as e:
-                logger.info(f"  OI fetch at entry failed for {sig['symbol']}: {e}")
+                logger.info(f"  OI/LTP fetch at entry failed for {sig['symbol']}: {e}")
+
+            # Replace BS premium with real market LTP (if available)
+            bs_premium = sig['premium']
+            if real_ltp and real_ltp > 0:
+                # Preserve target/SL ratios from strategy, apply to real premium
+                if bs_premium > 0:
+                    target_ratio = sig.get('target', bs_premium * 1.5) / bs_premium
+                    sl_ratio = sig.get('sl', bs_premium * 0.4) / bs_premium
+                else:
+                    target_ratio = 1.5
+                    sl_ratio = 0.4
+                logger.info(f"  REAL_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                           f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
+                           f"(ratio={real_ltp/bs_premium:.2f}x)")
+                sig['premium'] = real_ltp
+                sig['target'] = round(real_ltp * target_ratio, 2)
+                sig['sl'] = round(real_ltp * sl_ratio, 2)
+                logger.info(f"  REAL_LTP: Target={sig['target']:.2f} SL={sig['sl']:.2f}")
+            else:
+                logger.warning(f"  REAL_LTP: Unavailable for {sig['symbol']} {sig['strike']}{opt_type}, "
+                              f"using BS premium Rs {bs_premium:.2f}")
 
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
@@ -1393,6 +1469,8 @@ class PaperTrader:
                     'target': sig.get('target'),
                     'sl': sig.get('sl'),
                     'spot': sig.get('spot'),
+                    'option_token': option_token,
+                    'option_exchange': option_exchange,
                 },
                 oi=entry_oi,
                 spot_price=sig.get('spot', 0),
@@ -1739,7 +1817,7 @@ class PaperTrader:
             if not spot:
                 continue
 
-            # Delta+Gamma+Theta premium approximation (replaces broken BS recalculation)
+            # ---- PREMIUM UPDATE: Real market LTP with fallback to delta+gamma+theta ----
             entry_spot = pos.get('entry_spot', 0)
             if entry_spot == 0:
                 entry_spot = pos.get('details', {}).get('spot', spot)
@@ -1747,16 +1825,20 @@ class PaperTrader:
             spot_change = spot - entry_spot
             delta_val = pos.get('delta', 0.5)
             gamma_val = pos.get('gamma', 0)
-
-            # Premium change from delta + gamma curvature
-            premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
-
-            # Time decay (theta is per day, negative for long options)
-            theta_val = pos.get('theta', 0)
             hours_held = (datetime.now() - entry_time).total_seconds() / 3600
-            time_decay = theta_val * (hours_held / 24)
 
-            current_premium = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
+            # Try real option LTP first (15s cached)
+            real_option_ltp = self._get_option_ltp(pos)
+            if real_option_ltp is not None:
+                current_premium = real_option_ltp
+                premium_source = 'MARKET'
+            else:
+                # Fallback: delta+gamma+theta approximation
+                premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
+                theta_val = pos.get('theta', 0)
+                time_decay = theta_val * (hours_held / 24)
+                current_premium = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
+                premium_source = 'APPROX'
 
             self.portfolio.update_position(pos['id'], current_premium)
 
@@ -1919,7 +2001,7 @@ class PaperTrader:
 
             # ---- STATIC EXIT CHECK (original logic) ----
             # details/target/sl already computed above in TSL section
-            logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current_premium:.2f} | "
+            logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current_premium:.2f} [{premium_source}] | "
                        f"Target: {target:.2f} SL: {sl:.2f} | TSL: {pos.get('trailing_sl', 'N/A')} | "
                        f"Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f}")
 
