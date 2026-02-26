@@ -1603,6 +1603,7 @@ class PaperTrader:
             entry_spot = pos.get('entry_spot', 0)
             if entry_spot == 0:
                 entry_spot = pos.get('details', {}).get('spot', spot)
+            entry_spot = float(entry_spot) if entry_spot else spot
             spot_change = spot - entry_spot
             delta_val = pos.get('delta', 0.5)
             gamma_val = pos.get('gamma', 0)
