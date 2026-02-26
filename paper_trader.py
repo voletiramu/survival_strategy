@@ -147,6 +147,8 @@ class AngelConnection:
         self.session = None
         self.instruments = None
         self._connected = False
+        self._last_api_call = 0  # Timestamp of last REST API call
+        self._api_min_interval = 0.5  # Minimum 500ms between REST calls
 
     def load_credentials(self):
         """Load Angel credentials."""
@@ -177,6 +179,13 @@ class AngelConnection:
                         creds[app_type] = current_app.copy()
                         current_app = {}
         return creds
+
+    def _throttle(self):
+        """Enforce minimum interval between REST API calls to avoid rate limiting."""
+        elapsed = time.time() - self._last_api_call
+        if elapsed < self._api_min_interval:
+            time.sleep(self._api_min_interval - elapsed)
+        self._last_api_call = time.time()
 
     def connect(self, app_type='Historical'):
         """Connect to Angel SmartAPI with retry on rate limit."""
@@ -226,6 +235,7 @@ class AngelConnection:
         if not self._connected:
             return None
         try:
+            self._throttle()
             data = self.obj.ltpData(exchange, symbol_token, symbol_token)
             if data and data.get('data'):
                 return data['data'].get('ltp')
@@ -238,6 +248,7 @@ class AngelConnection:
         if not self._connected:
             return None
         try:
+            self._throttle()
             data = self.obj.getMarketData("FULL", {exchange: [symbol_token]})
             if data and data.get('data') and data['data'].get('fetched'):
                 return data['data']['fetched'][0]
@@ -250,6 +261,7 @@ class AngelConnection:
         if not self._connected:
             return None
         try:
+            self._throttle()
             data = self.obj.optionGreek({
                 "name": name,
                 "expirydate": expiry_date
@@ -265,6 +277,7 @@ class AngelConnection:
         if not self._connected:
             return None
         try:
+            self._throttle()
             params = {
                 "exchange": exchange,
                 "symboltoken": token,
@@ -1106,6 +1119,9 @@ class PaperTrader:
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
             'SENSEX': {'exchange': 'BSE', 'token': '99919000'},
         }
+        # Caches to reduce REST API calls (prevents rate limiting AB1004)
+        self._ohlc_cache = {}      # {symbol: {'data': ohlc_dict, 'time': datetime}}
+        self._greeks_cache = {}    # {cache_key: {'data': greeks, 'time': datetime}}
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
@@ -1148,10 +1164,15 @@ class PaperTrader:
         return None
 
     def get_intraday_ohlc(self, symbol):
-        """Get today's OHLC so far."""
+        """Get today's OHLC so far. Cached for 60s to avoid rate limiting."""
         info = self._index_tokens.get(symbol)
         if not info:
             return None
+
+        # Check cache (60-second TTL)
+        cached = self._ohlc_cache.get(symbol)
+        if cached and (datetime.now() - cached['time']).total_seconds() < 60:
+            return cached['data']
 
         try:
             # Try 5-min candles for today
@@ -1168,20 +1189,24 @@ class PaperTrader:
                 lows = [c[3] for c in data]
                 closes = [c[4] for c in data]
                 volumes = [c[5] for c in data]
-                return {
+                ohlc = {
                     'open': opens[0],
                     'high': max(highs),
                     'low': min(lows),
                     'close': closes[-1],
                     'volume': sum(volumes),
                 }
+                self._ohlc_cache[symbol] = {'data': ohlc, 'time': datetime.now()}
+                return ohlc
         except Exception as e:
             logger.error(f"Intraday OHLC error for {symbol}: {e}")
 
         # Fallback: use LTP as all OHLC
         spot = self.get_index_spot(symbol)
         if spot:
-            return {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0}
+            ohlc = {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0}
+            self._ohlc_cache[symbol] = {'data': ohlc, 'time': datetime.now()}
+            return ohlc
         return None
 
     def is_market_open(self):
@@ -1323,6 +1348,7 @@ class PaperTrader:
             # Send Telegram notification
             try:
                 from trade_notifier import notify_trade_entry
+                logger.info(f"  TELEGRAM: Sending entry notification for {sig['symbol']} {sig['type']}")
                 lot_size = LOT_SIZES.get(sig['symbol'], 50)
                 # Capital used: SELL = margin blocked, BUY = premium paid
                 is_sell_sig = 'SELL' in sig['type']
@@ -1356,34 +1382,84 @@ class PaperTrader:
         if skipped:
             logger.info(f"  Executed: {executed} | Skipped (duplicates): {skipped}")
 
-    def fetch_current_oi_iv(self, pos):
-        """Fetch current OI and IV from Angel SmartAPI for a position."""
-        try:
-            from live_scanner import LiveScanner
-            scanner = getattr(self, '_live_scanner', None)
-            if scanner is None:
-                return None, None
+    def _get_nearest_expiry(self, symbol):
+        """Get nearest weekly/monthly expiry for an index option.
+        Returns expiry as 'ddMONyyyy' format (e.g. '27FEB2026') for Angel API.
+        """
+        if self.angel.instruments is None:
+            return None
+        exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
+        mask = (self.angel.instruments['name'] == symbol) & \
+               (self.angel.instruments['exch_seg'] == exchange) & \
+               (self.angel.instruments['instrumenttype'].isin(['OPTIDX']))
+        matches = self.angel.instruments[mask]
+        if len(matches) == 0:
+            return None
+        # Parse expiry dates and find nearest future expiry
+        today = datetime.now().date()
+        expiries = pd.to_datetime(matches['expiry'], format='mixed', dayfirst=True).dt.date
+        future = expiries[expiries >= today]
+        if len(future) == 0:
+            return None
+        nearest = future.min()
+        # Angel optionGreek API expects 'ddMONyyyy' format
+        return nearest.strftime('%d%b%Y').upper()
 
+    def fetch_current_oi_iv(self, pos):
+        """Fetch current OI and IV using Angel SmartAPI directly.
+        Uses get_market_data for OI and get_option_greeks for IV.
+        Results are cached for 60s to avoid rate limiting.
+        """
+        try:
             symbol = pos['symbol']
             strike = pos['strike']
             opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
 
-            # Try to get market data for this option
-            # Use the scanner's existing API connection
-            try:
-                greeks_data = scanner.get_option_greeks_api(symbol, scanner.get_nearest_expiry(symbol))
-                if greeks_data:
-                    for row in greeks_data:
-                        if abs(row.get('strike', 0) - strike) < 10 and row.get('type') == opt_type:
-                            current_oi = row.get('oi', 0)
-                            current_iv = row.get('iv', 0)
-                            return current_oi, current_iv
-            except Exception:
-                pass
+            # Check cache (60s TTL)
+            cache_key = f"{symbol}_{strike}_{opt_type}"
+            cached = self._greeks_cache.get(cache_key)
+            if cached and (datetime.now() - cached['time']).total_seconds() < 60:
+                return cached['data']
 
-            return None, None
+            current_oi = None
+            current_iv = None
+
+            # Method 1: Try to find the option token and get market data (for OI)
+            expiry = self._get_nearest_expiry(symbol)
+            if expiry:
+                option_info = self.angel.find_option_tokens(symbol, expiry, strike, opt_type)
+                if option_info:
+                    token = str(option_info.get('token', ''))
+                    exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
+                    mkt_data = self.angel.get_market_data(exchange, token)
+                    if mkt_data:
+                        current_oi = mkt_data.get('opnInterest', mkt_data.get('oi', 0))
+                        # Some feeds include IV in market data
+                        if mkt_data.get('impliedVolatility'):
+                            current_iv = mkt_data['impliedVolatility']
+
+            # Method 2: Try option Greeks API for IV (if not already obtained)
+            if current_iv is None and expiry:
+                greeks_data = self.angel.get_option_greeks(symbol, expiry)
+                if greeks_data and isinstance(greeks_data, list):
+                    for row in greeks_data:
+                        row_strike = float(row.get('strikePrice', row.get('strike', 0)))
+                        row_type = row.get('optionType', row.get('type', ''))
+                        if abs(row_strike - strike) < 10 and opt_type in str(row_type).upper():
+                            current_iv = row.get('impliedVolatility', row.get('iv', None))
+                            if current_oi is None:
+                                current_oi = row.get('openInterest', row.get('oi', None))
+                            break
+
+            result = (current_oi, current_iv)
+            self._greeks_cache[cache_key] = {'data': result, 'time': datetime.now()}
+
+            if current_oi is not None or current_iv is not None:
+                logger.info(f"  OI/IV fetched: {pos['id']} OI={current_oi} IV={current_iv}")
+
+            return result
         except Exception as e:
-            logger.debug(f"  OI/IV fetch failed for {pos['id']}: {e}")
+            logger.info(f"  OI/IV fetch failed for {pos['id']}: {e}")
             return None, None
 
     def check_oi_iv_exit(self, pos, current_premium):

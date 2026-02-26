@@ -617,6 +617,15 @@ class AngelMCXConnection:
         self.instruments = None
         # MCX futures tokens for spot proxy
         self._futures_tokens = {}
+        self._last_api_call = 0  # Timestamp of last REST API call
+        self._api_min_interval = 0.5  # Minimum 500ms between REST calls
+
+    def _throttle(self):
+        """Enforce minimum interval between REST API calls to avoid rate limiting."""
+        elapsed = time.time() - self._last_api_call
+        if elapsed < self._api_min_interval:
+            time.sleep(self._api_min_interval - elapsed)
+        self._last_api_call = time.time()
 
     def connect(self):
         try:
@@ -690,6 +699,7 @@ class AngelMCXConnection:
         if not self._connected:
             return None
         try:
+            self._throttle()
             params = {
                 "exchange": exchange,
                 "symboltoken": token,
@@ -708,6 +718,7 @@ class AngelMCXConnection:
         if not self._connected or commodity not in self._futures_tokens:
             return None
         try:
+            self._throttle()
             data = self.obj.ltpData('MCX', self._futures_tokens[commodity],
                                     self._futures_tokens[commodity])
             if data and data.get('data'):
@@ -878,6 +889,7 @@ class CommodityPaperTrader:
             # Send Telegram notification
             try:
                 from trade_notifier import notify_trade_entry
+                logger.info(f"  TELEGRAM: Sending entry notification for {sig['commodity']} {sig['type']}")
                 spec = COMMODITIES[sig['commodity']]
                 # Capital used: SELL = margin blocked, BUY = premium paid
                 is_sell_sig = 'SELL' in sig['type']
