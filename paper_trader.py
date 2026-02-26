@@ -1451,6 +1451,12 @@ class PaperTrader:
                                 current_oi = row.get('openInterest', row.get('oi', None))
                             break
 
+            # Ensure numeric types (API may return strings)
+            if current_oi is not None:
+                current_oi = float(current_oi)
+            if current_iv is not None:
+                current_iv = float(current_iv)
+
             result = (current_oi, current_iv)
             self._greeks_cache[cache_key] = {'data': result, 'time': datetime.now()}
 
