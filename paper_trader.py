@@ -69,6 +69,12 @@ OI_IV_COMBO_OI = 10     # Combined exit: OI >10% AND IV >15%
 OI_IV_COMBO_IV = 15
 GAMMA_SHIELD_THRESHOLD = 0.002  # Exit short positions if gamma > this
 
+# Trailing Stop Loss Parameters
+TSL_BREAKEVEN_TRIGGER_PCT = 30   # Lock breakeven when 30% of target distance reached
+TSL_TRAIL_TRIGGER_PCT = 50       # Start trailing when 50% of target distance reached
+TSL_TRAIL_DISTANCE_PCT = 25      # Trail at 25% below peak unrealized profit
+TSL_MIN_PROFIT_LOCK_PCT = 10     # Never let trailing SL go below entry+10% of move
+
 # Strategy weights from backtest (Sharpe-weighted)
 STRATEGY_WEIGHTS = {
     'CPR': 0.88,          # 87.9% allocation (dominant)
@@ -452,6 +458,17 @@ class PaperPortfolio:
             logger.warning(f"  RISK_LIMIT: Max {MAX_POSITIONS_PER_SYMBOL} positions for {symbol}. SKIPPED.")
             return None
 
+        # Check 5: Drawdown-based position scaling
+        equity_hwm = max(self.initial_capital, self.capital)
+        current_dd_pct = (equity_hwm - self.capital) / equity_hwm * 100
+        if current_dd_pct > 5:
+            scale_factor = max(0.5, 1.0 - (current_dd_pct - 5) * 0.05)
+            scaled_max = max_per_trade * scale_factor
+            if trade_cost > scaled_max:
+                logger.warning(f"  RISK_SCALE: DD={current_dd_pct:.1f}%, trade Rs {trade_cost:,.0f} > "
+                              f"scaled max Rs {scaled_max:,.0f} ({scale_factor*100:.0f}%). SKIPPED.")
+                return None
+
         sig = {
             'timestamp': datetime.now().isoformat(),
             'strategy': strategy,
@@ -496,6 +513,11 @@ class PaperPortfolio:
             'entry_iv': round(iv * 100, 1),
             'entry_spot': round(spot_price, 2),
             'max_risk': round(max_per_trade, 2),
+            # Trailing Stop Loss tracking
+            'peak_premium': round(entry_premium, 2),
+            'trough_premium': round(entry_premium, 2),
+            'trailing_sl': None,
+            'breakeven_locked': False,
             'details': details or {},  # Store target/SL from strategy signals
         }
         self.positions.append(pos)
@@ -1320,7 +1342,41 @@ class PaperTrader:
                 skipped += 1
                 continue
 
+            # Check for CONFLICTING positions: no BUY_CE + SELL_CE on same symbol/strike
+            opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
+            is_buy_sig = 'BUY' in sig['type']
+            conflicting = [p for p in self.portfolio.positions
+                           if p['symbol'] == sig['symbol']
+                           and abs(p['strike'] - sig['strike']) <= tol
+                           and (('CE' in p['signal_type']) == (opt_type == 'CE'))
+                           and p['is_sell'] == is_buy_sig]  # opposite direction
+            if conflicting:
+                logger.info(f"  SKIP (conflicting): {sig['type']} conflicts with "
+                           f"{conflicting[0]['signal_type']} on {sig['symbol']} {sig['strike']}")
+                skipped += 1
+                continue
+
             g = sig['greeks']
+
+            # Fetch entry OI for dynamic OI/IV exit tracking
+            entry_oi = 0
+            try:
+                opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
+                expiry = self._get_nearest_expiry(sig['symbol'])
+                if expiry:
+                    option_info = self.angel.find_option_tokens(
+                        sig['symbol'], expiry, sig['strike'], opt_type
+                    )
+                    if option_info:
+                        token = str(option_info.get('token', ''))
+                        exchange = 'BFO' if sig['symbol'] == 'SENSEX' else 'NFO'
+                        mkt_data = self.angel.get_market_data(exchange, token)
+                        if mkt_data:
+                            entry_oi = float(mkt_data.get('opnInterest', mkt_data.get('oi', 0)) or 0)
+                            logger.info(f"  ENTRY_OI: {sig['symbol']} {sig['strike']}{opt_type} OI={entry_oi}")
+            except Exception as e:
+                logger.info(f"  OI fetch at entry failed for {sig['symbol']}: {e}")
+
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
                 symbol=sig['symbol'],
@@ -1338,6 +1394,7 @@ class PaperTrader:
                     'sl': sig.get('sl'),
                     'spot': sig.get('spot'),
                 },
+                oi=entry_oi,
                 spot_price=sig.get('spot', 0),
             )
             if result is None:
@@ -1529,12 +1586,49 @@ class PaperTrader:
 
         return None, False
 
-    def execute_reversal(self, pos, exit_reason):
-        """After closing a position due to OI+IV exit, open a reverse trade."""
+    def _check_sl_reversal_confirmation(self, pos, spot):
+        """Check if SL hit should trigger a reversal based on momentum confirmation."""
+        # Don't reverse if already a reversal trade (prevent ping-pong)
+        if pos.get('details', {}).get('origin') == 'REVERSAL' or '(Reversal)' in pos.get('strategy', ''):
+            return False
+
+        # Don't reverse after 2 PM (not enough time to recover)
+        if datetime.now().time() > dtime(14, 0):
+            return False
+
+        # Check spot movement direction vs original trade direction
+        entry_spot = pos.get('entry_spot', 0)
+        if entry_spot == 0:
+            return False
+
+        spot_move_pct = (spot - entry_spot) / entry_spot * 100
+        is_ce = 'CE' in pos['signal_type']
+
+        # BUY_CE hit SL: spot went down → reverse to BUY_PE if spot moved > 0.3%
+        if is_ce and not pos['is_sell'] and spot_move_pct < -0.3:
+            return True
+        # BUY_PE hit SL: spot went up → reverse to BUY_CE if spot moved > 0.3%
+        if not is_ce and not pos['is_sell'] and spot_move_pct > 0.3:
+            return True
+        # SELL options hit SL: strong momentum against us → always reverse
+        if pos['is_sell']:
+            return True
+
+        return False
+
+    def execute_reversal(self, pos, exit_reason, spot=None):
+        """After closing a position, open a reverse trade.
+        Works for both OI/IV exits and SL hits with confirmation.
+        """
         try:
             symbol = pos['symbol']
             strategy = pos['strategy']
             original_type = pos['signal_type']
+
+            # Don't chain reversals
+            if '(Reversal)' in strategy:
+                logger.info(f"  REVERSAL_SKIP: {pos['id']} already a reversal trade. No chain.")
+                return
 
             # Determine reverse direction
             if 'CE' in original_type:
@@ -1551,13 +1645,15 @@ class PaperTrader:
             logger.info(f"  REVERSAL: {pos['id']} → Opening {reverse_type} {symbol} "
                        f"@ strike {pos['strike']} due to {exit_reason}")
 
-            # Open reverse trade using same strike and current premium
+            # Use 75% of current premium for reversal (reduced risk)
+            reversal_premium = pos['current_premium'] * 0.75
+
             reverse_pos = self.portfolio.add_signal(
                 strategy=strategy + ' (Reversal)',
                 symbol=symbol,
                 signal_type=reverse_type,
                 strike=pos['strike'],
-                entry_premium=pos['current_premium'],
+                entry_premium=reversal_premium,
                 delta=pos.get('delta', 0),
                 gamma=pos.get('gamma', 0),
                 theta=pos.get('theta', 0),
@@ -1565,11 +1661,10 @@ class PaperTrader:
                 dte=pos.get('dte', 1),
                 details={'origin': 'REVERSAL', 'original_id': pos['id'], 'exit_reason': exit_reason},
                 oi=pos.get('entry_oi', 0),
-                spot_price=pos.get('entry_spot', 0),
+                spot_price=spot or pos.get('entry_spot', 0),
             )
 
             if reverse_pos:
-                # Telegram notification for reversal
                 try:
                     from trade_notifier import send_message
                     msg = (f"<b>REVERSAL TRADE</b>\n"
@@ -1577,7 +1672,7 @@ class PaperTrader:
                            f"Opened: {reverse_type} {symbol}\n"
                            f"Reason: {exit_reason}\n"
                            f"Strike: {pos['strike']:.0f}\n"
-                           f"Premium: Rs {pos['current_premium']:.2f}")
+                           f"Premium: Rs {reversal_premium:.2f}")
                     send_message(msg)
                 except Exception:
                     pass
@@ -1586,18 +1681,57 @@ class PaperTrader:
 
     def check_exits(self):
         """Check if any open positions should be exited.
-        Now includes OI+IV dynamic exits with reversal capability.
+        Includes: circuit breaker, trailing SL, OI+IV dynamic exits, time exits,
+        EOD force close, and static target/SL.
         """
         if not self.portfolio.positions:
             return
 
         logger.info("\n  Checking exits for open positions...")
 
+        # ---- CIRCUIT BREAKER: Close ALL positions if daily loss exceeds limit ----
+        today = datetime.now().strftime('%Y-%m-%d')
+        daily_loss = self.portfolio.daily_pnl.get(today, 0)
+        if daily_loss < -MAX_DAILY_LOSS_EQUITY:
+            logger.warning(f"  CIRCUIT_BREAKER: Daily loss Rs {daily_loss:,.0f} > limit Rs {MAX_DAILY_LOSS_EQUITY:,.0f}")
+            logger.warning(f"  Closing ALL {len(self.portfolio.positions)} open positions!")
+            for pos in list(self.portfolio.positions):
+                current = pos.get('current_premium', pos['entry_premium'])
+                self.portfolio.close_position(pos['id'], current, 'CIRCUIT_BREAKER')
+            try:
+                from trade_notifier import send_message
+                send_message(f"<b>CIRCUIT BREAKER TRIGGERED</b>\n"
+                           f"Daily loss: Rs {daily_loss:,.0f}\n"
+                           f"All equity positions closed. Trading halted.")
+            except Exception:
+                pass
+            self.portfolio.save_state()
+            return
+
         for pos in list(self.portfolio.positions):
             # Skip positions opened less than 5 minutes ago (grace period)
             entry_time = datetime.fromisoformat(pos['timestamp'])
             if (datetime.now() - entry_time).total_seconds() < 300:
                 logger.info(f"  GRACE: {pos['id']} opened {int((datetime.now() - entry_time).total_seconds())}s ago, skipping")
+                continue
+
+            # ---- EOD FORCE CLOSE: Close positions 10 min before market close ----
+            if datetime.now().time() > dtime(15, 20):
+                logger.info(f"  EOD_CLOSE: {pos['id']} force close (market closing at 15:30)")
+                current = pos.get('current_premium', pos['entry_premium'])
+                self.portfolio.close_position(pos['id'], current, 'EOD_FORCE_CLOSE')
+                try:
+                    from trade_notifier import notify_trade_exit
+                    lot_size = LOT_SIZES.get(pos['symbol'], 50)
+                    cap = MARGIN_PER_LOT.get(pos['symbol'], 120000) if pos['is_sell'] else pos['entry_premium'] * lot_size
+                    notify_trade_exit(market="EQUITY", strategy=pos['strategy'],
+                        symbol=pos['symbol'], signal_type=pos['signal_type'],
+                        strike=pos['strike'], entry_price=pos['entry_premium'],
+                        exit_price=current, entry_time=pos['timestamp'],
+                        pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                        exit_reason='EOD_FORCE_CLOSE')
+                except Exception:
+                    pass
                 continue
 
             symbol = pos['symbol']
@@ -1625,6 +1759,122 @@ class PaperTrader:
             current_premium = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
 
             self.portfolio.update_position(pos['id'], current_premium)
+
+            # ---- TIME-BASED EXIT: Close stale positions (>4 hours with <5% profit) ----
+            if hours_held > 4:
+                profit_pct = (pos['unrealized_pnl'] / max(pos['entry_premium'] * pos['lot_size'], 1)) * 100
+                if abs(profit_pct) < 5:
+                    logger.info(f"  TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only {profit_pct:.1f}% profit")
+                    self.portfolio.close_position(pos['id'], current_premium, 'TIME_EXIT_NO_PROGRESS')
+                    try:
+                        from trade_notifier import notify_trade_exit
+                        lot_size = LOT_SIZES.get(symbol, 50)
+                        cap = MARGIN_PER_LOT.get(symbol, 120000) if pos['is_sell'] else pos['entry_premium'] * lot_size
+                        notify_trade_exit(market="EQUITY", strategy=pos['strategy'],
+                            symbol=symbol, signal_type=pos['signal_type'],
+                            strike=pos['strike'], entry_price=pos['entry_premium'],
+                            exit_price=current_premium, entry_time=pos['timestamp'],
+                            pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                            exit_reason='TIME_EXIT_NO_PROGRESS')
+                    except Exception:
+                        pass
+                    continue
+
+            # ---- TRAILING STOP LOSS UPDATE ----
+            details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
+            target = details.get('target', pos['entry_premium'] * 2)
+            sl = details.get('sl', pos['entry_premium'] * 0.3)
+
+            if not pos['is_sell']:
+                # BUY positions: premium going UP is profit
+                target_distance = target - pos['entry_premium']
+                current_profit_pct = ((current_premium - pos['entry_premium']) / target_distance * 100
+                                      if target_distance > 0 else 0)
+
+                # Update peak premium
+                if current_premium > pos.get('peak_premium', pos['entry_premium']):
+                    pos['peak_premium'] = round(current_premium, 2)
+
+                # Phase 1: Lock breakeven at 30% of target reached
+                if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
+                    pos['breakeven_locked'] = True
+                    pos['trailing_sl'] = round(pos['entry_premium'] * 1.01, 2)  # entry + 1% buffer
+                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} locked SL at Rs {pos['trailing_sl']:.2f}")
+
+                # Phase 2: Trail at 50%+ of target reached
+                if current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
+                    peak = pos.get('peak_premium', current_premium)
+                    profit_from_entry = peak - pos['entry_premium']
+                    new_trailing_sl = round(peak - (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
+                    new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
+                    if new_trailing_sl > (pos.get('trailing_sl') or 0):
+                        pos['trailing_sl'] = new_trailing_sl
+                        logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f})")
+
+                # Check trailing SL hit (BUY: premium drops below trailing SL)
+                if pos.get('trailing_sl') and current_premium <= pos['trailing_sl']:
+                    logger.info(f"  TRAILING_SL_HIT: {pos['id']} premium {current_premium:.2f} <= TSL {pos['trailing_sl']:.2f}")
+                    self.portfolio.close_position(pos['id'], current_premium, 'TRAILING_SL_HIT')
+                    try:
+                        from trade_notifier import notify_trade_exit
+                        lot_size = LOT_SIZES.get(symbol, 50)
+                        cap = pos['entry_premium'] * lot_size
+                        pnl = pos.get('unrealized_pnl', 0)
+                        notify_trade_exit(
+                            market="EQUITY", strategy=pos['strategy'],
+                            symbol=symbol, signal_type=pos['signal_type'],
+                            strike=pos['strike'], entry_price=pos['entry_premium'],
+                            exit_price=current_premium, entry_time=pos['timestamp'],
+                            pnl=pnl, capital_used=cap, exit_reason='TRAILING_SL_HIT',
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+            else:
+                # SELL positions: premium going DOWN is profit
+                target_distance = pos['entry_premium'] - target
+                current_profit_pct = ((pos['entry_premium'] - current_premium) / target_distance * 100
+                                      if target_distance > 0 else 0)
+
+                # Update trough premium (lowest seen)
+                if current_premium < pos.get('trough_premium', pos['entry_premium']):
+                    pos['trough_premium'] = round(current_premium, 2)
+
+                # Phase 1: Lock breakeven at 30% of target reached
+                if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
+                    pos['breakeven_locked'] = True
+                    pos['trailing_sl'] = round(pos['entry_premium'] * 0.99, 2)  # entry - 1% buffer
+                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL locked SL at Rs {pos['trailing_sl']:.2f}")
+
+                # Phase 2: Trail at 50%+ of target reached
+                if current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
+                    trough = pos.get('trough_premium', current_premium)
+                    profit_from_entry = pos['entry_premium'] - trough
+                    new_trailing_sl = round(trough + (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
+                    if pos.get('trailing_sl') is None or new_trailing_sl < pos['trailing_sl']:
+                        pos['trailing_sl'] = new_trailing_sl
+                        logger.info(f"  TSL_TRAIL: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f})")
+
+                # Check trailing SL hit (SELL: premium rises above trailing SL)
+                if pos.get('trailing_sl') and current_premium >= pos['trailing_sl']:
+                    logger.info(f"  TRAILING_SL_HIT: {pos['id']} SELL premium {current_premium:.2f} >= TSL {pos['trailing_sl']:.2f}")
+                    self.portfolio.close_position(pos['id'], current_premium, 'TRAILING_SL_HIT')
+                    try:
+                        from trade_notifier import notify_trade_exit
+                        lot_size = LOT_SIZES.get(symbol, 50)
+                        cap = MARGIN_PER_LOT.get(symbol, 120000)
+                        pnl = pos.get('unrealized_pnl', 0)
+                        notify_trade_exit(
+                            market="EQUITY", strategy=pos['strategy'],
+                            symbol=symbol, signal_type=pos['signal_type'],
+                            strike=pos['strike'], entry_price=pos['entry_premium'],
+                            exit_price=current_premium, entry_time=pos['timestamp'],
+                            pnl=pnl, capital_used=cap, exit_reason='TRAILING_SL_HIT',
+                        )
+                    except Exception:
+                        pass
+                    continue
 
             # ---- OI+IV DYNAMIC EXIT CHECK (runs BEFORE static exit) ----
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current_premium)
@@ -1668,12 +1918,10 @@ class PaperTrader:
                 continue  # Skip static exit check for this position
 
             # ---- STATIC EXIT CHECK (original logic) ----
-            details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
-            target = details.get('target', pos['entry_premium'] * 2)
-            sl = details.get('sl', pos['entry_premium'] * 0.3)
-
+            # details/target/sl already computed above in TSL section
             logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current_premium:.2f} | "
-                       f"Target: {target:.2f} SL: {sl:.2f} | Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f}")
+                       f"Target: {target:.2f} SL: {sl:.2f} | TSL: {pos.get('trailing_sl', 'N/A')} | "
+                       f"Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f}")
 
             exit_reason = None
 
@@ -1697,21 +1945,17 @@ class PaperTrader:
                 try:
                     from trade_notifier import notify_trade_exit
                     lot_size = LOT_SIZES.get(symbol, 50)
-                    # Capital used: SELL = margin, BUY = premium
                     if pos.get('is_sell', False):
                         capital = MARGIN_PER_LOT.get(symbol, 120000)
                     else:
                         capital = pos['entry_premium'] * lot_size
                     pnl = pos.get('unrealized_pnl', 0)
-                    # Capital available AFTER closing (BUY/SELL aware)
                     locked = 0
                     for p in self.portfolio.positions:
                         if p.get('is_sell', False):
                             locked += MARGIN_PER_LOT.get(p['symbol'], 120000)
                         else:
                             locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
-                    total_invested = locked
-                    capital_available = EQUITY_CAPITAL - locked
                     notify_trade_exit(
                         market="EQUITY", strategy=pos['strategy'],
                         symbol=symbol, signal_type=pos['signal_type'],
@@ -1719,11 +1963,16 @@ class PaperTrader:
                         exit_price=current_premium, entry_time=pos['timestamp'],
                         pnl=pnl, capital_used=capital,
                         exit_reason=exit_reason,
-                        capital_available=capital_available,
-                        total_invested=total_invested,
+                        capital_available=EQUITY_CAPITAL - locked,
+                        total_invested=locked,
                     )
                 except Exception as e:
                     logger.warning(f"  Telegram exit notify failed: {e}")
+
+                # Smart reversal on SL hit (with momentum confirmation)
+                if exit_reason == 'SL_HIT' and self._check_sl_reversal_confirmation(pos, spot):
+                    logger.info(f"  SL_REVERSAL: {pos['id']} SL hit with momentum confirmation → reversing")
+                    self.execute_reversal(pos, 'SL_HIT_REVERSE', spot=spot)
 
         # Persist updated PnL/Greeks to disk after exit check cycle
         self.portfolio.save_state()

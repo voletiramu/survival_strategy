@@ -3,15 +3,16 @@ Telegram Trade Notification System
 Sends instant alerts for trade entries, exits, and daily summaries.
 """
 
+import os
 import requests
 import logging
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# Telegram Bot Config
-BOT_TOKEN = "8426384062:AAGJKO8y7ijbSMdbaFnxkfOeLFlnQZWc8oI"
-CHAT_ID = 1722559857  # Ram's Telegram chat ID
+# Telegram Bot Config — prefer environment variables, fallback to hardcoded
+BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', "8426384062:AAGJKO8y7ijbSMdbaFnxkfOeLFlnQZWc8oI")
+CHAT_ID = int(os.environ.get('TELEGRAM_CHAT_ID', '1722559857') or '1722559857')
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -320,6 +321,36 @@ def notify_active_trades():
         return send_message(msg[mid:])
     else:
         return send_message(msg)
+
+
+def notify_trailing_sl(market, symbol, strike, old_sl, new_sl, current_premium, peak_premium):
+    """Notify when trailing stop loss is adjusted."""
+    msg = (f"<b>TRAILING SL ADJUSTED</b>\n"
+           f"{market} | {symbol} {strike}\n"
+           f"Old SL: Rs {old_sl:.2f} → New SL: Rs {new_sl:.2f}\n"
+           f"Current: Rs {current_premium:.2f} | Peak: Rs {peak_premium:.2f}")
+    return send_message(msg)
+
+
+def notify_circuit_breaker(market, daily_loss, positions_closed):
+    """Notify when circuit breaker triggers."""
+    msg = (f"<b>CIRCUIT BREAKER TRIGGERED</b>\n"
+           f"Market: {market}\n"
+           f"Daily Loss: Rs {daily_loss:,.2f}\n"
+           f"Positions Closed: {positions_closed}\n"
+           f"ALL TRADING HALTED FOR TODAY")
+    return send_message(msg)
+
+
+def notify_reversal(market, original_type, reverse_type, symbol, strike, premium, reason):
+    """Notify when a reversal trade is opened."""
+    msg = (f"<b>REVERSAL TRADE</b>\n"
+           f"Market: {market}\n"
+           f"Closed: {original_type} {symbol} {strike}\n"
+           f"Opened: {reverse_type} {symbol} {strike}\n"
+           f"Premium: Rs {premium:.2f}\n"
+           f"Reason: {reason}")
+    return send_message(msg)
 
 
 if __name__ == "__main__":
