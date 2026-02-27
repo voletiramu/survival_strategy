@@ -256,6 +256,7 @@
                             <th>Entry</th>
                             <th>Current</th>
                             <th>PnL</th>
+                            <th>Entry At</th>
                             <th>Duration</th>
                             <th>TSL</th>
                             <th>Target</th>
@@ -264,7 +265,7 @@
                         </tr>
                     </thead>
                     <tbody id="openTableBody">
-                        <tr><td colspan="14" class="loading">Loading...</td></tr>
+                        <tr><td colspan="15" class="loading">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -292,12 +293,14 @@
                             <th>Exit</th>
                             <th>PnL</th>
                             <th>Cap After</th>
+                            <th>Entry At</th>
+                            <th>Exit At</th>
                             <th>Exit Reason</th>
                             <th>Hold</th>
                         </tr>
                     </thead>
                     <tbody id="closedTableBody">
-                        <tr><td colspan="11" class="loading">Loading...</td></tr>
+                        <tr><td colspan="13" class="loading">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -338,6 +341,25 @@
             return tags;
         }
 
+        function fmtTime(isoStr) {
+            if (!isoStr) return '--';
+            try {
+                const d = new Date(isoStr);
+                return d.toLocaleTimeString('en-IN', {hour: '2-digit', minute: '2-digit', hour12: true});
+            } catch(e) { return '--'; }
+        }
+
+        function fmtDateTime(isoStr) {
+            if (!isoStr) return '--';
+            try {
+                const d = new Date(isoStr);
+                const day = d.getDate().toString().padStart(2, '0');
+                const mon = (d.getMonth()+1).toString().padStart(2, '0');
+                const time = d.toLocaleTimeString('en-IN', {hour: '2-digit', minute: '2-digit', hour12: true});
+                return `${day}/${mon} ${time}`;
+            } catch(e) { return '--'; }
+        }
+
         function lotsStr(p) {
             let s = String(p.num_lots || 1);
             if (p.multiplier && p.multiplier > 1) s += 'x' + p.multiplier;
@@ -350,7 +372,7 @@
             document.getElementById('openBadge').textContent = positions.length;
 
             if (positions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="14" style="text-align:center;color:#8899aa">No open positions</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:#8899aa">No open positions</td></tr>';
                 cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No open positions</div>';
                 return;
             }
@@ -369,6 +391,7 @@
                     <td>${fmt(p.entry_price)}</td>
                     <td>${fmt(p.current_price)}</td>
                     <td class="${pnlClass(p.pnl)}"><b>${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</b></td>
+                    <td style="font-size:11px">${fmtTime(p.entry_time)}</td>
                     <td>${p.duration}</td>
                     <td>${p.tsl ? fmt(p.tsl) : '--'}</td>
                     <td>${fmt(p.target)}</td>
@@ -388,7 +411,7 @@
                         <span class="secondary">${p.duration}</span>
                     </div>
                     <div class="row">
-                        <span class="secondary">Entry: ${fmt(p.entry_price)} | Curr: ${fmt(p.current_price)}</span>
+                        <span class="secondary">Entry: ${fmt(p.entry_price)} @ ${fmtTime(p.entry_time)} | Curr: ${fmt(p.current_price)}</span>
                         <span class="secondary">TSL: ${p.tsl ? fmt(p.tsl) : '--'}</span>
                     </div>
                     <div class="row">
@@ -405,7 +428,7 @@
             document.getElementById('closedBadge').textContent = trades.length;
 
             if (trades.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#8899aa">No closed trades today</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#8899aa">No closed trades today</td></tr>';
                 cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No closed trades today</div>';
                 return;
             }
@@ -424,6 +447,8 @@
                     <td>${fmt(t.exit_price)}</td>
                     <td class="${pnlClass(t.pnl)}"><b>${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</b></td>
                     <td>${fmtK(t.capital_after)}</td>
+                    <td style="font-size:11px">${fmtTime(t.entry_time)}</td>
+                    <td style="font-size:11px">${fmtTime(t.exit_time)}</td>
                     <td><span class="tag tag-exit">${t.exit_reason}</span></td>
                     <td>${t.hold_duration}</td>
                 </tr>
@@ -440,8 +465,11 @@
                         <span class="tag tag-exit">${t.exit_reason}</span>
                     </div>
                     <div class="row">
-                        <span class="secondary">Entry: ${fmt(t.entry_price)} | Exit: ${fmt(t.exit_price)}</span>
+                        <span class="secondary">In: ${fmtTime(t.entry_time)} | Out: ${fmtTime(t.exit_time)}</span>
                         <span class="secondary">Cap: ${fmtK(t.capital_after)}</span>
+                    </div>
+                    <div class="row">
+                        <span class="secondary">Entry: ${fmt(t.entry_price)} | Exit: ${fmt(t.exit_price)}</span>
                     </div>
                 </div>
             `).join('');
