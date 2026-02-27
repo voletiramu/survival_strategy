@@ -61,6 +61,10 @@ MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
 MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
 MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
 
+# v2.4: Dynamic lot sizing
+MAX_LOTS = {'NIFTY': 3, 'BANKNIFTY': 3, 'SENSEX': 4}  # Hard cap on lots per trade
+STRONG_TRADE_MIN_SCORE = 60  # Only multi-lot on quality score >= 60 (strong trades)
+
 # OI + IV Exit Thresholds (INCREASED — 15% was too aggressive, caused 82% premature exits)
 OI_SURGE_PCT = 35                # Exit if OI changes >35% from entry (was 15%)
 OI_SURGE_FIRST_HOUR_PCT = 50     # 9:15-10:15 AM: first hour OI shifts are massive
@@ -73,6 +77,16 @@ IV_REVERSE_PCT = 50              # Reverse trade if IV changes >50% (was 40%)
 OI_IV_COMBO_OI = 20              # Combined exit: OI >20% AND IV >25% (was 10%/15%)
 OI_IV_COMBO_IV = 25
 GAMMA_SHIELD_THRESHOLD = 0.002   # Exit short positions if gamma > this
+
+# v2.4: Strategy-specific OI/IV exit multipliers
+# Ghost Zone exits faster (worst performer), Survivor tolerates more (benefits from decay)
+STRATEGY_EXIT_MULT = {
+    'CPR':          {'oi': 1.0, 'iv': 1.0},
+    'Gamma Blast':  {'oi': 1.0, 'iv': 1.0},
+    'Ghost Zone':   {'oi': 0.7, 'iv': 0.8},    # 30% LOWER threshold → exits faster
+    'PCR+VWAP':     {'oi': 1.0, 'iv': 1.0},
+    'Survivor':     {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold → tolerates swings
+}
 
 # Trade Quality Filters (eliminate brokerage-losing weak trades)
 MIN_PREMIUM_BUY = 15             # Min Rs 15 premium for BUY trades (was Rs 3)
@@ -605,41 +619,69 @@ class PaperPortfolio:
 
     def add_signal(self, strategy, symbol, signal_type, strike, entry_premium,
                    delta, gamma, theta, iv, dte, details=None, oi=0, spot_price=0):
-        """Record a trading signal with risk management and OI/IV tracking."""
+        """Record a trading signal with risk management, dynamic lot sizing, and OI/IV tracking."""
         # ---- RISK CHECK ----
-        lot_size = LOT_SIZES.get(symbol, 65)
+        base_lot = LOT_SIZES.get(symbol, 65)
         is_sell = 'SELL' in signal_type
         is_commodity = symbol in ('GOLDM', 'SILVERM', 'CRUDEOILM', 'GOLD', 'SILVER', 'CRUDEOIL')
         max_per_trade = MAX_COMMODITY_PER_TRADE if is_commodity else MAX_EQUITY_PER_TRADE
         segment_capital = COMMODITY_CAPITAL if is_commodity else EQUITY_CAPITAL
 
-        # Capital required: SELL = margin blocked, BUY = premium paid
-        if is_sell:
-            trade_cost = MARGIN_PER_LOT.get(symbol, 120000)
-        else:
-            trade_cost = entry_premium * lot_size
-
-        # Check 1: Per-trade risk limit (skip for SELL — margin is collateral, not risk)
-        if not is_sell and trade_cost > max_per_trade:
-            logger.warning(f"  RISK_LIMIT: {symbol} {strategy} trade cost Rs {trade_cost:,.0f} "
-                          f"> max Rs {max_per_trade:,.0f}. SKIPPED.")
-            return None
-
-        # Check 2: Only trade with LEFTOVER available capital
+        # Compute available capital first (needed for dynamic lot sizing)
         total_exposure = 0
         for p in self.positions:
             p_is_commodity = p['symbol'] in ('GOLDM', 'SILVERM', 'CRUDEOILM', 'GOLD', 'SILVER', 'CRUDEOIL')
             if p_is_commodity == is_commodity:
                 if p.get('is_sell', False):
-                    total_exposure += MARGIN_PER_LOT.get(p['symbol'], 120000)
+                    total_exposure += MARGIN_PER_LOT.get(p['symbol'], 120000) * p.get('num_lots', 1)
                 else:
                     total_exposure += p['entry_premium'] * p['lot_size']
-
         available_capital = segment_capital - total_exposure
-        if trade_cost > available_capital:
-            logger.warning(f"  RISK_LIMIT: {symbol} {strategy} needs Rs {trade_cost:,.0f} "
-                          f"but only Rs {available_capital:,.0f} available. SKIPPED.")
+
+        # v2.4: Dynamic lot sizing — scale up for strong trades when capital available
+        quality_score = (details or {}).get('quality_score', 0) if details else 0
+        if is_sell:
+            cost_per_lot = MARGIN_PER_LOT.get(symbol, 120000)
+        else:
+            cost_per_lot = entry_premium * base_lot
+
+        # Drawdown check — force single lot if DD > 5%
+        equity_hwm = max(self.initial_capital, self.capital)
+        current_dd_pct = (equity_hwm - self.capital) / equity_hwm * 100
+
+        # Determine number of lots
+        max_lots_cap = MAX_LOTS.get(symbol, 2)
+        if quality_score >= STRONG_TRADE_MIN_SCORE and cost_per_lot > 0 and current_dd_pct <= 5:
+            affordable_lots = int(available_capital // cost_per_lot)
+            num_lots = max(1, min(affordable_lots, max_lots_cap))
+        else:
+            num_lots = 1
+
+        lot_size = base_lot * num_lots
+
+        # Capital required for this trade
+        if is_sell:
+            trade_cost = MARGIN_PER_LOT.get(symbol, 120000) * num_lots
+        else:
+            trade_cost = entry_premium * lot_size
+
+        # Check 1: Per-trade risk limit (skip for SELL — margin is collateral, not risk)
+        if not is_sell and trade_cost > max_per_trade * num_lots:
+            logger.warning(f"  RISK_LIMIT: {symbol} {strategy} trade cost Rs {trade_cost:,.0f} "
+                          f"> max Rs {max_per_trade * num_lots:,.0f}. SKIPPED.")
             return None
+
+        # Check 2: Available capital
+        if trade_cost > available_capital:
+            # Try with fewer lots
+            if num_lots > 1 and cost_per_lot > 0:
+                num_lots = max(1, int(available_capital // cost_per_lot))
+                lot_size = base_lot * num_lots
+                trade_cost = cost_per_lot * num_lots
+            if trade_cost > available_capital:
+                logger.warning(f"  RISK_LIMIT: {symbol} {strategy} needs Rs {trade_cost:,.0f} "
+                              f"but only Rs {available_capital:,.0f} available. SKIPPED.")
+                return None
 
         # Check 3: Daily loss limit
         today = datetime.now().strftime('%Y-%m-%d')
@@ -655,9 +697,7 @@ class PaperPortfolio:
             logger.warning(f"  RISK_LIMIT: Max {MAX_POSITIONS_PER_SYMBOL} positions for {symbol}. SKIPPED.")
             return None
 
-        # Check 5: Drawdown-based position scaling
-        equity_hwm = max(self.initial_capital, self.capital)
-        current_dd_pct = (equity_hwm - self.capital) / equity_hwm * 100
+        # Check 5: Drawdown-based position scaling (for single-lot trades too)
         if current_dd_pct > 5:
             scale_factor = max(0.5, 1.0 - (current_dd_pct - 5) * 0.05)
             scaled_max = max_per_trade * scale_factor
@@ -696,6 +736,7 @@ class PaperPortfolio:
             'entry_premium': round(entry_premium, 2),
             'current_premium': round(entry_premium, 2),
             'lot_size': lot_size,
+            'num_lots': num_lots,  # v2.4: How many exchange lots
             'is_sell': is_sell,
             'entry_cost': round(cost, 2),
             'delta': round(delta, 4),
@@ -716,11 +757,15 @@ class PaperPortfolio:
             'trailing_sl': None,
             'breakeven_locked': False,
             'details': details or {},  # Store target/SL from strategy signals
+            'capital_available': round(available_capital - trade_cost, 2),  # v2.4
         }
         self.positions.append(pos)
 
+        if num_lots > 1:
+            logger.info(f"  MULTI_LOT: {num_lots} lots ({lot_size} qty) for {symbol} "
+                       f"| Score={quality_score} | Available Rs {available_capital:,.0f}")
         logger.info(f"  PAPER TRADE: {signal_type} {symbol} {strike} "
-                    f"@ Rs {entry_premium:.2f} | Strategy: {strategy} "
+                    f"@ Rs {entry_premium:.2f} x{num_lots}lot | Strategy: {strategy} "
                     f"| Delta: {delta:.3f} | IV: {iv*100:.1f}% | OI: {oi}")
 
         self.save_state()
@@ -766,10 +811,11 @@ class PaperPortfolio:
                 today = datetime.now().strftime('%Y-%m-%d')
                 self.daily_pnl[today] = self.daily_pnl.get(today, 0) + pnl
                 self.capital += pnl
+                trade['capital_after'] = round(self.capital, 2)  # v2.4
 
                 logger.info(f"  CLOSED: {pos['signal_type']} {pos['symbol']} {pos['strike']} "
                            f"| Entry: Rs {pos['entry_premium']:.2f} Exit: Rs {exit_premium:.2f} "
-                           f"| PnL: Rs {pnl:,.2f} | Reason: {reason}")
+                           f"| PnL: Rs {pnl:,.2f} | Reason: {reason} | Capital: Rs {self.capital:,.0f}")
 
                 self.save_state()
                 return trade
@@ -1299,8 +1345,8 @@ class StrategyEngine:
                     'greeks': g,
                     'reason': f"Survivor: PE sell at {pe_strike:.0f} "
                               f"dist={distance:.0f} gap={gap:.0f} res={ind['resistance']:.0f}",
-                    'target': g['price'] * 0.1,
-                    'sl': g['price'] * 1.5,
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
                 })
 
         # CE SELLING - price breaks below support
@@ -1315,8 +1361,8 @@ class StrategyEngine:
                     'greeks': g,
                     'reason': f"Survivor: CE sell at {ce_strike:.0f} "
                               f"dist={distance:.0f} gap={gap:.0f} sup={ind['support']:.0f}",
-                    'target': g['price'] * 0.1,
-                    'sl': g['price'] * 1.5,
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
                 })
 
         return signals
@@ -1655,18 +1701,17 @@ class PaperTrader:
                 logger.info(f"  MAX_TRADES_REACHED: {self.daily_trade_count} trades today. Skipping remaining signals.")
                 break
 
-            # Check for duplicate: same strategy + symbol + NEARBY strike + SAME option type
+            # v2.4: Check for duplicate across ALL strategies — same symbol + NEARBY strike + SAME option type
             strike_tolerance = {'NIFTY': 100, 'BANKNIFTY': 200, 'SENSEX': 200}
             tol = strike_tolerance.get(sig['symbol'], 100)
             sig_opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
             existing = [p for p in self.portfolio.positions
-                        if p['strategy'] == sig['strategy']
-                        and p['symbol'] == sig['symbol']
+                        if p['symbol'] == sig['symbol']
                         and abs(p['strike'] - sig['strike']) <= tol
                         and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)]
             if existing:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['symbol']} "
-                           f"{sig['strike']}{sig_opt_type} near existing {existing[0]['strike']}")
+                           f"{sig['strike']}{sig_opt_type} — already held by {existing[0]['strategy']} @ {existing[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -2017,9 +2062,30 @@ class PaperTrader:
         vix_mult = self.get_vix_multiplier()
         oi_threshold *= vix_mult
 
+        # v2.4: Strategy-specific threshold multiplier
+        strat_name = pos.get('strategy', '').replace(' (Reversal)', '')
+        strat_mult = STRATEGY_EXIT_MULT.get(strat_name, {'oi': 1.0, 'iv': 1.0})
+        oi_threshold *= strat_mult['oi']
+
         # v2.3: BANKNIFTY-specific IV threshold
         iv_threshold = IV_SPIKE_PCT_BANKNIFTY if pos['symbol'] == 'BANKNIFTY' else IV_SPIKE_PCT
         iv_threshold *= vix_mult
+        iv_threshold *= strat_mult['iv']
+
+        # v2.4: If position is profitable AND moving toward target, hold despite OI/IV
+        details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
+        target = details.get('target', 0)
+        if target > 0 and pos.get('entry_premium', 0) > 0:
+            is_sell = pos.get('is_sell', False)
+            if is_sell:
+                moving_toward_target = current_premium < pos['entry_premium']
+            else:
+                moving_toward_target = current_premium > pos['entry_premium']
+            pnl = pos.get('unrealized_pnl', 0)
+            if moving_toward_target and pnl > 0:
+                logger.info(f"  OI_TREND_HOLD: {pos['id']} ({strat_name}) profitable Rs {pnl:.0f} "
+                           f"& moving toward target. Holding despite OI={oi_change:.1f}%/IV={iv_change:.1f}%.")
+                return None, False
 
         # Rule 1: OI surge (time-adaptive)
         if oi_change > oi_threshold:
@@ -2444,17 +2510,22 @@ class PaperTrader:
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current_premium, current_iv_pct)
             if oi_iv_reason:
                 # v2.3.2: PnL guard — don't exit on OI/IV if PnL doesn't cover brokerage
-                lot_size = LOT_SIZES.get(symbol, 50)
+                lot_size = pos.get('lot_size', LOT_SIZES.get(symbol, 50))
                 if pos['is_sell']:
                     pnl_estimate = (pos['entry_premium'] - current_premium) * lot_size
                 else:
                     pnl_estimate = (current_premium - pos['entry_premium']) * lot_size
                 total_cost = calc_costs(pos['entry_premium'], lot_size, pos.get('is_sell', False))
 
+                # v2.4: Strategy-aware PnL threshold (Survivor tolerates 3x more)
+                min_oi_pnl = MIN_OI_EXIT_PNL
+                if 'Survivor' in pos.get('strategy', ''):
+                    min_oi_pnl = MIN_OI_EXIT_PNL * 3  # Rs 240 for Survivor
+
                 # Allow OI exit only if: profitable enough, OR losing badly (stop bleeding)
-                if pnl_estimate < MIN_OI_EXIT_PNL and pnl_estimate > -total_cost * 2:
+                if pnl_estimate < min_oi_pnl and pnl_estimate > -total_cost * 2:
                     logger.info(f"  OI_EXIT_BLOCKED: {pos['id']} {oi_iv_reason} blocked — "
-                               f"PnL Rs {pnl_estimate:.0f} < Rs {MIN_OI_EXIT_PNL} "
+                               f"PnL Rs {pnl_estimate:.0f} < Rs {min_oi_pnl} "
                                f"(need profit to cover brokerage). Letting TSL/target handle exit.")
                 else:
                     self.portfolio.close_position(pos['id'], current_premium, oi_iv_reason)

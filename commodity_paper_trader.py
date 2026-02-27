@@ -102,6 +102,10 @@ MAX_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
 MAX_POSITIONS_PER_COMMODITY = 3                         # Prevent cascade (e.g., 16 SILVERM trades)
 MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 30,000 (10% daily loss limit)
 
+# v2.4: Dynamic lot sizing for commodities
+MCX_MAX_LOTS = {'GOLDM': 5, 'SILVERM': 3, 'CRUDEOILM': 5}
+MCX_STRONG_TRADE_MIN_SCORE = 60  # Only multi-lot on quality score >= 60
+
 # Trailing Stop Loss Parameters (multi-phase for max profit capture)
 TSL_BREAKEVEN_TRIGGER_PCT = 30   # Phase 1: Lock breakeven when 30% of target reached
 TSL_TRAIL_TRIGGER_PCT = 50       # Phase 2: Start trailing when 50% of target reached
@@ -120,6 +124,15 @@ MCX_IV_REVERSE_PCT = 60         # Reverse trade if IV changes >60% (was 50%)
 MCX_OI_IV_COMBO_OI = 25         # Combined exit: OI >25% AND IV >30% (was 15%/20%)
 MCX_OI_IV_COMBO_IV = 30
 MCX_GAMMA_SHIELD_THRESHOLD = 0.003  # Exit short if gamma > this
+
+# v2.4: Strategy-specific OI/IV exit multipliers for commodities
+MCX_STRATEGY_EXIT_MULT = {
+    'CPR':          {'oi': 1.0, 'iv': 1.0},
+    'Gamma Blast':  {'oi': 1.0, 'iv': 1.0},
+    'Ghost Zone':   {'oi': 0.7, 'iv': 0.8},    # 30% LOWER threshold → exits faster
+    'PCR+VWAP':     {'oi': 1.0, 'iv': 1.0},
+    'Survivor':     {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold → tolerates swings
+}
 
 # Trade Quality Filters (commodity — eliminate brokerage-losing weak trades)
 MCX_MIN_PREMIUM_BUY = 5         # Min Rs 5 premium for commodity BUY trades
@@ -376,38 +389,63 @@ class CommodityPortfolio:
     def add_signal(self, strategy, commodity, signal_type, strike, entry_premium,
                    greeks, dte, details=None, oi=0, iv=0):
         spec = COMMODITIES[commodity]
-        lot = spec['lot_size']
+        base_lot = spec['lot_size']
         mult = spec['multiplier']
         is_sell = 'SELL' in signal_type
 
         # ---- RISK CHECKS: Only trade with leftover capital ----
 
-        # Capital required: SELL = margin blocked, BUY = premium paid
-        if is_sell:
-            trade_capital = spec['margin']
-        else:
-            trade_capital = entry_premium * lot * mult
-
-        # Check 1: Per-trade limit (25% of commodity capital for BUY; margin check for SELL)
-        if not is_sell and trade_capital > MAX_PER_TRADE:
-            logger.warning(f"  RISK_LIMIT: {commodity} {strategy} trade capital Rs {trade_capital:,.0f} "
-                          f"> max Rs {MAX_PER_TRADE:,.0f}. SKIPPED.")
-            return None
-
-        # Check 2: Only trade with LEFTOVER available capital
+        # Compute available capital first (needed for dynamic lot sizing)
         total_locked = 0
         for p in self.positions:
             p_spec = COMMODITIES[p['commodity']]
             if p['is_sell']:
-                total_locked += p_spec['margin']
+                total_locked += p_spec['margin'] * p.get('num_lots', 1)
             else:
                 total_locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
-
         available_capital = self.capital - total_locked
-        if trade_capital > available_capital:
-            logger.warning(f"  RISK_LIMIT: {commodity} {strategy} needs Rs {trade_capital:,.0f} "
-                          f"but only Rs {available_capital:,.0f} available. SKIPPED.")
+
+        # v2.4: Dynamic lot sizing for commodities
+        quality_score = (details or {}).get('quality_score', 0) if details else 0
+        cost_per_lot = spec['margin'] if is_sell else entry_premium * base_lot * mult
+
+        # Drawdown check
+        hwm = max(self.initial_capital, self.capital)
+        dd_pct = (hwm - self.capital) / hwm * 100
+
+        # Determine number of lots
+        max_lots_cap = MCX_MAX_LOTS.get(commodity, 3)
+        if quality_score >= MCX_STRONG_TRADE_MIN_SCORE and cost_per_lot > 0 and dd_pct <= 5:
+            affordable_lots = int(available_capital // cost_per_lot)
+            num_lots = max(1, min(affordable_lots, max_lots_cap))
+        else:
+            num_lots = 1
+
+        lot = base_lot * num_lots
+
+        # Capital required for this trade
+        if is_sell:
+            trade_capital = spec['margin'] * num_lots
+        else:
+            trade_capital = entry_premium * lot * mult
+
+        # Check 1: Per-trade limit (25% of commodity capital for BUY; margin check for SELL)
+        if not is_sell and trade_capital > MAX_PER_TRADE * num_lots:
+            logger.warning(f"  RISK_LIMIT: {commodity} {strategy} trade capital Rs {trade_capital:,.0f} "
+                          f"> max Rs {MAX_PER_TRADE * num_lots:,.0f}. SKIPPED.")
             return None
+
+        # Check 2: Available capital
+        if trade_capital > available_capital:
+            # Try with fewer lots
+            if num_lots > 1 and cost_per_lot > 0:
+                num_lots = max(1, int(available_capital // cost_per_lot))
+                lot = base_lot * num_lots
+                trade_capital = cost_per_lot * num_lots
+            if trade_capital > available_capital:
+                logger.warning(f"  RISK_LIMIT: {commodity} {strategy} needs Rs {trade_capital:,.0f} "
+                              f"but only Rs {available_capital:,.0f} available. SKIPPED.")
+                return None
 
         # Check 3: Daily loss limit (10% of commodity capital)
         today = datetime.now().strftime('%Y-%m-%d')
@@ -424,9 +462,7 @@ class CommodityPortfolio:
                           f"for {commodity} reached. SKIPPED.")
             return None
 
-        # Check 5: Drawdown-based position scaling
-        hwm = max(self.initial_capital, self.capital)
-        dd_pct = (hwm - self.capital) / hwm * 100
+        # Check 5: Drawdown-based position scaling (for single-lot trades too)
         if dd_pct > 5:
             scale = max(0.5, 1.0 - (dd_pct - 5) * 0.05)
             scaled_max = MAX_PER_TRADE * scale
@@ -449,6 +485,7 @@ class CommodityPortfolio:
             'entry_premium': round(entry_premium, 2),
             'current_premium': round(entry_premium, 2),
             'lot_size': lot,
+            'num_lots': num_lots,  # v2.4: How many exchange lots
             'multiplier': mult,
             'is_sell': is_sell,
             'entry_cost': round(cost, 2),
@@ -468,11 +505,15 @@ class CommodityPortfolio:
             'trough_premium': round(entry_premium, 2),
             'trailing_sl': None,
             'breakeven_locked': False,
+            'capital_available': round(available_capital - trade_capital, 2),  # v2.4
         }
         self.positions.append(pos)
 
+        if num_lots > 1:
+            logger.info(f"  MCX_MULTI_LOT: {num_lots} lots ({lot} qty) for {commodity} "
+                       f"| Score={quality_score} | Available Rs {available_capital:,.0f}")
         logger.info(f"  PAPER TRADE: {signal_type} {commodity} {strike} "
-                    f"@ Rs {entry_premium:.2f} | {strategy} | Delta: {greeks['delta']:.3f}")
+                    f"@ Rs {entry_premium:.2f} x{num_lots}lot | {strategy} | Delta: {greeks['delta']:.3f}")
         self.save_state()
         return pos
 
@@ -495,8 +536,9 @@ class CommodityPortfolio:
                 today = datetime.now().strftime('%Y-%m-%d')
                 self.daily_pnl[today] = self.daily_pnl.get(today, 0) + pnl
                 self.capital += pnl
+                trade['capital_after'] = round(self.capital, 2)  # v2.4
                 logger.info(f"  CLOSED: {pos['signal_type']} {pos['commodity']} "
-                           f"| PnL: Rs {pnl:,.2f} | {reason}")
+                           f"| PnL: Rs {pnl:,.2f} | {reason} | Capital: Rs {self.capital:,.0f}")
                 self.save_state()
                 return trade
         return None
@@ -871,8 +913,8 @@ class CommodityStrategyEngine:
         T = dte / 365
         atr = ind['atr']
 
-        # Skip if too close to expiry (< 3 DTE)
-        if dte < 3:
+        # Skip if too close to expiry (< 3 DTE) or too far (> 5 DTE — negligible theta)
+        if dte < 3 or dte > 5:
             return signals
 
         # Check margin availability
@@ -909,8 +951,8 @@ class CommodityStrategyEngine:
                     'greeks': g,
                     'reason': f"Survivor: PE sell at {pe_strike:.0f} dist={distance:.0f} "
                               f"gap={gap:.0f} res={resistance:.0f}",
-                    'target': g['price'] * 0.1,
-                    'sl': g['price'] * 1.5,
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
                 })
 
         # CE SELLING — price breaks below support (bearish → sell OTM CEs)
@@ -925,8 +967,8 @@ class CommodityStrategyEngine:
                     'greeks': g,
                     'reason': f"Survivor: CE sell at {ce_strike:.0f} dist={distance:.0f} "
                               f"gap={gap:.0f} sup={support:.0f}",
-                    'target': g['price'] * 0.1,
-                    'sl': g['price'] * 1.5,
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
                 })
 
         return signals
@@ -1349,6 +1391,26 @@ class CommodityPaperTrader:
         else:
             oi_threshold = MCX_OI_SURGE_LAST_HOUR_PCT    # 45% — close
 
+        # v2.4: Strategy-specific threshold multiplier
+        strat_name = pos.get('strategy', '').replace(' (Reversal)', '')
+        strat_mult = MCX_STRATEGY_EXIT_MULT.get(strat_name, {'oi': 1.0, 'iv': 1.0})
+        oi_threshold *= strat_mult['oi']
+
+        # v2.4: If position is profitable AND moving toward target, hold despite OI/IV
+        details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
+        target = details.get('target', 0)
+        if target > 0 and pos.get('entry_premium', 0) > 0:
+            is_sell = pos.get('is_sell', False)
+            if is_sell:
+                moving_toward_target = current_premium < pos['entry_premium']
+            else:
+                moving_toward_target = current_premium > pos['entry_premium']
+            pnl = pos.get('unrealized_pnl', 0)
+            if moving_toward_target and pnl > 0:
+                logger.info(f"  MCX_OI_TREND_HOLD: {pos['id']} ({strat_name}) profitable Rs {pnl:.0f} "
+                           f"& moving toward target. Holding despite OI={oi_change:.1f}%/IV={iv_change:.1f}%.")
+                return None, False
+
         # Rule 1: OI surge (time-adaptive)
         if oi_change > oi_threshold:
             should_reverse = oi_change > MCX_OI_REVERSE_PCT
@@ -1356,10 +1418,11 @@ class CommodityPaperTrader:
                        f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')})")
             return 'OI_SURGE_EXIT', should_reverse
 
-        # Rule 2: IV spike
-        if iv_change > MCX_IV_SPIKE_PCT:
+        # Rule 2: IV spike (v2.4: strategy-adjusted)
+        iv_threshold = MCX_IV_SPIKE_PCT * strat_mult['iv']
+        if iv_change > iv_threshold:
             should_reverse = iv_change > MCX_IV_REVERSE_PCT
-            logger.info(f"  MCX_IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {MCX_IV_SPIKE_PCT}% "
+            logger.info(f"  MCX_IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
                        f"(entry={entry_iv}%, current={current_iv}%)")
             return 'IV_SPIKE_EXIT', should_reverse
 
@@ -1595,18 +1658,17 @@ class CommodityPaperTrader:
                 logger.info(f"  MCX_MAX_TRADES_REACHED: {self.daily_trade_count} trades today. Skipping remaining.")
                 break
 
-            # Check for duplicate: same strategy + commodity + NEARBY strike + SAME option type
+            # v2.4: Check for duplicate across ALL strategies — same commodity + NEARBY strike + SAME option type
             strike_tolerance = {'GOLDM': 200, 'SILVERM': 1000, 'CRUDEOILM': 100}
             tol = strike_tolerance.get(sig['commodity'], 100)
             sig_opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
             existing = [p for p in self.portfolio.positions
-                        if p['strategy'] == sig['strategy']
-                        and p['commodity'] == sig['commodity']
+                        if p['commodity'] == sig['commodity']
                         and abs(p['strike'] - sig['strike']) <= tol
                         and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)]
             if existing:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['commodity']} "
-                           f"{sig['strike']}{sig_opt_type} near existing {existing[0]['strike']}")
+                           f"{sig['strike']}{sig_opt_type} — already held by {existing[0]['strategy']} @ {existing[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -1982,16 +2044,22 @@ class CommodityPaperTrader:
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current, current_iv_pct)
             if oi_iv_reason:
                 # v2.3.2: PnL guard — don't exit on OI/IV if PnL doesn't cover brokerage
-                spec = COMMODITIES[commodity]
+                pos_lot = pos.get('lot_size', COMMODITIES[commodity]['lot_size'])
+                pos_mult = pos.get('multiplier', COMMODITIES[commodity]['multiplier'])
                 if pos['is_sell']:
-                    pnl_estimate = (pos['entry_premium'] - current) * spec['lot_size'] * spec['multiplier']
+                    pnl_estimate = (pos['entry_premium'] - current) * pos_lot * pos_mult
                 else:
-                    pnl_estimate = (current - pos['entry_premium']) * spec['lot_size'] * spec['multiplier']
-                total_cost = calc_mcx_costs(pos['entry_premium'], spec['lot_size'], spec['multiplier'], pos.get('is_sell', False))
+                    pnl_estimate = (current - pos['entry_premium']) * pos_lot * pos_mult
+                total_cost = calc_mcx_costs(pos['entry_premium'], pos_lot, pos_mult, pos.get('is_sell', False))
 
-                if pnl_estimate < MCX_MIN_OI_EXIT_PNL and pnl_estimate > -total_cost * 2:
+                # v2.4: Strategy-aware PnL threshold (Survivor tolerates 3x more)
+                min_oi_pnl = MCX_MIN_OI_EXIT_PNL
+                if 'Survivor' in pos.get('strategy', ''):
+                    min_oi_pnl = MCX_MIN_OI_EXIT_PNL * 3  # Rs 150 for Survivor
+
+                if pnl_estimate < min_oi_pnl and pnl_estimate > -total_cost * 2:
                     logger.info(f"  OI_EXIT_BLOCKED: {pos['id']} {oi_iv_reason} blocked — "
-                               f"PnL Rs {pnl_estimate:.0f} < Rs {MCX_MIN_OI_EXIT_PNL} "
+                               f"PnL Rs {pnl_estimate:.0f} < Rs {min_oi_pnl} "
                                f"(need profit to cover brokerage). Letting TSL/target handle exit.")
                 else:
                     self.portfolio.close_position(pos['id'], current, oi_iv_reason)

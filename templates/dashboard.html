@@ -226,6 +226,16 @@
             <div class="value neutral" id="cmCapital">--</div>
             <div class="sub" id="cmDaily">Daily PnL</div>
         </div>
+        <div class="stat-card">
+            <div class="label">Equity Available</div>
+            <div class="value neutral" id="eqAvailable">--</div>
+            <div class="sub">Free capital</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Commodity Available</div>
+            <div class="value neutral" id="cmAvailable">--</div>
+            <div class="sub">Free capital</div>
+        </div>
     </div>
 
     <div class="section">
@@ -240,19 +250,21 @@
                             <th>Symbol</th>
                             <th>Strategy</th>
                             <th>Type</th>
+                            <th>Lots</th>
+                            <th>Invested</th>
                             <th>Strike</th>
                             <th>Entry</th>
                             <th>Current</th>
                             <th>PnL</th>
                             <th>Duration</th>
-                            <th>Delta</th>
                             <th>TSL</th>
                             <th>Target</th>
                             <th>SL</th>
+                            <th>Available</th>
                         </tr>
                     </thead>
                     <tbody id="openTableBody">
-                        <tr><td colspan="12" class="loading">Loading...</td></tr>
+                        <tr><td colspan="14" class="loading">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -274,16 +286,18 @@
                             <th>Symbol</th>
                             <th>Strategy</th>
                             <th>Type</th>
+                            <th>Lots</th>
                             <th>Strike</th>
                             <th>Entry</th>
                             <th>Exit</th>
                             <th>PnL</th>
+                            <th>Cap After</th>
                             <th>Exit Reason</th>
                             <th>Hold</th>
                         </tr>
                     </thead>
                     <tbody id="closedTableBody">
-                        <tr><td colspan="9" class="loading">Loading...</td></tr>
+                        <tr><td colspan="11" class="loading">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -295,11 +309,18 @@
 
     <script>
         function fmt(n) {
-            if (n === null || n === undefined) return '--';
+            if (n === null || n === undefined || n === 0) return '--';
             return new Intl.NumberFormat('en-IN', {
                 maximumFractionDigits: 2,
                 minimumFractionDigits: 0
             }).format(n);
+        }
+
+        function fmtK(n) {
+            if (n === null || n === undefined || n === 0) return '--';
+            if (Math.abs(n) >= 100000) return (n / 100000).toFixed(1) + 'L';
+            if (Math.abs(n) >= 1000) return (n / 1000).toFixed(1) + 'K';
+            return fmt(n);
         }
 
         function pnlClass(v) {
@@ -317,13 +338,19 @@
             return tags;
         }
 
+        function lotsStr(p) {
+            let s = String(p.num_lots || 1);
+            if (p.multiplier && p.multiplier > 1) s += 'x' + p.multiplier;
+            return s;
+        }
+
         function renderOpen(positions) {
             const tbody = document.getElementById('openTableBody');
             const cards = document.getElementById('openCards');
             document.getElementById('openBadge').textContent = positions.length;
 
             if (positions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#8899aa">No open positions</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="14" style="text-align:center;color:#8899aa">No open positions</td></tr>';
                 cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No open positions</div>';
                 return;
             }
@@ -336,15 +363,17 @@
                     <td><b>${p.symbol}</b> <span style="font-size:10px;color:#8899aa">${p.market.toUpperCase()}</span></td>
                     <td>${p.strategy}</td>
                     <td>${typeTag(p.type)}</td>
+                    <td>${lotsStr(p)}</td>
+                    <td>${fmtK(p.capital_invested)}</td>
                     <td>${fmt(p.strike)}</td>
                     <td>${fmt(p.entry_price)}</td>
                     <td>${fmt(p.current_price)}</td>
                     <td class="${pnlClass(p.pnl)}"><b>${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</b></td>
                     <td>${p.duration}</td>
-                    <td>${p.delta ? p.delta.toFixed(3) : '--'}</td>
                     <td>${p.tsl ? fmt(p.tsl) : '--'}</td>
                     <td>${fmt(p.target)}</td>
                     <td>${fmt(p.sl)}</td>
+                    <td>${fmtK(p.capital_available)}</td>
                 </tr>
             `).join('');
 
@@ -355,12 +384,16 @@
                         <span class="primary ${pnlClass(p.pnl)}">${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</span>
                     </div>
                     <div class="row">
-                        <span class="secondary">${p.strategy} | Strike ${fmt(p.strike)}</span>
+                        <span class="secondary">${p.strategy} | ${lotsStr(p)} lot | ${fmtK(p.capital_invested)}</span>
                         <span class="secondary">${p.duration}</span>
                     </div>
                     <div class="row">
                         <span class="secondary">Entry: ${fmt(p.entry_price)} | Curr: ${fmt(p.current_price)}</span>
                         <span class="secondary">TSL: ${p.tsl ? fmt(p.tsl) : '--'}</span>
+                    </div>
+                    <div class="row">
+                        <span class="secondary">Avail: ${fmtK(p.capital_available)}</span>
+                        <span class="secondary">Strike: ${fmt(p.strike)}</span>
                     </div>
                 </div>
             `).join('');
@@ -372,7 +405,7 @@
             document.getElementById('closedBadge').textContent = trades.length;
 
             if (trades.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#8899aa">No closed trades today</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#8899aa">No closed trades today</td></tr>';
                 cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No closed trades today</div>';
                 return;
             }
@@ -385,10 +418,12 @@
                     <td><b>${t.symbol}</b> <span style="font-size:10px;color:#8899aa">${t.market.toUpperCase()}</span></td>
                     <td>${t.strategy}</td>
                     <td>${typeTag(t.type)}</td>
+                    <td>${t.num_lots || 1}</td>
                     <td>${fmt(t.strike)}</td>
                     <td>${fmt(t.entry_price)}</td>
                     <td>${fmt(t.exit_price)}</td>
                     <td class="${pnlClass(t.pnl)}"><b>${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</b></td>
+                    <td>${fmtK(t.capital_after)}</td>
                     <td><span class="tag tag-exit">${t.exit_reason}</span></td>
                     <td>${t.hold_duration}</td>
                 </tr>
@@ -401,11 +436,12 @@
                         <span class="primary ${pnlClass(t.pnl)}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</span>
                     </div>
                     <div class="row">
-                        <span class="secondary">${t.strategy} | ${t.hold_duration}</span>
+                        <span class="secondary">${t.strategy} | ${t.num_lots || 1} lot | ${t.hold_duration}</span>
                         <span class="tag tag-exit">${t.exit_reason}</span>
                     </div>
                     <div class="row">
                         <span class="secondary">Entry: ${fmt(t.entry_price)} | Exit: ${fmt(t.exit_price)}</span>
+                        <span class="secondary">Cap: ${fmtK(t.capital_after)}</span>
                     </div>
                 </div>
             `).join('');
@@ -437,6 +473,10 @@
             el('cmCapital').textContent = fmt(s.commodity_capital);
             el('cmDaily').textContent = 'Daily: ' + (s.commodity_daily_pnl >= 0 ? '+' : '') + fmt(s.commodity_daily_pnl);
             el('cmDaily').className = 'sub ' + pnlClass(s.commodity_daily_pnl);
+
+            // v2.4: Capital available
+            el('eqAvailable').textContent = fmtK(s.equity_available);
+            el('cmAvailable').textContent = fmtK(s.commodity_available);
 
             el('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString('en-IN');
         }

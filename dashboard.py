@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Live Trading Dashboard — Flask server for monitoring algo trading positions.
 Reads portfolio state JSON files and serves a mobile-friendly dashboard.
+v2.4: Added lots, capital invested, capital available, capital after close.
 """
 import json
 import os
@@ -17,6 +18,11 @@ CRYPTO_STATE = os.path.join(BASE_DIR, 'paper_trades_crypto', 'crypto_portfolio_s
 
 EQUITY_CAPITAL = 300000
 COMMODITY_CAPITAL = 300000
+
+# Margin per lot for capital invested calculation
+MARGIN_PER_LOT = {'NIFTY': 100000, 'BANKNIFTY': 95000, 'SENSEX': 70000}
+MCX_MARGINS = {'GOLDM': 15000, 'SILVERM': 15000, 'CRUDEOILM': 8000,
+               'GOLD': 100000, 'SILVER': 80000, 'NATURALGAS': 70000, 'COPPER': 60000}
 
 
 def load_json(path):
@@ -45,9 +51,24 @@ def parse_positions(data, market='equity'):
         details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
         pnl = pos.get('unrealized_pnl', 0)
 
+        # v2.4: Compute capital invested
+        lot_size = pos.get('lot_size', 0)
+        num_lots = pos.get('num_lots', 1)
+        multiplier = pos.get('multiplier', 1)
+        is_sell = pos.get('is_sell', False)
+        symbol = pos.get('symbol', pos.get('commodity', ''))
+
+        if is_sell:
+            if market == 'equity':
+                cap_invested = MARGIN_PER_LOT.get(symbol, 100000) * num_lots
+            else:
+                cap_invested = MCX_MARGINS.get(symbol, 15000) * num_lots
+        else:
+            cap_invested = pos.get('entry_premium', 0) * lot_size * multiplier
+
         positions.append({
             'id': pos.get('id', ''),
-            'symbol': pos.get('symbol', pos.get('commodity', '')),
+            'symbol': symbol,
             'strategy': pos.get('strategy', ''),
             'type': pos.get('signal_type', ''),
             'strike': pos.get('strike', 0),
@@ -60,9 +81,15 @@ def parse_positions(data, market='equity'):
             'tsl': pos.get('trailing_sl', None),
             'target': details.get('target', 0),
             'sl': details.get('sl', 0),
-            'is_sell': pos.get('is_sell', False),
+            'is_sell': is_sell,
             'score': pos.get('quality_score', details.get('quality_score', '')),
             'market': market,
+            # v2.4: New fields
+            'lot_size': lot_size,
+            'num_lots': num_lots,
+            'multiplier': multiplier,
+            'capital_invested': round(cap_invested, 2),
+            'capital_available': pos.get('capital_available', 0),
         })
     return positions
 
@@ -107,7 +134,24 @@ def parse_closed_trades(data, market='equity'):
             'exit_time': exit_ts,
             'is_sell': t.get('is_sell', False),
             'market': market,
+            # v2.4: New fields
+            'num_lots': t.get('num_lots', 1),
+            'lot_size': t.get('lot_size', 0),
+            'multiplier': t.get('multiplier', 1),
+            'capital_after': t.get('capital_after', 0),
         })
+
+    # Sort by exit time and compute running capital_after if not present
+    trades.sort(key=lambda x: x.get('exit_time', ''))
+    default_cap = EQUITY_CAPITAL if market == 'equity' else COMMODITY_CAPITAL
+    capital = data.get('capital', default_cap) if data else default_cap
+    if trades and not trades[-1].get('capital_after'):
+        total_today = sum(t['pnl'] for t in trades)
+        running = capital - total_today
+        for t in trades:
+            running += t['pnl']
+            t['capital_after'] = round(running, 2)
+
     return trades
 
 
@@ -124,10 +168,7 @@ def api_equity():
     positions = parse_positions(data, 'equity')
     closed = parse_closed_trades(data, 'equity')
     capital = data.get('capital', EQUITY_CAPITAL)
-    invested = sum(
-        p['entry_price'] * 65 if not p['is_sell'] else 100000
-        for p in positions
-    )
+    invested = sum(p['capital_invested'] for p in positions)
     return jsonify({
         'positions': positions,
         'closed_trades': closed,
@@ -147,10 +188,7 @@ def api_commodity():
     positions = parse_positions(data, 'commodity')
     closed = parse_closed_trades(data, 'commodity')
     capital = data.get('capital', COMMODITY_CAPITAL)
-    invested = sum(
-        p['entry_price'] * 10 if not p['is_sell'] else 15000
-        for p in positions
-    )
+    invested = sum(p['capital_invested'] for p in positions)
     return jsonify({
         'positions': positions,
         'closed_trades': closed,
@@ -184,6 +222,9 @@ def api_summary():
     eq_capital = eq_data.get('capital', EQUITY_CAPITAL) if eq_data else EQUITY_CAPITAL
     cm_capital = cm_data.get('capital', COMMODITY_CAPITAL) if cm_data else COMMODITY_CAPITAL
 
+    eq_invested = sum(p['capital_invested'] for p in eq_positions)
+    cm_invested = sum(p['capital_invested'] for p in cm_positions)
+
     today = datetime.now().strftime('%Y-%m-%d')
     eq_daily = eq_data.get('daily_pnl', {}).get(today, 0) if eq_data else 0
     cm_daily = cm_data.get('daily_pnl', {}).get(today, 0) if cm_data else 0
@@ -203,6 +244,8 @@ def api_summary():
         'worst_trade': worst_trade,
         'equity_capital': round(eq_capital, 2),
         'commodity_capital': round(cm_capital, 2),
+        'equity_available': round(eq_capital - eq_invested, 2),
+        'commodity_available': round(cm_capital - cm_invested, 2),
         'last_updated': datetime.now().isoformat(),
     })
 
