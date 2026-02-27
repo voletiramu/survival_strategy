@@ -110,13 +110,28 @@ TSL_TIGHT_TRIGGER_PCT = 100      # Phase 3: Tighter trail once past target
 TSL_TIGHT_DISTANCE_PCT = 15      # Phase 3 trail: 15% below peak (capture max profit)
 
 # Commodity OI/IV Exit Thresholds (wider than equity due to lower liquidity)
-MCX_OI_SURGE_PCT = 20        # Exit if OI changes >20% from entry
-MCX_OI_REVERSE_PCT = 30      # Reverse trade if OI changes >30%
-MCX_IV_SPIKE_PCT = 30         # Exit if IV changes >30% from entry
-MCX_IV_REVERSE_PCT = 50       # Reverse trade if IV changes >50%
-MCX_OI_IV_COMBO_OI = 15      # Combined exit: OI >15% AND IV >20%
-MCX_OI_IV_COMBO_IV = 20
+MCX_OI_SURGE_PCT = 40           # Exit if OI changes >40% from entry (was 20%)
+MCX_OI_SURGE_FIRST_HOUR_PCT = 55  # First hour: wider threshold
+MCX_OI_SURGE_MID_DAY_PCT = 40     # Mid session
+MCX_OI_SURGE_LAST_HOUR_PCT = 45   # Last 2 hours
+MCX_OI_REVERSE_PCT = 60         # Reverse trade if OI changes >60% (was 30%)
+MCX_IV_SPIKE_PCT = 40           # Exit if IV changes >40% from entry (was 30%)
+MCX_IV_REVERSE_PCT = 60         # Reverse trade if IV changes >60% (was 50%)
+MCX_OI_IV_COMBO_OI = 25         # Combined exit: OI >25% AND IV >30% (was 15%/20%)
+MCX_OI_IV_COMBO_IV = 30
 MCX_GAMMA_SHIELD_THRESHOLD = 0.003  # Exit short if gamma > this
+
+# Trade Quality Filters (commodity — eliminate brokerage-losing weak trades)
+MCX_MIN_PREMIUM_BUY = 5         # Min Rs 5 premium for commodity BUY trades
+MCX_MIN_PREMIUM_SELL = 10       # Min Rs 10 premium for commodity SELL trades
+MCX_MIN_SIGNAL_SCORE = 40       # Quality score 0-100, reject below 40
+MCX_MIN_PROFIT_TO_COST_RATIO = 2.0  # Expected profit must be >= 2x total cost
+
+# Cooldowns & Limits (commodity)
+MCX_GRACE_PERIOD_SECONDS = 900     # 15 min minimum hold (was 300s)
+MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
+MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
+MCX_MAX_TRADES_PER_DAY = 12           # Hard cap on daily commodity trades
 
 # MCX Trading costs
 MCX_BROKERAGE = 20
@@ -208,6 +223,110 @@ def calc_mcx_costs(premium, qty, multiplier, is_sell=False):
     exchange = turnover * MCX_EXCHANGE
     gst = brokerage * MCX_GST
     return brokerage + ctt + exchange + gst
+
+
+def mcx_passes_profit_filter(premium, lot_size, multiplier, target_multiplier, is_sell=False):
+    """Check if expected profit exceeds 2x brokerage cost (commodity version)."""
+    total_cost = calc_mcx_costs(premium, lot_size, multiplier, is_sell)
+    if is_sell:
+        expected_profit = premium * lot_size * multiplier * (1 - target_multiplier)
+    else:
+        expected_profit = premium * lot_size * multiplier * (target_multiplier - 1)
+    passes = expected_profit >= (total_cost * MCX_MIN_PROFIT_TO_COST_RATIO)
+    return passes, round(expected_profit, 2), round(total_cost, 2)
+
+
+def mcx_compute_signal_score(signal, spot, indicators, vix=None):
+    """Compute quality score (0-100) for a commodity trading signal."""
+    score = 0
+    greeks = signal.get('greeks', {})
+    premium = signal.get('premium', 0)
+    atr = indicators.get('atr', 1)
+    is_buy = 'BUY' in signal.get('type', '')
+    is_ce = 'CE' in signal.get('type', '')
+
+    # 1. DELTA (0-25)
+    delta = abs(greeks.get('delta', 0))
+    if is_buy:
+        if 0.30 <= delta <= 0.65:
+            score += 25
+        elif 0.20 <= delta < 0.30 or 0.65 < delta <= 0.75:
+            score += 18
+        elif 0.15 <= delta < 0.20:
+            score += 10
+        else:
+            score += 5
+    else:
+        if 0.10 <= delta <= 0.30:
+            score += 25
+        elif 0.30 < delta <= 0.40:
+            score += 18
+        else:
+            score += 10
+
+    # 2. ATR-PREMIUM RATIO (0-20)
+    if atr > 0:
+        ratio = premium / atr
+        if is_buy:
+            if 0.03 < ratio < 0.25:
+                score += 20
+            elif 0.25 <= ratio < 0.5:
+                score += 12
+            else:
+                score += 5
+        else:
+            if ratio > 0.2:
+                score += 20
+            elif ratio > 0.1:
+                score += 12
+            else:
+                score += 5
+
+    # 3. VOLATILITY (0-20) — commodity uses historical vol
+    hv = indicators.get('iv', 0.2) * 100  # as percentage
+    if hv > 30:
+        score += 20
+    elif hv > 20:
+        score += 15
+    elif hv > 15:
+        score += 10
+    else:
+        score += 5
+
+    # 4. MOMENTUM (0-20)
+    prev_close = indicators.get('prev_close', spot)
+    body = spot - prev_close
+    if is_buy:
+        if (is_ce and body > 0) or (not is_ce and body < 0):
+            score += 20
+        elif abs(body) < atr * 0.1:
+            score += 10
+        else:
+            score += 3
+    else:
+        if abs(body) < atr * 0.2:
+            score += 20
+        elif abs(body) < atr * 0.5:
+            score += 12
+        else:
+            score += 5
+
+    # 5. TREND STRENGTH (0-15)
+    pcr = indicators.get('pcr', 1.0)
+    if is_buy:
+        if (is_ce and pcr > 1.0) or (not is_ce and pcr < 1.0):
+            score += 15
+        elif 0.9 < pcr < 1.1:
+            score += 8
+        else:
+            score += 3
+    else:
+        if 0.9 < pcr < 1.1:
+            score += 15
+        else:
+            score += 8
+
+    return min(score, 100)
 
 
 # ====================================================================
@@ -575,7 +694,7 @@ class CommodityStrategyEngine:
             if spot > ind['tc']:
                 ce_strike = round(spot / strike_int) * strike_int
                 g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
-                if g['price'] > 1:
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
@@ -585,7 +704,7 @@ class CommodityStrategyEngine:
             elif spot < ind['bc']:
                 pe_strike = round(spot / strike_int) * strike_int
                 g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
-                if g['price'] > 1:
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
@@ -598,7 +717,7 @@ class CommodityStrategyEngine:
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_int) * strike_int
                 g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
-                if g['price'] > 2:
+                if g['price'] > MCX_MIN_PREMIUM_SELL:
                     signals.append({
                         'type': 'SELL_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
@@ -608,7 +727,7 @@ class CommodityStrategyEngine:
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_int) * strike_int
                 g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
-                if g['price'] > 2:
+                if g['price'] > MCX_MIN_PREMIUM_SELL:
                     signals.append({
                         'type': 'SELL_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
@@ -637,7 +756,7 @@ class CommodityStrategyEngine:
             if body > 0:
                 ce_strike = round(spot / strike_int) * strike_int
                 g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv * 1.2, 'CE')
-                if g['price'] > 1:
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
@@ -647,7 +766,7 @@ class CommodityStrategyEngine:
             else:
                 pe_strike = round(spot / strike_int) * strike_int
                 g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv * 1.2, 'PE')
-                if g['price'] > 1:
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
@@ -667,7 +786,7 @@ class CommodityStrategyEngine:
         if ohlc['low'] <= ind['demand_zone'] * 1.01 and spot > ind['demand_zone'] and ind['demand_strength'] >= 2:
             ce_strike = round(spot / strike_int) * strike_int
             g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
-            if g['price'] > 1:
+            if g['price'] > MCX_MIN_PREMIUM_BUY:
                 bounce = (spot - ohlc['low']) / max(atr, 1)
                 signals.append({
                     'type': 'BUY_CE_GTZ', 'strike': ce_strike,
@@ -680,7 +799,7 @@ class CommodityStrategyEngine:
         elif ohlc['high'] >= ind['supply_zone'] * 0.99 and spot < ind['supply_zone'] and ind['supply_strength'] >= 2:
             pe_strike = round(spot / strike_int) * strike_int
             g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
-            if g['price'] > 1:
+            if g['price'] > MCX_MIN_PREMIUM_BUY:
                 signals.append({
                     'type': 'BUY_PE_GTZ', 'strike': pe_strike,
                     'premium': g['price'], 'greeks': g,
@@ -711,7 +830,7 @@ class CommodityStrategyEngine:
         if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot >= vwap * 0.995:
             ce_strike = round(spot / strike_int) * strike_int
             g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > 1 and g['price'] < spot * 0.05:
+            if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
                 signals.append({
                     'type': 'BUY_CE_PCRVWAP',
                     'strike': ce_strike,
@@ -726,7 +845,7 @@ class CommodityStrategyEngine:
         elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot <= vwap * 1.005:
             pe_strike = round(spot / strike_int) * strike_int
             g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > 1 and g['price'] < spot * 0.05:
+            if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
                 signals.append({
                     'type': 'BUY_PE_PCRVWAP',
                     'strike': pe_strike,
@@ -781,7 +900,7 @@ class CommodityStrategyEngine:
         if ohlc['high'] > resistance + gap:
             pe_strike = round((spot - distance) / strike_int) * strike_int
             g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > 2:
+            if g['price'] > MCX_MIN_PREMIUM_SELL:
                 signals.append({
                     'type': 'SELL_PE_SURV',
                     'strike': pe_strike,
@@ -797,7 +916,7 @@ class CommodityStrategyEngine:
         if ohlc['low'] < support - gap:
             ce_strike = round((spot + distance) / strike_int) * strike_int
             g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > 2:
+            if g['price'] > MCX_MIN_PREMIUM_SELL:
                 signals.append({
                     'type': 'SELL_CE_SURV',
                     'strike': ce_strike,
@@ -1017,6 +1136,10 @@ class CommodityPaperTrader:
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
+        # v2.3: Trade quality tracking
+        self.daily_trade_count = 0
+        self.exit_history = []          # [{commodity, direction, time}] for re-entry cooldown
+        self.ghost_zone_losses = {}     # {(commodity, 'CE'/'PE'): datetime}
 
     def connect(self):
         connected = self.angel.connect()
@@ -1193,7 +1316,7 @@ class CommodityPaperTrader:
 
     def check_oi_iv_exit(self, pos, current_premium, current_iv_pct=None):
         """Check if commodity position should exit based on OI/IV changes.
-        current_iv_pct: if provided (from implied vol back-solve), use instead of HV estimate.
+        v2.3: Time-adaptive OI thresholds.
         Returns: (exit_reason, should_reverse) or (None, False)
         """
         entry_oi = pos.get('entry_oi', 0)
@@ -1216,16 +1339,27 @@ class CommodityPaperTrader:
         if entry_iv and entry_iv > 0:
             iv_change = abs(current_iv - entry_iv) / entry_iv * 100
 
-        # Rule 1: OI surge
-        if oi_change > MCX_OI_SURGE_PCT:
+        # v2.3: Time-adaptive OI threshold for MCX
+        now_time = datetime.now().time()
+        if now_time < dtime(10, 0):
+            oi_threshold = MCX_OI_SURGE_FIRST_HOUR_PCT   # 55% — first hour
+        elif now_time < dtime(21, 0):
+            oi_threshold = MCX_OI_SURGE_MID_DAY_PCT      # 40% — normal session
+        else:
+            oi_threshold = MCX_OI_SURGE_LAST_HOUR_PCT    # 45% — close
+
+        # Rule 1: OI surge (time-adaptive)
+        if oi_change > oi_threshold:
             should_reverse = oi_change > MCX_OI_REVERSE_PCT
-            logger.info(f"  MCX_OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% (entry={entry_oi}, current={current_oi})")
+            logger.info(f"  MCX_OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
+                       f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')})")
             return 'OI_SURGE_EXIT', should_reverse
 
         # Rule 2: IV spike
         if iv_change > MCX_IV_SPIKE_PCT:
             should_reverse = iv_change > MCX_IV_REVERSE_PCT
-            logger.info(f"  MCX_IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% (entry={entry_iv}%, current={current_iv}%)")
+            logger.info(f"  MCX_IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {MCX_IV_SPIKE_PCT}% "
+                       f"(entry={entry_iv}%, current={current_iv}%)")
             return 'IV_SPIKE_EXIT', should_reverse
 
         # Rule 3: Combined OI+IV
@@ -1239,6 +1373,25 @@ class CommodityPaperTrader:
             return 'GAMMA_SHIELD_EXIT', False
 
         return None, False
+
+    def _track_exit(self, pos, exit_reason):
+        """Track exit for cooldown logic. Called after every close_position."""
+        direction = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+        self.exit_history.append({
+            'commodity': pos['commodity'],
+            'direction': direction,
+            'time': datetime.now(),
+            'reason': exit_reason,
+        })
+        # Track Ghost Zone losses for extended cooldown
+        if ('GTZ' in pos['signal_type'] or 'Ghost' in pos.get('strategy', '')) and \
+           pos.get('unrealized_pnl', 0) < 0:
+            gz_key = (pos['commodity'], direction)
+            self.ghost_zone_losses[gz_key] = datetime.now()
+            logger.info(f"  GZ_LOSS_TRACKED: {pos['commodity']} {direction} — 30min cooldown active")
+        # Cleanup old exit history (keep last 2 hours only)
+        cutoff = datetime.now() - timedelta(hours=2)
+        self.exit_history = [eh for eh in self.exit_history if eh['time'] > cutoff]
 
     def execute_reversal(self, pos, exit_reason):
         """After closing a commodity position due to OI+IV exit, open reverse trade."""
@@ -1352,6 +1505,13 @@ class CommodityPaperTrader:
         dow = now.weekday()
         all_signals = []
 
+        # Reset daily counters at market open
+        if now.time() < dtime(9, 16) and self.daily_trade_count > 0:
+            logger.info("  DAILY_RESET: Clearing commodity trade count and cooldowns")
+            self.daily_trade_count = 0
+            self.exit_history = []
+            self.ghost_zone_losses = {}
+
         # CRITICAL: Block trading outside MCX hours
         if not self.is_mcx_open():
             logger.warning(f"  MCX MARKET CLOSED (current: {now.strftime('%H:%M:%S')})")
@@ -1416,6 +1576,11 @@ class CommodityPaperTrader:
             logger.warning(f"  {len(signals)} signals found but MCX CLOSED - NOT executing")
             return
 
+        # Daily trade cap check
+        if self.daily_trade_count >= MCX_MAX_TRADES_PER_DAY:
+            logger.warning(f"  MCX_MAX_TRADES_REACHED: {self.daily_trade_count} trades today (limit {MCX_MAX_TRADES_PER_DAY}). Skipping all signals.")
+            return
+
         logger.info(f"\n  {len(signals)} COMMODITY SIGNALS (PAPER):")
         executed = 0
         skipped = 0
@@ -1423,6 +1588,11 @@ class CommodityPaperTrader:
             # Track ALL signals for dummy PnL at EOD
             self.daily_signal_count += 1
             self.daily_signals_all.append(sig)
+
+            # Daily cap re-check inside loop
+            if self.daily_trade_count >= MCX_MAX_TRADES_PER_DAY:
+                logger.info(f"  MCX_MAX_TRADES_REACHED: {self.daily_trade_count} trades today. Skipping remaining.")
+                break
 
             # Check for duplicate: same strategy + commodity + NEARBY strike + SAME option type
             strike_tolerance = {'GOLDM': 200, 'SILVERM': 1000, 'CRUDEOILM': 100}
@@ -1450,6 +1620,56 @@ class CommodityPaperTrader:
             if conflicting:
                 logger.info(f"  SKIP (conflicting): {sig['type']} conflicts with "
                            f"{conflicting[0]['signal_type']} on {sig['commodity']} {sig['strike']}")
+                skipped += 1
+                continue
+
+            # ---- v2.3: Re-entry cooldown check ----
+            now = datetime.now()
+            cooldown_hit = False
+            for eh in self.exit_history:
+                if eh['commodity'] == sig['commodity'] and eh['direction'] == sig_opt_type:
+                    elapsed = (now - eh['time']).total_seconds()
+                    if elapsed < MCX_REENTRY_COOLDOWN_SECONDS:
+                        logger.info(f"  SKIP_COOLDOWN: {sig['commodity']} {sig_opt_type} exited {int(elapsed)}s ago "
+                                   f"(need {MCX_REENTRY_COOLDOWN_SECONDS}s)")
+                        skipped += 1
+                        cooldown_hit = True
+                        break
+            if cooldown_hit:
+                continue
+
+            # ---- v2.3: Ghost Zone cooldown check ----
+            if 'GTZ' in sig['type'] or 'Ghost' in sig.get('strategy', ''):
+                gz_key = (sig['commodity'], sig_opt_type)
+                if gz_key in self.ghost_zone_losses:
+                    elapsed = (now - self.ghost_zone_losses[gz_key]).total_seconds()
+                    if elapsed < MCX_GHOST_ZONE_COOLDOWN_SECONDS:
+                        logger.info(f"  SKIP_GZ_COOLDOWN: {sig['commodity']} Ghost Zone {sig_opt_type} lost {int(elapsed)}s ago")
+                        skipped += 1
+                        continue
+
+            # ---- v2.3: Signal quality score check ----
+            indicators = self.engine.compute_indicators(sig['commodity'],
+                         {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
+            if indicators:
+                score = mcx_compute_signal_score(sig, sig['spot'], indicators)
+                sig['quality_score'] = score
+                if score < MCX_MIN_SIGNAL_SCORE:
+                    logger.info(f"  SKIP_QUALITY: {sig['commodity']} {sig['type']} score={score} < {MCX_MIN_SIGNAL_SCORE}")
+                    skipped += 1
+                    continue
+                logger.info(f"  QUALITY_SCORE: {sig['commodity']} {sig['type']} score={score}/100")
+
+            # ---- v2.3: Profit filter check ----
+            is_sell = 'SELL' in sig['type']
+            spec = COMMODITIES[sig['commodity']]
+            target_mult = sig.get('target', sig['premium'] * 2) / max(sig['premium'], 0.01)
+            passes, exp_profit, total_cost = mcx_passes_profit_filter(
+                sig['premium'], spec['lot_size'], spec['multiplier'], target_mult, is_sell
+            )
+            if not passes:
+                logger.info(f"  SKIP_PROFIT: {sig['commodity']} {sig['type']} Rs {sig['premium']:.2f} "
+                           f"expected Rs {exp_profit:.0f} < 2x cost Rs {total_cost:.0f}")
                 skipped += 1
                 continue
 
@@ -1533,6 +1753,7 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
             executed += 1
+            self.daily_trade_count += 1
 
             # Send Telegram notification
             try:
@@ -1555,6 +1776,9 @@ class CommodityPaperTrader:
                         locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
                 total_invested = locked
                 capital_available = COMMODITY_CAPITAL - locked
+                score_info = f" | Score={sig.get('quality_score', 'N/A')}"
+                trade_info = f" | Trade #{self.daily_trade_count}/{MCX_MAX_TRADES_PER_DAY}"
+                enriched_reason = sig['reason'] + score_info + trade_info
                 notify_trade_entry(
                     market="COMMODITY", strategy=sig['strategy'],
                     symbol=sig['commodity'], signal_type=sig['type'],
@@ -1562,7 +1786,7 @@ class CommodityPaperTrader:
                     spot=sig.get('spot', 0), lot_size=spec['lot_size'],
                     multiplier=spec['multiplier'], delta=sig['greeks'].get('delta', 0),
                     target=sig.get('target', 0), sl=sig.get('sl', 0),
-                    capital_used=capital, reason=sig['reason'],
+                    capital_used=capital, reason=enriched_reason,
                     capital_available=capital_available,
                     total_invested=total_invested,
                 )
@@ -1570,7 +1794,8 @@ class CommodityPaperTrader:
                 logger.warning(f"  Telegram notify failed: {e}")
 
         if skipped:
-            logger.info(f"  Executed: {executed} | Skipped (duplicates): {skipped}")
+            logger.info(f"  Executed: {executed} | Skipped: {skipped} | "
+                       f"Day total: {self.daily_trade_count}/{MCX_MAX_TRADES_PER_DAY}")
 
     def check_exits(self):
         if not self.portfolio.positions:
@@ -1586,6 +1811,7 @@ class CommodityPaperTrader:
             for pos in list(self.portfolio.positions):
                 current = pos.get('current_premium', pos['entry_premium'])
                 self.portfolio.close_position(pos['id'], current, 'CIRCUIT_BREAKER')
+                self._track_exit(pos, 'CIRCUIT_BREAKER')
             try:
                 from trade_notifier import send_message
                 send_message(f"<b>MCX CIRCUIT BREAKER</b>\nDaily loss: Rs {daily_loss:,.0f}\nAll commodity positions closed.")
@@ -1595,9 +1821,11 @@ class CommodityPaperTrader:
             return
 
         for pos in list(self.portfolio.positions):
-            # Skip positions opened less than 5 minutes ago (grace period)
+            # Skip positions opened less than 15 minutes ago (grace period — v2.3)
             entry_time = datetime.fromisoformat(pos['timestamp'])
-            if (datetime.now() - entry_time).total_seconds() < 300:
+            elapsed_secs = (datetime.now() - entry_time).total_seconds()
+            if elapsed_secs < MCX_GRACE_PERIOD_SECONDS:
+                logger.info(f"  GRACE: {pos['id']} opened {int(elapsed_secs)}s ago (need {MCX_GRACE_PERIOD_SECONDS}s)")
                 continue
 
             # ---- EOD FORCE CLOSE: 15 min before MCX close (23:15) ----
@@ -1605,6 +1833,7 @@ class CommodityPaperTrader:
                 current = pos.get('current_premium', pos['entry_premium'])
                 logger.info(f"  MCX_EOD_CLOSE: {pos['id']} force close (MCX closing at 23:30)")
                 self.portfolio.close_position(pos['id'], current, 'EOD_FORCE_CLOSE')
+                self._track_exit(pos, 'EOD_FORCE_CLOSE')
                 self._notify_commodity_exit(pos, pos['commodity'], current, 'EOD_FORCE_CLOSE')
                 continue
 
@@ -1654,6 +1883,7 @@ class CommodityPaperTrader:
                 if abs(profit_pct) < 5:
                     logger.info(f"  MCX_TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only {profit_pct:.1f}% profit")
                     self.portfolio.close_position(pos['id'], current, 'TIME_EXIT_NO_PROGRESS')
+                    self._track_exit(pos, 'TIME_EXIT_NO_PROGRESS')
                     self._notify_commodity_exit(pos, commodity, current, 'TIME_EXIT_NO_PROGRESS')
                     continue
 
@@ -1698,6 +1928,7 @@ class CommodityPaperTrader:
                 if pos.get('trailing_sl') and current <= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} premium {current:.2f} <= TSL {pos['trailing_sl']:.2f}")
                     self.portfolio.close_position(pos['id'], current, 'TRAILING_SL_HIT')
+                    self._track_exit(pos, 'TRAILING_SL_HIT')
                     self._notify_commodity_exit(pos, commodity, current, 'TRAILING_SL_HIT')
                     continue
             else:
@@ -1734,6 +1965,7 @@ class CommodityPaperTrader:
                 if pos.get('trailing_sl') and current >= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} SELL premium {current:.2f} >= TSL {pos['trailing_sl']:.2f}")
                     self.portfolio.close_position(pos['id'], current, 'TRAILING_SL_HIT')
+                    self._track_exit(pos, 'TRAILING_SL_HIT')
                     self._notify_commodity_exit(pos, commodity, current, 'TRAILING_SL_HIT')
                     continue
 
@@ -1749,6 +1981,7 @@ class CommodityPaperTrader:
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current, current_iv_pct)
             if oi_iv_reason:
                 self.portfolio.close_position(pos['id'], current, oi_iv_reason)
+                self._track_exit(pos, oi_iv_reason)
                 self._notify_commodity_exit(pos, commodity, current, oi_iv_reason)
                 if should_reverse:
                     self.execute_reversal(pos, oi_iv_reason)
@@ -1769,6 +2002,7 @@ class CommodityPaperTrader:
 
             if exit_reason:
                 self.portfolio.close_position(pos['id'], current, exit_reason)
+                self._track_exit(pos, exit_reason)
                 self._notify_commodity_exit(pos, commodity, current, exit_reason)
 
         # Persist updated PnL to disk after exit check cycle

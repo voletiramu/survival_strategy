@@ -41,7 +41,8 @@ for d in [PAPER_DIR, LOG_DIR, OPTIONS_DIR]:
 INITIAL_CAPITAL = 300000  # Rs 3L for equity (all strategies share this pool)
 RISK_FREE_RATE = 0.065
 LOT_SIZES = {'NIFTY': 65, 'BANKNIFTY': 30, 'SENSEX': 20}  # NSE revised Jan 2026
-MARGIN_PER_LOT = {'NIFTY': 180000, 'BANKNIFTY': 200000, 'SENSEX': 150000}  # Adjusted for new lot sizes
+MARGIN_PER_LOT = {'NIFTY': 100000, 'BANKNIFTY': 95000, 'SENSEX': 70000}  # Realistic SPAN margins for selling
+STRIKE_INTERVALS = {'NIFTY': 50, 'BANKNIFTY': 100, 'SENSEX': 100}  # NSE strike gap
 BROKERAGE = 20
 STT_SELL = 0.000625
 EXCHANGE_CHARGES = 0.0005
@@ -60,14 +61,36 @@ MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
 MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
 MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
 
-# OI + IV Exit Thresholds
-OI_SURGE_PCT = 15       # Exit if OI changes >15% from entry
-OI_REVERSE_PCT = 25     # Reverse trade if OI changes >25%
-IV_SPIKE_PCT = 25       # Exit if IV changes >25% from entry
-IV_REVERSE_PCT = 40     # Reverse trade if IV changes >40%
-OI_IV_COMBO_OI = 10     # Combined exit: OI >10% AND IV >15%
-OI_IV_COMBO_IV = 15
-GAMMA_SHIELD_THRESHOLD = 0.002  # Exit short positions if gamma > this
+# OI + IV Exit Thresholds (INCREASED — 15% was too aggressive, caused 82% premature exits)
+OI_SURGE_PCT = 35                # Exit if OI changes >35% from entry (was 15%)
+OI_SURGE_FIRST_HOUR_PCT = 50     # 9:15-10:15 AM: first hour OI shifts are massive
+OI_SURGE_MID_DAY_PCT = 35        # 10:15 AM - 2:00 PM: normal session
+OI_SURGE_LAST_HOUR_PCT = 40      # 2:00-3:30 PM: close compression
+OI_REVERSE_PCT = 50              # Reverse trade if OI changes >50% (was 25%)
+IV_SPIKE_PCT = 30                # Exit if IV changes >30% from entry (was 25%)
+IV_SPIKE_PCT_BANKNIFTY = 45      # BANKNIFTY-specific: naturally higher IV volatility
+IV_REVERSE_PCT = 50              # Reverse trade if IV changes >50% (was 40%)
+OI_IV_COMBO_OI = 20              # Combined exit: OI >20% AND IV >25% (was 10%/15%)
+OI_IV_COMBO_IV = 25
+GAMMA_SHIELD_THRESHOLD = 0.002   # Exit short positions if gamma > this
+
+# Trade Quality Filters (eliminate brokerage-losing weak trades)
+MIN_PREMIUM_BUY = 15             # Min Rs 15 premium for BUY trades (was Rs 3)
+MIN_PREMIUM_SELL = 20            # Min Rs 20 premium for SELL trades (was Rs 5)
+MIN_SIGNAL_SCORE = 40            # Quality score 0-100, reject below 40
+MIN_PROFIT_TO_COST_RATIO = 2.0   # Expected profit must be >= 2x total brokerage cost
+
+# VIX-Adaptive Trading
+VIX_LOW_THRESHOLD = 14           # Below 14 = low vol regime → increase filters 1.5x
+VIX_HIGH_THRESHOLD = 20          # Above 20 = high vol regime → relax filters 0.8x
+VIX_LOW_MULTIPLIER = 1.5         # Multiply thresholds by 1.5 in low VIX
+VIX_HIGH_MULTIPLIER = 0.8        # Multiply thresholds by 0.8 in high VIX
+
+# Cooldowns & Limits
+GRACE_PERIOD_SECONDS = 900       # 15 min minimum hold (was 300s / 5 min)
+GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry same direction
+REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
+MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
 
 # Trailing Stop Loss Parameters (multi-phase for max profit capture)
 TSL_BREAKEVEN_TRIGGER_PCT = 30   # Phase 1: Lock breakeven when 30% of target reached
@@ -188,6 +211,116 @@ def calc_costs(premium, qty, is_sell=False):
     exchange = turnover * EXCHANGE_CHARGES
     gst = brokerage * GST_RATE
     return brokerage + stt + exchange + gst
+
+
+def passes_profit_filter(premium, lot_size, target_multiplier, is_sell=False):
+    """Check if expected profit exceeds 2x brokerage cost.
+    Returns: (passes, expected_profit, total_cost)
+    """
+    total_cost = calc_costs(premium, lot_size, is_sell)
+    if is_sell:
+        expected_profit = premium * lot_size * (1 - target_multiplier)
+    else:
+        expected_profit = premium * lot_size * (target_multiplier - 1)
+    passes = expected_profit >= (total_cost * MIN_PROFIT_TO_COST_RATIO)
+    return passes, round(expected_profit, 2), round(total_cost, 2)
+
+
+def compute_signal_score(signal, spot, indicators, vix=None):
+    """Compute quality score (0-100) for a trading signal.
+    Factors: delta, ATR-premium ratio, VIX level, momentum, PCR.
+    """
+    score = 0
+    greeks = signal.get('greeks', {})
+    premium = signal.get('premium', 0)
+    atr = indicators.get('atr', 1)
+    is_buy = 'BUY' in signal.get('type', '')
+    is_ce = 'CE' in signal.get('type', '')
+
+    # 1. DELTA (0-25): sweet spot scoring
+    delta = abs(greeks.get('delta', 0))
+    if is_buy:
+        if 0.35 <= delta <= 0.65:
+            score += 25
+        elif 0.25 <= delta < 0.35 or 0.65 < delta <= 0.75:
+            score += 18
+        elif 0.15 <= delta < 0.25:
+            score += 10
+        else:
+            score += 5
+    else:
+        if 0.10 <= delta <= 0.25:
+            score += 25
+        elif 0.25 < delta <= 0.35:
+            score += 18
+        else:
+            score += 10
+
+    # 2. ATR-PREMIUM RATIO (0-20)
+    if atr > 0:
+        ratio = premium / atr
+        if is_buy:
+            if 0.05 < ratio < 0.3:
+                score += 20
+            elif 0.3 <= ratio < 0.5:
+                score += 12
+            else:
+                score += 5
+        else:
+            if ratio > 0.3:
+                score += 20
+            elif ratio > 0.15:
+                score += 12
+            else:
+                score += 5
+
+    # 3. VIX LEVEL (0-20)
+    if vix is not None:
+        if vix > 20:
+            score += 20
+        elif vix > 16:
+            score += 15
+        elif vix > 14:
+            score += 10
+        elif vix > 12:
+            score += 5
+        else:
+            score += 2
+
+    # 4. MOMENTUM (0-20): body direction matches signal
+    prev_close = indicators.get('prev_close', spot)
+    body = spot - prev_close
+    if is_buy:
+        if (is_ce and body > 0) or (not is_ce and body < 0):
+            score += 20
+        elif abs(body) < atr * 0.1:
+            score += 10
+        else:
+            score += 3
+    else:
+        if abs(body) < atr * 0.2:
+            score += 20
+        elif abs(body) < atr * 0.5:
+            score += 12
+        else:
+            score += 5
+
+    # 5. PCR CONFIRMATION (0-15)
+    pcr = indicators.get('pcr', 1.0)
+    if is_buy:
+        if (is_ce and pcr > 1.0) or (not is_ce and pcr < 1.0):
+            score += 15
+        elif 0.9 < pcr < 1.1:
+            score += 8
+        else:
+            score += 3
+    else:
+        if 0.9 < pcr < 1.1:
+            score += 15
+        else:
+            score += 8
+
+    return min(score, 100)
 
 
 # ====================================================================
@@ -890,7 +1023,7 @@ class StrategyEngine:
         signals = []
         ind = indicators
         T = dte / 365
-        strike_interval = 50 if symbol in ['NIFTY', 'BANKNIFTY'] else 100
+        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
 
         # NARROW CPR (< 0.3%) = BREAKOUT expected
         if ind['cpr_width'] < 0.3:
@@ -898,7 +1031,7 @@ class StrategyEngine:
                 # Bullish breakout
                 ce_strike = round(spot / strike_interval) * strike_interval
                 g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-                if g['price'] > 3:
+                if g['price'] > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_CE_CPR',
                         'strike': ce_strike,
@@ -913,7 +1046,7 @@ class StrategyEngine:
                 # Bearish breakout
                 pe_strike = round(spot / strike_interval) * strike_interval
                 g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-                if g['price'] > 3:
+                if g['price'] > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_PE_CPR',
                         'strike': pe_strike,
@@ -930,7 +1063,7 @@ class StrategyEngine:
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_interval) * strike_interval
                 g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-                if g['price'] > 5:
+                if g['price'] > MIN_PREMIUM_SELL:
                     signals.append({
                         'type': 'SELL_CE_CPR',
                         'strike': ce_strike,
@@ -944,7 +1077,7 @@ class StrategyEngine:
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_interval) * strike_interval
                 g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-                if g['price'] > 5:
+                if g['price'] > MIN_PREMIUM_SELL:
                     signals.append({
                         'type': 'SELL_PE_CPR',
                         'strike': pe_strike,
@@ -996,14 +1129,14 @@ class StrategyEngine:
         if day_range < 0.3:
             return signals
 
-        strike_interval = 50 if symbol in ['NIFTY', 'BANKNIFTY'] else 100
+        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         day_label = "EXPIRY" if is_expiry_day else f"{days_to_expiry}DTE"
 
         if abs(body) > atr * 0.15:
             if body > 0:  # Up breakout
                 ce_strike = round(spot / strike_interval) * strike_interval
                 g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'] * iv_mult, 'CE')
-                if g['price'] > 3:
+                if g['price'] > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_CE_GAMMA',
                         'strike': ce_strike,
@@ -1017,7 +1150,7 @@ class StrategyEngine:
             else:  # Down breakout
                 pe_strike = round(spot / strike_interval) * strike_interval
                 g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'] * iv_mult, 'PE')
-                if g['price'] > 3:
+                if g['price'] > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_PE_GAMMA',
                         'strike': pe_strike,
@@ -1036,7 +1169,7 @@ class StrategyEngine:
         signals = []
         ind = indicators
         T = dte / 365
-        strike_interval = 50 if symbol in ['NIFTY', 'BANKNIFTY'] else 100
+        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
 
         # Demand zone retest (BUY CE)
         if (ohlc['low'] <= ind['demand_zone'] * 1.01 and
@@ -1044,7 +1177,7 @@ class StrategyEngine:
                 ind['demand_strength'] >= 2):
             ce_strike = round(spot / strike_interval) * strike_interval
             g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > 3:
+            if g['price'] > MIN_PREMIUM_BUY:
                 bounce = (spot - ohlc['low']) / max(ind['atr'], 1)
                 signals.append({
                     'type': 'BUY_CE_GTZ',
@@ -1063,7 +1196,7 @@ class StrategyEngine:
               ind['supply_strength'] >= 2):
             pe_strike = round(spot / strike_interval) * strike_interval
             g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > 3:
+            if g['price'] > MIN_PREMIUM_BUY:
                 rejection = (ohlc['high'] - spot) / max(ind['atr'], 1)
                 signals.append({
                     'type': 'BUY_PE_GTZ',
@@ -1083,7 +1216,7 @@ class StrategyEngine:
         signals = []
         ind = indicators
         T = dte / 365
-        strike_interval = 50 if symbol in ['NIFTY', 'BANKNIFTY'] else 100
+        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
 
         if ind['iv'] > 0.40:
             return signals
@@ -1096,7 +1229,7 @@ class StrategyEngine:
         if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot >= vwap * 0.995:
             ce_strike = round(spot / strike_interval) * strike_interval
             g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > 3 and g['price'] < spot * 0.05:
+            if g['price'] > MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
                 signals.append({
                     'type': 'BUY_CE',
                     'strike': ce_strike,
@@ -1111,7 +1244,7 @@ class StrategyEngine:
         elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot <= vwap * 1.005:
             pe_strike = round(spot / strike_interval) * strike_interval
             g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > 3 and g['price'] < spot * 0.05:
+            if g['price'] > MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
                 signals.append({
                     'type': 'BUY_PE',
                     'strike': pe_strike,
@@ -1153,10 +1286,11 @@ class StrategyEngine:
             distance = max(atr * 0.4, 80)
 
         # PE SELLING - price breaks above resistance
+        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         if ohlc['high'] > ind['resistance'] + gap:
-            pe_strike = spot - distance
+            pe_strike = round((spot - distance) / strike_interval) * strike_interval
             g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > 5:
+            if g['price'] > MIN_PREMIUM_SELL:
                 signals.append({
                     'type': 'SELL_PE',
                     'strike': pe_strike,
@@ -1170,9 +1304,9 @@ class StrategyEngine:
 
         # CE SELLING - price breaks below support
         if ohlc['low'] < ind['support'] - gap:
-            ce_strike = spot + distance
+            ce_strike = round((spot + distance) / strike_interval) * strike_interval
             g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > 5:
+            if g['price'] > MIN_PREMIUM_SELL:
                 signals.append({
                     'type': 'SELL_CE',
                     'strike': ce_strike,
@@ -1211,6 +1345,12 @@ class PaperTrader:
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
+        # v2.3: Trade quality tracking
+        self.daily_trade_count = 0
+        self.exit_history = []          # [{symbol, direction, time}] for re-entry cooldown
+        self.ghost_zone_losses = {}     # {(symbol, 'CE'/'PE'): datetime}
+        self._vix_cache = {'value': None, 'time': None}
+        self.current_vix = None
 
     def connect(self):
         """Connect to Angel API."""
@@ -1248,6 +1388,43 @@ class PaperTrader:
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
         return None
+
+    def get_india_vix(self):
+        """Fetch India VIX value. Cached for 120 seconds."""
+        cached = self._vix_cache
+        if cached['value'] and cached['time'] and (datetime.now() - cached['time']).total_seconds() < 120:
+            return cached['value']
+        try:
+            ltp = self.angel.get_ltp('NSE', '99926004')
+            if ltp and ltp > 0:
+                self._vix_cache = {'value': ltp, 'time': datetime.now()}
+                self.current_vix = ltp
+                return ltp
+        except Exception as e:
+            logger.debug(f"VIX fetch failed: {e}")
+        # Fallback: use historical volatility as VIX proxy
+        df = self.engine.historical_data.get('NIFTY')
+        if df is not None and len(df) > 20:
+            log_ret = np.log(df['Close'] / df['Close'].shift(1))
+            hv = log_ret.tail(20).std() * np.sqrt(252) * 100
+            self.current_vix = max(min(hv, 40), 8)
+            return self.current_vix
+        return None
+
+    def get_vix_multiplier(self):
+        """Return threshold multiplier based on VIX level.
+        Low VIX (<14): 1.5x (harder to enter, wider exits)
+        Normal (14-20): 1.0x
+        High VIX (>20): 0.8x (easier to enter)
+        """
+        vix = self.current_vix
+        if vix is None:
+            return 1.0
+        if vix < VIX_LOW_THRESHOLD:
+            return VIX_LOW_MULTIPLIER
+        elif vix > VIX_HIGH_THRESHOLD:
+            return VIX_HIGH_MULTIPLIER
+        return 1.0
 
     def _get_option_ltp(self, pos):
         """Get real-time option LTP for a position, with 15s cache.
@@ -1357,6 +1534,20 @@ class PaperTrader:
         dow = now.weekday()
         all_signals = []
 
+        # Reset daily counters at market open
+        if now.time() < dtime(9, 16) and self.daily_trade_count > 0:
+            logger.info("  DAILY_RESET: Clearing trade count and cooldowns for new day")
+            self.daily_trade_count = 0
+            self.exit_history = []
+            self.ghost_zone_losses = {}
+
+        # Fetch India VIX for adaptive filtering
+        vix = self.get_india_vix()
+        vix_mult = self.get_vix_multiplier()
+        if vix:
+            regime = "LOW" if vix < VIX_LOW_THRESHOLD else ("HIGH" if vix > VIX_HIGH_THRESHOLD else "NORMAL")
+            logger.info(f"  INDIA VIX: {vix:.2f} | Regime: {regime} | Filter multiplier: {vix_mult}x")
+
         # CRITICAL: Block trading outside market hours
         if not self.is_market_open():
             logger.warning(f"  EQUITY MARKET CLOSED (current: {now.strftime('%H:%M:%S')})")
@@ -1418,7 +1609,7 @@ class PaperTrader:
         return all_signals
 
     def execute_paper_signals(self, signals):
-        """Execute signals in paper mode."""
+        """Execute signals in paper mode with quality filters."""
         if not signals:
             logger.info("\n  No signals generated this scan.")
             return
@@ -1428,14 +1619,25 @@ class PaperTrader:
             logger.warning(f"  {len(signals)} signals found but MARKET CLOSED - NOT executing")
             return
 
+        # Daily trade cap check
+        if self.daily_trade_count >= MAX_TRADES_PER_DAY:
+            logger.warning(f"  MAX_TRADES_REACHED: {self.daily_trade_count} trades today (limit {MAX_TRADES_PER_DAY}). Skipping all signals.")
+            return
+
         logger.info(f"\n  {len(signals)} SIGNALS TO EXECUTE (PAPER MODE):")
 
+        vix_mult = self.get_vix_multiplier()
         executed = 0
         skipped = 0
         for sig in signals:
             # Track ALL signals for dummy PnL at EOD
             self.daily_signal_count += 1
             self.daily_signals_all.append(sig)
+
+            # Daily cap re-check inside loop
+            if self.daily_trade_count >= MAX_TRADES_PER_DAY:
+                logger.info(f"  MAX_TRADES_REACHED: {self.daily_trade_count} trades today. Skipping remaining signals.")
+                break
 
             # Check for duplicate: same strategy + symbol + NEARBY strike + SAME option type
             strike_tolerance = {'NIFTY': 100, 'BANKNIFTY': 200, 'SENSEX': 200}
@@ -1463,6 +1665,66 @@ class PaperTrader:
             if conflicting:
                 logger.info(f"  SKIP (conflicting): {sig['type']} conflicts with "
                            f"{conflicting[0]['signal_type']} on {sig['symbol']} {sig['strike']}")
+                skipped += 1
+                continue
+
+            # ---- v2.3: Re-entry cooldown check ----
+            now = datetime.now()
+            cooldown_hit = False
+            for eh in self.exit_history:
+                if eh['symbol'] == sig['symbol'] and eh['direction'] == sig_opt_type:
+                    elapsed = (now - eh['time']).total_seconds()
+                    if elapsed < REENTRY_COOLDOWN_SECONDS:
+                        logger.info(f"  SKIP_COOLDOWN: {sig['symbol']} {sig_opt_type} exited {int(elapsed)}s ago "
+                                   f"(need {REENTRY_COOLDOWN_SECONDS}s)")
+                        skipped += 1
+                        cooldown_hit = True
+                        break
+            if cooldown_hit:
+                continue
+
+            # ---- v2.3: Ghost Zone cooldown check ----
+            if 'GTZ' in sig['type'] or 'Ghost' in sig.get('strategy', ''):
+                gz_key = (sig['symbol'], sig_opt_type)
+                if gz_key in self.ghost_zone_losses:
+                    elapsed = (now - self.ghost_zone_losses[gz_key]).total_seconds()
+                    if elapsed < GHOST_ZONE_COOLDOWN_SECONDS:
+                        logger.info(f"  SKIP_GZ_COOLDOWN: {sig['symbol']} Ghost Zone {sig_opt_type} lost {int(elapsed)}s ago "
+                                   f"(need {GHOST_ZONE_COOLDOWN_SECONDS}s)")
+                        skipped += 1
+                        continue
+
+            # ---- v2.3: VIX-adjusted minimum premium check ----
+            is_sell = 'SELL' in sig['type']
+            min_prem = (MIN_PREMIUM_SELL if is_sell else MIN_PREMIUM_BUY) * vix_mult
+            if sig['premium'] < min_prem:
+                logger.info(f"  SKIP_PREMIUM: {sig['symbol']} {sig['type']} Rs {sig['premium']:.2f} "
+                           f"< VIX-adjusted min Rs {min_prem:.2f} (VIX mult={vix_mult}x)")
+                skipped += 1
+                continue
+
+            # ---- v2.3: Signal quality score check ----
+            indicators = self.engine.compute_indicators(sig['symbol'],
+                         self.get_intraday_ohlc(sig['symbol']) or
+                         {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
+            if indicators:
+                score = compute_signal_score(sig, sig['spot'], indicators, self.current_vix)
+                sig['quality_score'] = score
+                if score < MIN_SIGNAL_SCORE:
+                    logger.info(f"  SKIP_QUALITY: {sig['symbol']} {sig['type']} score={score} < {MIN_SIGNAL_SCORE}")
+                    skipped += 1
+                    continue
+                logger.info(f"  QUALITY_SCORE: {sig['symbol']} {sig['type']} score={score}/100")
+
+            # ---- v2.3: Profit filter check ----
+            lot_size = LOT_SIZES.get(sig['symbol'], 50)
+            target_mult = sig.get('target', sig['premium'] * 2) / max(sig['premium'], 0.01)
+            passes, exp_profit, total_cost = passes_profit_filter(
+                sig['premium'], lot_size, target_mult, is_sell
+            )
+            if not passes:
+                logger.info(f"  SKIP_PROFIT: {sig['symbol']} {sig['type']} Rs {sig['premium']:.2f} "
+                           f"expected Rs {exp_profit:.0f} < 2x cost Rs {total_cost:.0f}")
                 skipped += 1
                 continue
 
@@ -1557,6 +1819,7 @@ class PaperTrader:
                 skipped += 1
                 continue
             executed += 1
+            self.daily_trade_count += 1
 
             # Send Telegram notification
             try:
@@ -1578,6 +1841,11 @@ class PaperTrader:
                         locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
                 total_invested = locked
                 capital_available = EQUITY_CAPITAL - locked
+                # Add VIX + quality score to reason for Telegram
+                vix_info = f" | VIX={self.current_vix:.1f}" if self.current_vix else ""
+                score_info = f" | Score={sig.get('quality_score', 'N/A')}"
+                trade_info = f" | Trade #{self.daily_trade_count}/{MAX_TRADES_PER_DAY}"
+                enriched_reason = sig['reason'] + vix_info + score_info + trade_info
                 notify_trade_entry(
                     market="EQUITY", strategy=sig['strategy'],
                     symbol=sig['symbol'], signal_type=sig['type'],
@@ -1585,7 +1853,7 @@ class PaperTrader:
                     spot=sig.get('spot', 0), lot_size=lot_size,
                     multiplier=1, delta=g['delta'],
                     target=sig.get('target', 0), sl=sig.get('sl', 0),
-                    capital_used=capital, reason=sig['reason'],
+                    capital_used=capital, reason=enriched_reason,
                     capital_available=capital_available,
                     total_invested=total_invested,
                 )
@@ -1593,7 +1861,8 @@ class PaperTrader:
                 logger.warning(f"  Telegram notify failed: {e}")
 
         if skipped:
-            logger.info(f"  Executed: {executed} | Skipped (duplicates): {skipped}")
+            logger.info(f"  Executed: {executed} | Skipped: {skipped} | "
+                       f"Day total: {self.daily_trade_count}/{MAX_TRADES_PER_DAY}")
 
     def _get_nearest_expiry(self, symbol):
         """Get nearest weekly/monthly expiry for an index option.
@@ -1685,6 +1954,8 @@ class PaperTrader:
         """Check if position should exit based on OI velocity + IV changes + Gamma risk.
         current_iv_pct: if provided (from implied vol back-solve), use instead of HV estimate.
         Returns: (exit_reason, should_reverse) or (None, False)
+
+        v2.3: Time-adaptive OI thresholds + BANKNIFTY-specific IV + VIX multiplier.
         """
         entry_oi = pos.get('entry_oi', 0)
         entry_iv = pos.get('entry_iv', 0)
@@ -1717,22 +1988,41 @@ class PaperTrader:
         if entry_iv and entry_iv > 0:
             iv_change = abs(current_iv - entry_iv) / entry_iv * 100
 
-        # Rule 1: OI surge >15% from entry
-        if oi_change > OI_SURGE_PCT:
+        # v2.3: Time-adaptive OI threshold
+        now_time = datetime.now().time()
+        if now_time < dtime(10, 15):
+            oi_threshold = OI_SURGE_FIRST_HOUR_PCT   # 50% — first hour OI massive
+        elif now_time < dtime(14, 0):
+            oi_threshold = OI_SURGE_MID_DAY_PCT      # 35% — normal
+        else:
+            oi_threshold = OI_SURGE_LAST_HOUR_PCT    # 40% — close compression
+
+        # v2.3: Apply VIX multiplier to OI threshold (low VIX = higher threshold)
+        vix_mult = self.get_vix_multiplier()
+        oi_threshold *= vix_mult
+
+        # v2.3: BANKNIFTY-specific IV threshold
+        iv_threshold = IV_SPIKE_PCT_BANKNIFTY if pos['symbol'] == 'BANKNIFTY' else IV_SPIKE_PCT
+        iv_threshold *= vix_mult
+
+        # Rule 1: OI surge (time-adaptive)
+        if oi_change > oi_threshold:
             should_reverse = oi_change > OI_REVERSE_PCT
-            logger.info(f"  OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% "
-                       f"(entry={entry_oi}, current={current_oi}). Reverse={should_reverse}")
+            logger.info(f"  OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
+                       f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')}). Reverse={should_reverse}")
             return 'OI_SURGE_EXIT', should_reverse
 
-        # Rule 2: IV spike >25% from entry
-        if iv_change > IV_SPIKE_PCT:
+        # Rule 2: IV spike (BANKNIFTY-aware)
+        if iv_change > iv_threshold:
             should_reverse = iv_change > IV_REVERSE_PCT
-            logger.info(f"  IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% "
-                       f"(entry={entry_iv}%, current={current_iv}%). Reverse={should_reverse}")
+            logger.info(f"  IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
+                       f"(entry={entry_iv}%, current={current_iv}%, threshold={iv_threshold:.0f}%). Reverse={should_reverse}")
             return 'IV_SPIKE_EXIT', should_reverse
 
-        # Rule 3: Combined OI+IV (lower thresholds)
-        if oi_change > OI_IV_COMBO_OI and iv_change > OI_IV_COMBO_IV:
+        # Rule 3: Combined OI+IV (lower thresholds, also VIX-adjusted)
+        combo_oi = OI_IV_COMBO_OI * vix_mult
+        combo_iv = OI_IV_COMBO_IV * vix_mult
+        if oi_change > combo_oi and iv_change > combo_iv:
             logger.info(f"  OI_IV_COMBO: {pos['id']} OI={oi_change:.1f}%, IV={iv_change:.1f}%. REVERSE!")
             return 'OI_IV_COMBINED_EXIT', True
 
@@ -1772,6 +2062,25 @@ class PaperTrader:
             return True
 
         return False
+
+    def _track_exit(self, pos, exit_reason):
+        """Track exit for cooldown logic. Called after every close_position."""
+        direction = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+        self.exit_history.append({
+            'symbol': pos['symbol'],
+            'direction': direction,
+            'time': datetime.now(),
+            'reason': exit_reason,
+        })
+        # Track Ghost Zone losses for extended cooldown
+        if ('GTZ' in pos['signal_type'] or 'Ghost' in pos.get('strategy', '')) and \
+           pos.get('unrealized_pnl', 0) < 0:
+            gz_key = (pos['symbol'], direction)
+            self.ghost_zone_losses[gz_key] = datetime.now()
+            logger.info(f"  GZ_LOSS_TRACKED: {pos['symbol']} {direction} — 30min cooldown active")
+        # Cleanup old exit history (keep last 2 hours only)
+        cutoff = datetime.now() - timedelta(hours=2)
+        self.exit_history = [eh for eh in self.exit_history if eh['time'] > cutoff]
 
     def execute_reversal(self, pos, exit_reason, spot=None):
         """After closing a position, open a reverse trade.
@@ -1902,6 +2211,7 @@ class PaperTrader:
             for pos in list(self.portfolio.positions):
                 current = pos.get('current_premium', pos['entry_premium'])
                 self.portfolio.close_position(pos['id'], current, 'CIRCUIT_BREAKER')
+                self._track_exit(pos, 'CIRCUIT_BREAKER')
             try:
                 from trade_notifier import send_message
                 send_message(f"<b>CIRCUIT BREAKER TRIGGERED</b>\n"
@@ -1913,10 +2223,11 @@ class PaperTrader:
             return
 
         for pos in list(self.portfolio.positions):
-            # Skip positions opened less than 5 minutes ago (grace period)
+            # Skip positions opened less than 15 minutes ago (grace period — v2.3: was 5 min)
             entry_time = datetime.fromisoformat(pos['timestamp'])
-            if (datetime.now() - entry_time).total_seconds() < 300:
-                logger.info(f"  GRACE: {pos['id']} opened {int((datetime.now() - entry_time).total_seconds())}s ago, skipping")
+            elapsed_secs = (datetime.now() - entry_time).total_seconds()
+            if elapsed_secs < GRACE_PERIOD_SECONDS:
+                logger.info(f"  GRACE: {pos['id']} opened {int(elapsed_secs)}s ago (need {GRACE_PERIOD_SECONDS}s)")
                 continue
 
             # ---- EOD FORCE CLOSE: Close positions 10 min before market close ----
@@ -1924,6 +2235,7 @@ class PaperTrader:
                 logger.info(f"  EOD_CLOSE: {pos['id']} force close (market closing at 15:30)")
                 current = pos.get('current_premium', pos['entry_premium'])
                 self.portfolio.close_position(pos['id'], current, 'EOD_FORCE_CLOSE')
+                self._track_exit(pos, 'EOD_FORCE_CLOSE')
                 try:
                     from trade_notifier import notify_trade_exit
                     lot_size = LOT_SIZES.get(pos['symbol'], 50)
@@ -1974,6 +2286,7 @@ class PaperTrader:
                 if abs(profit_pct) < 5:
                     logger.info(f"  TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only {profit_pct:.1f}% profit")
                     self.portfolio.close_position(pos['id'], current_premium, 'TIME_EXIT_NO_PROGRESS')
+                    self._track_exit(pos, 'TIME_EXIT_NO_PROGRESS')
                     try:
                         from trade_notifier import notify_trade_exit
                         lot_size = LOT_SIZES.get(symbol, 50)
@@ -2032,6 +2345,7 @@ class PaperTrader:
                 if pos.get('trailing_sl') and current_premium <= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} premium {current_premium:.2f} <= TSL {pos['trailing_sl']:.2f}")
                     self.portfolio.close_position(pos['id'], current_premium, 'TRAILING_SL_HIT')
+                    self._track_exit(pos, 'TRAILING_SL_HIT')
                     try:
                         from trade_notifier import notify_trade_exit
                         lot_size = LOT_SIZES.get(symbol, 50)
@@ -2085,6 +2399,7 @@ class PaperTrader:
                 if pos.get('trailing_sl') and current_premium >= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} SELL premium {current_premium:.2f} >= TSL {pos['trailing_sl']:.2f}")
                     self.portfolio.close_position(pos['id'], current_premium, 'TRAILING_SL_HIT')
+                    self._track_exit(pos, 'TRAILING_SL_HIT')
                     try:
                         from trade_notifier import notify_trade_exit
                         lot_size = LOT_SIZES.get(symbol, 50)
@@ -2113,6 +2428,7 @@ class PaperTrader:
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current_premium, current_iv_pct)
             if oi_iv_reason:
                 self.portfolio.close_position(pos['id'], current_premium, oi_iv_reason)
+                self._track_exit(pos, oi_iv_reason)
                 # Telegram notification
                 try:
                     from trade_notifier import notify_trade_exit
@@ -2175,6 +2491,7 @@ class PaperTrader:
 
             if exit_reason:
                 self.portfolio.close_position(pos['id'], current_premium, exit_reason)
+                self._track_exit(pos, exit_reason)
                 try:
                     from trade_notifier import notify_trade_exit
                     lot_size = LOT_SIZES.get(symbol, 50)
