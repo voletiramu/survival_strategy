@@ -132,6 +132,7 @@ MCX_GRACE_PERIOD_SECONDS = 900     # 15 min minimum hold (was 300s)
 MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
 MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
 MCX_MAX_TRADES_PER_DAY = 12           # Hard cap on daily commodity trades
+MCX_MIN_OI_EXIT_PNL = 50              # Min Rs 50 PnL to allow OI/IV exit (covers 2x MCX brokerage)
 
 # MCX Trading costs
 MCX_BROKERAGE = 20
@@ -1980,12 +1981,25 @@ class CommodityPaperTrader:
                     current_iv_pct = round(iv_solved * 100, 1)
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current, current_iv_pct)
             if oi_iv_reason:
-                self.portfolio.close_position(pos['id'], current, oi_iv_reason)
-                self._track_exit(pos, oi_iv_reason)
-                self._notify_commodity_exit(pos, commodity, current, oi_iv_reason)
-                if should_reverse:
-                    self.execute_reversal(pos, oi_iv_reason)
-                continue
+                # v2.3.2: PnL guard — don't exit on OI/IV if PnL doesn't cover brokerage
+                spec = COMMODITIES[commodity]
+                if pos['is_sell']:
+                    pnl_estimate = (pos['entry_premium'] - current) * spec['lot_size'] * spec['multiplier']
+                else:
+                    pnl_estimate = (current - pos['entry_premium']) * spec['lot_size'] * spec['multiplier']
+                total_cost = calc_mcx_costs(pos['entry_premium'], spec['lot_size'], spec['multiplier'], pos.get('is_sell', False))
+
+                if pnl_estimate < MCX_MIN_OI_EXIT_PNL and pnl_estimate > -total_cost * 2:
+                    logger.info(f"  OI_EXIT_BLOCKED: {pos['id']} {oi_iv_reason} blocked — "
+                               f"PnL Rs {pnl_estimate:.0f} < Rs {MCX_MIN_OI_EXIT_PNL} "
+                               f"(need profit to cover brokerage). Letting TSL/target handle exit.")
+                else:
+                    self.portfolio.close_position(pos['id'], current, oi_iv_reason)
+                    self._track_exit(pos, oi_iv_reason)
+                    self._notify_commodity_exit(pos, commodity, current, oi_iv_reason)
+                    if should_reverse:
+                        self.execute_reversal(pos, oi_iv_reason)
+                    continue
 
             # ---- STATIC EXIT CHECK ----
             logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current:.2f} [{premium_source}] | "

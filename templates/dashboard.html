@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Algo Trading Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f1923;
+            color: #e0e6ed;
+            min-height: 100vh;
+        }
+        .header {
+            background: #1a2332;
+            padding: 12px 16px;
+            border-bottom: 1px solid #2a3a4a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            color: #fff;
+        }
+        .header .status {
+            font-size: 12px;
+            color: #8899aa;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 8px;
+            padding: 12px 16px;
+        }
+        .stat-card {
+            background: #1a2332;
+            border-radius: 8px;
+            padding: 12px;
+            border: 1px solid #2a3a4a;
+        }
+        .stat-card .label {
+            font-size: 11px;
+            color: #8899aa;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .stat-card .value {
+            font-size: 20px;
+            font-weight: 700;
+            margin-top: 4px;
+        }
+        .stat-card .sub {
+            font-size: 11px;
+            color: #8899aa;
+            margin-top: 2px;
+        }
+        .positive { color: #00c853; }
+        .negative { color: #ff1744; }
+        .neutral { color: #e0e6ed; }
+
+        .section {
+            padding: 8px 16px;
+        }
+        .section-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #8899aa;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .section-title .count {
+            background: #2a3a4a;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+        }
+
+        .table-wrap {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th {
+            background: #1a2332;
+            color: #8899aa;
+            font-weight: 600;
+            text-align: left;
+            padding: 8px 10px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+            position: sticky;
+            top: 0;
+        }
+        td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #1a2332;
+            white-space: nowrap;
+        }
+        tr:hover { background: #1a2332; }
+        .tag {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .tag-buy { background: #004d40; color: #00e676; }
+        .tag-sell { background: #4a0000; color: #ff8a80; }
+        .tag-ce { background: #1a237e; color: #82b1ff; }
+        .tag-pe { background: #4a148c; color: #ea80fc; }
+        .tag-exit {
+            background: #2a3a4a;
+            color: #8899aa;
+            font-size: 10px;
+        }
+
+        .mobile-card {
+            display: none;
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 6px;
+                padding: 8px;
+            }
+            .stat-card { padding: 8px; }
+            .stat-card .value { font-size: 16px; }
+            .section { padding: 8px; }
+
+            .desktop-table { display: none; }
+            .mobile-card { display: block; }
+
+            .position-card {
+                background: #1a2332;
+                border-radius: 8px;
+                padding: 10px;
+                margin-bottom: 6px;
+                border: 1px solid #2a3a4a;
+            }
+            .position-card .row {
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 4px;
+            }
+            .position-card .primary {
+                font-weight: 600;
+                font-size: 14px;
+            }
+            .position-card .secondary {
+                font-size: 12px;
+                color: #8899aa;
+            }
+        }
+
+        .refresh-btn {
+            background: #2a3a4a;
+            border: none;
+            color: #8899aa;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .refresh-btn:hover { background: #3a4a5a; color: #fff; }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #8899aa;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Algo Trading Dashboard</h1>
+        <div>
+            <button class="refresh-btn" onclick="refreshAll()">Refresh</button>
+            <span class="status" id="lastUpdate">Loading...</span>
+        </div>
+    </div>
+
+    <div class="stats-grid" id="statsGrid">
+        <div class="stat-card">
+            <div class="label">Total PnL</div>
+            <div class="value neutral" id="totalPnl">--</div>
+            <div class="sub" id="pnlBreakdown">Open + Closed</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Win Rate</div>
+            <div class="value neutral" id="winRate">--</div>
+            <div class="sub" id="winLoss">W/L</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Open</div>
+            <div class="value neutral" id="openCount">--</div>
+            <div class="sub" id="openPnl">Unrealized</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Closed Today</div>
+            <div class="value neutral" id="closedCount">--</div>
+            <div class="sub" id="closedPnl">Realized</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Equity Capital</div>
+            <div class="value neutral" id="eqCapital">--</div>
+            <div class="sub" id="eqDaily">Daily PnL</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Commodity Capital</div>
+            <div class="value neutral" id="cmCapital">--</div>
+            <div class="sub" id="cmDaily">Daily PnL</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">
+            Open Positions <span class="count" id="openBadge">0</span>
+        </div>
+        <div class="desktop-table">
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Strategy</th>
+                            <th>Type</th>
+                            <th>Strike</th>
+                            <th>Entry</th>
+                            <th>Current</th>
+                            <th>PnL</th>
+                            <th>Duration</th>
+                            <th>Delta</th>
+                            <th>TSL</th>
+                            <th>Target</th>
+                            <th>SL</th>
+                        </tr>
+                    </thead>
+                    <tbody id="openTableBody">
+                        <tr><td colspan="12" class="loading">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div class="mobile-card" id="openCards">
+            <div class="loading">Loading...</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">
+            Closed Trades (Today) <span class="count" id="closedBadge">0</span>
+        </div>
+        <div class="desktop-table">
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Strategy</th>
+                            <th>Type</th>
+                            <th>Strike</th>
+                            <th>Entry</th>
+                            <th>Exit</th>
+                            <th>PnL</th>
+                            <th>Exit Reason</th>
+                            <th>Hold</th>
+                        </tr>
+                    </thead>
+                    <tbody id="closedTableBody">
+                        <tr><td colspan="9" class="loading">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div class="mobile-card" id="closedCards">
+            <div class="loading">Loading...</div>
+        </div>
+    </div>
+
+    <script>
+        function fmt(n) {
+            if (n === null || n === undefined) return '--';
+            return new Intl.NumberFormat('en-IN', {
+                maximumFractionDigits: 2,
+                minimumFractionDigits: 0
+            }).format(n);
+        }
+
+        function pnlClass(v) {
+            if (v > 0) return 'positive';
+            if (v < 0) return 'negative';
+            return 'neutral';
+        }
+
+        function typeTag(type) {
+            let tags = '';
+            if (type.includes('BUY')) tags += '<span class="tag tag-buy">BUY</span> ';
+            else if (type.includes('SELL')) tags += '<span class="tag tag-sell">SELL</span> ';
+            if (type.includes('CE')) tags += '<span class="tag tag-ce">CE</span>';
+            else if (type.includes('PE')) tags += '<span class="tag tag-pe">PE</span>';
+            return tags;
+        }
+
+        function renderOpen(positions) {
+            const tbody = document.getElementById('openTableBody');
+            const cards = document.getElementById('openCards');
+            document.getElementById('openBadge').textContent = positions.length;
+
+            if (positions.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#8899aa">No open positions</td></tr>';
+                cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No open positions</div>';
+                return;
+            }
+
+            // Sort by PnL descending
+            positions.sort((a, b) => b.pnl - a.pnl);
+
+            tbody.innerHTML = positions.map(p => `
+                <tr>
+                    <td><b>${p.symbol}</b> <span style="font-size:10px;color:#8899aa">${p.market.toUpperCase()}</span></td>
+                    <td>${p.strategy}</td>
+                    <td>${typeTag(p.type)}</td>
+                    <td>${fmt(p.strike)}</td>
+                    <td>${fmt(p.entry_price)}</td>
+                    <td>${fmt(p.current_price)}</td>
+                    <td class="${pnlClass(p.pnl)}"><b>${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</b></td>
+                    <td>${p.duration}</td>
+                    <td>${p.delta ? p.delta.toFixed(3) : '--'}</td>
+                    <td>${p.tsl ? fmt(p.tsl) : '--'}</td>
+                    <td>${fmt(p.target)}</td>
+                    <td>${fmt(p.sl)}</td>
+                </tr>
+            `).join('');
+
+            cards.innerHTML = positions.map(p => `
+                <div class="position-card">
+                    <div class="row">
+                        <span class="primary">${p.symbol} ${typeTag(p.type)}</span>
+                        <span class="primary ${pnlClass(p.pnl)}">${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</span>
+                    </div>
+                    <div class="row">
+                        <span class="secondary">${p.strategy} | Strike ${fmt(p.strike)}</span>
+                        <span class="secondary">${p.duration}</span>
+                    </div>
+                    <div class="row">
+                        <span class="secondary">Entry: ${fmt(p.entry_price)} | Curr: ${fmt(p.current_price)}</span>
+                        <span class="secondary">TSL: ${p.tsl ? fmt(p.tsl) : '--'}</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderClosed(trades) {
+            const tbody = document.getElementById('closedTableBody');
+            const cards = document.getElementById('closedCards');
+            document.getElementById('closedBadge').textContent = trades.length;
+
+            if (trades.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#8899aa">No closed trades today</td></tr>';
+                cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No closed trades today</div>';
+                return;
+            }
+
+            // Sort by exit time descending (most recent first)
+            trades.sort((a, b) => (b.exit_time || '').localeCompare(a.exit_time || ''));
+
+            tbody.innerHTML = trades.map(t => `
+                <tr>
+                    <td><b>${t.symbol}</b> <span style="font-size:10px;color:#8899aa">${t.market.toUpperCase()}</span></td>
+                    <td>${t.strategy}</td>
+                    <td>${typeTag(t.type)}</td>
+                    <td>${fmt(t.strike)}</td>
+                    <td>${fmt(t.entry_price)}</td>
+                    <td>${fmt(t.exit_price)}</td>
+                    <td class="${pnlClass(t.pnl)}"><b>${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</b></td>
+                    <td><span class="tag tag-exit">${t.exit_reason}</span></td>
+                    <td>${t.hold_duration}</td>
+                </tr>
+            `).join('');
+
+            cards.innerHTML = trades.map(t => `
+                <div class="position-card">
+                    <div class="row">
+                        <span class="primary">${t.symbol} ${typeTag(t.type)}</span>
+                        <span class="primary ${pnlClass(t.pnl)}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</span>
+                    </div>
+                    <div class="row">
+                        <span class="secondary">${t.strategy} | ${t.hold_duration}</span>
+                        <span class="tag tag-exit">${t.exit_reason}</span>
+                    </div>
+                    <div class="row">
+                        <span class="secondary">Entry: ${fmt(t.entry_price)} | Exit: ${fmt(t.exit_price)}</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderSummary(s) {
+            const el = (id) => document.getElementById(id);
+
+            el('totalPnl').textContent = (s.total_pnl >= 0 ? '+' : '') + fmt(s.total_pnl);
+            el('totalPnl').className = 'value ' + pnlClass(s.total_pnl);
+            el('pnlBreakdown').textContent = `Open: ${fmt(s.open_pnl)} | Closed: ${fmt(s.closed_pnl)}`;
+
+            el('winRate').textContent = s.win_rate + '%';
+            el('winRate').className = 'value ' + (s.win_rate >= 50 ? 'positive' : 'negative');
+            el('winLoss').textContent = `${s.wins}W / ${s.losses}L`;
+
+            el('openCount').textContent = s.open_positions;
+            el('openPnl').textContent = (s.open_pnl >= 0 ? '+' : '') + fmt(s.open_pnl);
+            el('openPnl').className = 'sub ' + pnlClass(s.open_pnl);
+
+            el('closedCount').textContent = s.closed_today;
+            el('closedPnl').textContent = (s.closed_pnl >= 0 ? '+' : '') + fmt(s.closed_pnl);
+            el('closedPnl').className = 'sub ' + pnlClass(s.closed_pnl);
+
+            el('eqCapital').textContent = fmt(s.equity_capital);
+            el('eqDaily').textContent = 'Daily: ' + (s.equity_daily_pnl >= 0 ? '+' : '') + fmt(s.equity_daily_pnl);
+            el('eqDaily').className = 'sub ' + pnlClass(s.equity_daily_pnl);
+
+            el('cmCapital').textContent = fmt(s.commodity_capital);
+            el('cmDaily').textContent = 'Daily: ' + (s.commodity_daily_pnl >= 0 ? '+' : '') + fmt(s.commodity_daily_pnl);
+            el('cmDaily').className = 'sub ' + pnlClass(s.commodity_daily_pnl);
+
+            el('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString('en-IN');
+        }
+
+        async function refreshAll() {
+            try {
+                const [eqRes, cmRes, sumRes] = await Promise.all([
+                    fetch('/api/equity').then(r => r.json()).catch(() => null),
+                    fetch('/api/commodity').then(r => r.json()).catch(() => null),
+                    fetch('/api/summary').then(r => r.json()).catch(() => null),
+                ]);
+
+                const allPositions = [
+                    ...(eqRes && eqRes.positions ? eqRes.positions : []),
+                    ...(cmRes && cmRes.positions ? cmRes.positions : []),
+                ];
+                const allClosed = [
+                    ...(eqRes && eqRes.closed_trades ? eqRes.closed_trades : []),
+                    ...(cmRes && cmRes.closed_trades ? cmRes.closed_trades : []),
+                ];
+
+                renderOpen(allPositions);
+                renderClosed(allClosed);
+                if (sumRes) renderSummary(sumRes);
+            } catch (e) {
+                console.error('Refresh failed:', e);
+            }
+        }
+
+        // Initial load
+        refreshAll();
+        // Auto-refresh every 30 seconds
+        setInterval(refreshAll, 30000);
+    </script>
+</body>
+</html>

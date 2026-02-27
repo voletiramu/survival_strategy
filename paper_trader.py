@@ -91,6 +91,7 @@ GRACE_PERIOD_SECONDS = 900       # 15 min minimum hold (was 300s / 5 min)
 GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry same direction
 REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
 MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
+MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x brokerage)
 
 # Trailing Stop Loss Parameters (multi-phase for max profit capture)
 TSL_BREAKEVEN_TRIGGER_PCT = 30   # Phase 1: Lock breakeven when 30% of target reached
@@ -2442,44 +2443,57 @@ class PaperTrader:
                     current_iv_pct = round(iv_solved * 100, 1)
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current_premium, current_iv_pct)
             if oi_iv_reason:
-                self.portfolio.close_position(pos['id'], current_premium, oi_iv_reason)
-                self._track_exit(pos, oi_iv_reason)
-                # Telegram notification
-                try:
-                    from trade_notifier import notify_trade_exit
-                    lot_size = LOT_SIZES.get(symbol, 50)
-                    # Capital used: SELL = margin, BUY = premium
-                    if pos.get('is_sell', False):
-                        capital = MARGIN_PER_LOT.get(symbol, 120000)
-                    else:
-                        capital = pos['entry_premium'] * lot_size
-                    pnl = pos.get('unrealized_pnl', 0)
-                    # Capital available AFTER closing (BUY/SELL aware)
-                    locked = 0
-                    for p in self.portfolio.positions:
-                        if p.get('is_sell', False):
-                            locked += MARGIN_PER_LOT.get(p['symbol'], 120000)
-                        else:
-                            locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
-                    total_invested = locked
-                    capital_available = EQUITY_CAPITAL - locked
-                    notify_trade_exit(
-                        market="EQUITY", strategy=pos['strategy'],
-                        symbol=symbol, signal_type=pos['signal_type'],
-                        strike=pos['strike'], entry_price=pos['entry_premium'],
-                        exit_price=current_premium, entry_time=pos['timestamp'],
-                        pnl=pnl, capital_used=capital,
-                        exit_reason=oi_iv_reason,
-                        capital_available=capital_available,
-                        total_invested=total_invested,
-                    )
-                except Exception as e:
-                    logger.warning(f"  Telegram exit notify failed: {e}")
+                # v2.3.2: PnL guard — don't exit on OI/IV if PnL doesn't cover brokerage
+                lot_size = LOT_SIZES.get(symbol, 50)
+                if pos['is_sell']:
+                    pnl_estimate = (pos['entry_premium'] - current_premium) * lot_size
+                else:
+                    pnl_estimate = (current_premium - pos['entry_premium']) * lot_size
+                total_cost = calc_costs(pos['entry_premium'], lot_size, pos.get('is_sell', False))
 
-                # Execute reversal if triggered
-                if should_reverse:
-                    self.execute_reversal(pos, oi_iv_reason)
-                continue  # Skip static exit check for this position
+                # Allow OI exit only if: profitable enough, OR losing badly (stop bleeding)
+                if pnl_estimate < MIN_OI_EXIT_PNL and pnl_estimate > -total_cost * 2:
+                    logger.info(f"  OI_EXIT_BLOCKED: {pos['id']} {oi_iv_reason} blocked — "
+                               f"PnL Rs {pnl_estimate:.0f} < Rs {MIN_OI_EXIT_PNL} "
+                               f"(need profit to cover brokerage). Letting TSL/target handle exit.")
+                else:
+                    self.portfolio.close_position(pos['id'], current_premium, oi_iv_reason)
+                    self._track_exit(pos, oi_iv_reason)
+                    # Telegram notification
+                    try:
+                        from trade_notifier import notify_trade_exit
+                        # Capital used: SELL = margin, BUY = premium
+                        if pos.get('is_sell', False):
+                            capital = MARGIN_PER_LOT.get(symbol, 120000)
+                        else:
+                            capital = pos['entry_premium'] * lot_size
+                        pnl = pos.get('unrealized_pnl', 0)
+                        # Capital available AFTER closing (BUY/SELL aware)
+                        locked = 0
+                        for p in self.portfolio.positions:
+                            if p.get('is_sell', False):
+                                locked += MARGIN_PER_LOT.get(p['symbol'], 120000)
+                            else:
+                                locked += p['entry_premium'] * LOT_SIZES.get(p['symbol'], 50)
+                        total_invested = locked
+                        capital_available = EQUITY_CAPITAL - locked
+                        notify_trade_exit(
+                            market="EQUITY", strategy=pos['strategy'],
+                            symbol=symbol, signal_type=pos['signal_type'],
+                            strike=pos['strike'], entry_price=pos['entry_premium'],
+                            exit_price=current_premium, entry_time=pos['timestamp'],
+                            pnl=pnl, capital_used=capital,
+                            exit_reason=oi_iv_reason,
+                            capital_available=capital_available,
+                            total_invested=total_invested,
+                        )
+                    except Exception as e:
+                        logger.warning(f"  Telegram exit notify failed: {e}")
+
+                    # Execute reversal if triggered
+                    if should_reverse:
+                        self.execute_reversal(pos, oi_iv_reason)
+                    continue  # Skip static exit check for this position
 
             # ---- STATIC EXIT CHECK (original logic) ----
             # details/target/sl already computed above in TSL section
