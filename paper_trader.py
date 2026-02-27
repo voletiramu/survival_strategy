@@ -1390,24 +1390,39 @@ class PaperTrader:
         return None
 
     def get_india_vix(self):
-        """Fetch India VIX value. Cached for 120 seconds."""
+        """Fetch India VIX value. Cached for 120 seconds.
+        Tries Angel API first, falls back to historical volatility proxy.
+        """
         cached = self._vix_cache
         if cached['value'] and cached['time'] and (datetime.now() - cached['time']).total_seconds() < 120:
             return cached['value']
-        try:
-            ltp = self.angel.get_ltp('NSE', '99926004')
-            if ltp and ltp > 0:
-                self._vix_cache = {'value': ltp, 'time': datetime.now()}
-                self.current_vix = ltp
-                return ltp
-        except Exception as e:
-            logger.debug(f"VIX fetch failed: {e}")
-        # Fallback: use historical volatility as VIX proxy
+
+        # Method 1: Try Angel API with multiple known VIX tokens
+        for token in ['26017', '99926004']:
+            try:
+                ltp = self.angel.get_ltp('NSE', token)
+                if ltp and ltp > 0:
+                    vix = ltp
+                    # Normalize: Angel may return VIX × 100, × 1000, or raw
+                    if vix > 1000:
+                        vix = vix / 1000  # e.g., 23270 → 23.27
+                    elif vix > 100:
+                        vix = vix / 100   # e.g., 1327 → 13.27
+                    # Valid VIX range: 5-80
+                    if 5 < vix < 80:
+                        self._vix_cache = {'value': vix, 'time': datetime.now()}
+                        self.current_vix = vix
+                        return vix
+            except Exception:
+                pass
+
+        # Method 2: Fallback to historical volatility as VIX proxy
         df = self.engine.historical_data.get('NIFTY')
         if df is not None and len(df) > 20:
             log_ret = np.log(df['Close'] / df['Close'].shift(1))
             hv = log_ret.tail(20).std() * np.sqrt(252) * 100
             self.current_vix = max(min(hv, 40), 8)
+            self._vix_cache = {'value': self.current_vix, 'time': datetime.now()}
             return self.current_vix
         return None
 
