@@ -137,11 +137,11 @@ MCX_STRATEGY_EXIT_MULT = {
 # Trade Quality Filters (commodity — eliminate brokerage-losing weak trades)
 MCX_MIN_PREMIUM_BUY = 5         # Min Rs 5 premium for commodity BUY trades
 MCX_MIN_PREMIUM_SELL = 10       # Min Rs 10 premium for commodity SELL trades
-MCX_MIN_SIGNAL_SCORE = 40       # Quality score 0-100, reject below 40
+MCX_MIN_SIGNAL_SCORE = 50       # v2.5: Quality score 0-100, reject below 50 (was 40)
 MCX_MIN_PROFIT_TO_COST_RATIO = 2.0  # Expected profit must be >= 2x total cost
 
 # Cooldowns & Limits (commodity)
-MCX_GRACE_PERIOD_SECONDS = 900     # 15 min minimum hold (was 300s)
+MCX_GRACE_PERIOD_SECONDS = 600     # v2.5: 10 min minimum hold (was 15 min / 900s)
 MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
 MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
 MCX_MAX_TRADES_PER_DAY = 12           # Hard cap on daily commodity trades
@@ -765,7 +765,7 @@ class CommodityStrategyEngine:
                         'type': 'SELL_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at R3",
-                        'target': g['price'] * 0.15, 'sl': g['price'] * 1.8,
+                        'target': g['price'] * 0.3, 'sl': g['price'] * 1.2,  # v2.5: Was 0.15/1.8
                     })
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_int) * strike_int
@@ -775,7 +775,7 @@ class CommodityStrategyEngine:
                         'type': 'SELL_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at S3",
-                        'target': g['price'] * 0.15, 'sl': g['price'] * 1.8,
+                        'target': g['price'] * 0.3, 'sl': g['price'] * 1.2,  # v2.5: Was 0.15/1.8
                     })
         return signals
 
@@ -819,6 +819,8 @@ class CommodityStrategyEngine:
         return signals
 
     def check_ghost_zone_signals(self, commodity, spot, ohlc, ind, dow, dte):
+        """v2.5: DISABLED — weak zone detection causing consistent losses on backtest."""
+        return []  # v2.5: Disabled pending redesign
         signals = []
         spec = COMMODITIES[commodity]
         strike_int = spec['strike_interval']
@@ -853,8 +855,9 @@ class CommodityStrategyEngine:
 
     def check_pcr_vwap_signals(self, commodity, spot, ohlc, indicators, dow, dte):
         """PCR+VWAP Strategy adapted for commodities.
-        Uses momentum-based PCR proxy + VWAP proximity for entries.
+        v2.5: DISABLED — zero signals ever generated. Proxy PCR stays between 0.95-1.05.
         """
+        return []  # v2.5: Disabled
         signals = []
         ind = indicators
         spec = COMMODITIES[commodity]
@@ -905,8 +908,14 @@ class CommodityStrategyEngine:
         """Survivor V2 option selling adapted for commodities.
         Sells OTM options after breakout/breakdown from support/resistance.
         Uses DTE-based filter instead of day-of-week (MCX has monthly expiry).
+        v2.5: SILVERM disabled — 0% WR, premium never moves (6/6 trades zero movement on Feb 27).
         """
         signals = []
+
+        # v2.5: Disable SILVERM — 0% WR, premium never moves
+        if commodity == 'SILVERM':
+            return signals
+
         ind = indicators
         spec = COMMODITIES[commodity]
         strike_int = spec['strike_interval']
@@ -1458,7 +1467,10 @@ class CommodityPaperTrader:
         self.exit_history = [eh for eh in self.exit_history if eh['time'] > cutoff]
 
     def execute_reversal(self, pos, exit_reason):
-        """After closing a commodity position due to OI+IV exit, open reverse trade."""
+        """After closing a commodity position due to OI+IV exit, open reverse trade.
+        v2.5: DISABLED — CPR Reversal -Rs 5,825 on Feb 27. SELL targets bugged at 0.1x/1.5x.
+        """
+        return  # v2.5: Disabled
         try:
             commodity = pos['commodity']
             strategy = pos['strategy']
@@ -1808,7 +1820,8 @@ class CommodityPaperTrader:
                 dte=sig['dte'],
                 details={'reason': sig['reason'], 'target': sig.get('target'),
                          'sl': sig.get('sl'), 'spot': sig.get('spot'),
-                         'option_token': option_token},
+                         'option_token': option_token,
+                         'quality_score': sig.get('quality_score', 0)},  # v2.5: FIX — was missing!
                 oi=entry_oi,
                 iv=sig['greeks'].get('iv', 0),
             )
@@ -1940,10 +1953,10 @@ class CommodityPaperTrader:
                 pos['unrealized_pnl'] = round(
                     (current - pos['entry_premium']) * lot * mult - pos['entry_cost'], 2)
 
-            # ---- TIME-BASED EXIT: Close stale commodity positions (>6 hours with <5% profit) ----
-            if hours_held > 6:
+            # ---- TIME-BASED EXIT: Close stale commodity positions (v2.5: >4 hours with <10% profit) ----
+            if hours_held > 4:  # v2.5: Reduced from 6 hours
                 profit_pct = (pos['unrealized_pnl'] / max(pos['entry_premium'] * lot * mult, 1)) * 100
-                if abs(profit_pct) < 5:
+                if abs(profit_pct) < 10:  # v2.5: Raised from 5%
                     logger.info(f"  MCX_TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only {profit_pct:.1f}% profit")
                     self.portfolio.close_position(pos['id'], current, 'TIME_EXIT_NO_PROGRESS')
                     self._track_exit(pos, 'TIME_EXIT_NO_PROGRESS')

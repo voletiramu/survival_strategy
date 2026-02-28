@@ -72,7 +72,7 @@ OI_SURGE_MID_DAY_PCT = 35        # 10:15 AM - 2:00 PM: normal session
 OI_SURGE_LAST_HOUR_PCT = 40      # 2:00-3:30 PM: close compression
 OI_REVERSE_PCT = 50              # Reverse trade if OI changes >50% (was 25%)
 IV_SPIKE_PCT = 30                # Exit if IV changes >30% from entry (was 25%)
-IV_SPIKE_PCT_BANKNIFTY = 45      # BANKNIFTY-specific: naturally higher IV volatility
+IV_SPIKE_PCT_BANKNIFTY = 55      # v2.5: Raised from 45 (BANKNIFTY inherently volatile)
 IV_REVERSE_PCT = 50              # Reverse trade if IV changes >50% (was 40%)
 OI_IV_COMBO_OI = 20              # Combined exit: OI >20% AND IV >25% (was 10%/15%)
 OI_IV_COMBO_IV = 25
@@ -91,7 +91,7 @@ STRATEGY_EXIT_MULT = {
 # Trade Quality Filters (eliminate brokerage-losing weak trades)
 MIN_PREMIUM_BUY = 15             # Min Rs 15 premium for BUY trades (was Rs 3)
 MIN_PREMIUM_SELL = 20            # Min Rs 20 premium for SELL trades (was Rs 5)
-MIN_SIGNAL_SCORE = 40            # Quality score 0-100, reject below 40
+MIN_SIGNAL_SCORE = 50            # v2.5: Quality score 0-100, reject below 50 (was 40)
 MIN_PROFIT_TO_COST_RATIO = 2.0   # Expected profit must be >= 2x total brokerage cost
 
 # VIX-Adaptive Trading
@@ -101,7 +101,7 @@ VIX_LOW_MULTIPLIER = 1.5         # Multiply thresholds by 1.5 in low VIX
 VIX_HIGH_MULTIPLIER = 0.8        # Multiply thresholds by 0.8 in high VIX
 
 # Cooldowns & Limits
-GRACE_PERIOD_SECONDS = 900       # 15 min minimum hold (was 300s / 5 min)
+GRACE_PERIOD_SECONDS = 600       # v2.5: 10 min minimum hold (was 15 min / 900s)
 GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry same direction
 REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
 MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
@@ -1117,8 +1117,8 @@ class StrategyEngine:
                         'premium': g['price'],
                         'greeks': g,
                         'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at R3={ind['cam_r3']:.0f}",
-                        'target': g['price'] * 0.15,
-                        'sl': g['price'] * 1.8,
+                        'target': g['price'] * 0.3,   # v2.5: Was 0.15 (too aggressive)
+                        'sl': g['price'] * 1.2,       # v2.5: Was 1.8 (too wide)
                     })
 
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
@@ -1131,8 +1131,8 @@ class StrategyEngine:
                         'premium': g['price'],
                         'greeks': g,
                         'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at S3={ind['cam_s3']:.0f}",
-                        'target': g['price'] * 0.15,
-                        'sl': g['price'] * 1.8,
+                        'target': g['price'] * 0.3,   # v2.5: Was 0.15 (too aggressive)
+                        'sl': g['price'] * 1.2,       # v2.5: Was 1.8 (too wide)
                     })
 
         return signals
@@ -1212,54 +1212,18 @@ class StrategyEngine:
         return signals
 
     def check_ghost_zone_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Ghost Zone - demand/supply zone trading."""
-        signals = []
-        ind = indicators
-        T = dte / 365
-        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
-
-        # Demand zone retest (BUY CE)
-        if (ohlc['low'] <= ind['demand_zone'] * 1.01 and
-                spot > ind['demand_zone'] and
-                ind['demand_strength'] >= 2):
-            ce_strike = round(spot / strike_interval) * strike_interval
-            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > MIN_PREMIUM_BUY:
-                bounce = (spot - ohlc['low']) / max(ind['atr'], 1)
-                signals.append({
-                    'type': 'BUY_CE_GTZ',
-                    'strike': ce_strike,
-                    'premium': g['price'],
-                    'greeks': g,
-                    'reason': f"Ghost Zone: Demand zone retest {ind['demand_zone']:.0f} "
-                              f"bounce={bounce:.2f}x strength={ind['demand_strength']}",
-                    'target': g['price'] * 2.5 if bounce > 0.8 else g['price'] * 1.8,
-                    'sl': g['price'] * 0.4,
-                })
-
-        # Supply zone retest (BUY PE)
-        elif (ohlc['high'] >= ind['supply_zone'] * 0.99 and
-              spot < ind['supply_zone'] and
-              ind['supply_strength'] >= 2):
-            pe_strike = round(spot / strike_interval) * strike_interval
-            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > MIN_PREMIUM_BUY:
-                rejection = (ohlc['high'] - spot) / max(ind['atr'], 1)
-                signals.append({
-                    'type': 'BUY_PE_GTZ',
-                    'strike': pe_strike,
-                    'premium': g['price'],
-                    'greeks': g,
-                    'reason': f"Ghost Zone: Supply zone retest {ind['supply_zone']:.0f} "
-                              f"rejection={rejection:.2f}x strength={ind['supply_strength']}",
-                    'target': g['price'] * 2.5 if rejection > 0.8 else g['price'] * 1.8,
-                    'sl': g['price'] * 0.4,
-                })
-
-        return signals
+        """Ghost Zone - demand/supply zone trading.
+        v2.5: DISABLED — 23% WR equity, -Rs 12,276 combined on Feb 27 backtest.
+        Zone detection too weak (10-candle lookback, 2-touch threshold).
+        """
+        return []  # v2.5: Disabled pending redesign with stronger zone logic
 
     def check_pcr_vwap_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """PCR+VWAP Strategy - CA Nitin Muraka."""
+        """PCR+VWAP Strategy - CA Nitin Muraka.
+        v2.5: DISABLED — zero signals ever generated. Proxy PCR never exceeds 1.05/0.95 thresholds.
+        Revive only when real OI chain PCR data is integrated.
+        """
+        return []  # v2.5: Disabled
         signals = []
         ind = indicators
         T = dte / 365
@@ -1305,7 +1269,11 @@ class StrategyEngine:
         return signals
 
     def check_survivor_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Survivor V2 - Raahi Bhushan option selling."""
+        """Survivor V2 - Raahi Bhushan option selling.
+        v2.5: DISABLED for equity — zero signals on Feb 27, needs Rs 100K margin/lot.
+        Too capital-intensive for Rs 3L portfolio.
+        """
+        return []  # v2.5: Disabled for equity
         signals = []
         ind = indicators
         T = dte / 365
@@ -1872,6 +1840,7 @@ class PaperTrader:
                     'spot': sig.get('spot'),
                     'option_token': option_token,
                     'option_exchange': option_exchange,
+                    'quality_score': sig.get('quality_score', 0),  # v2.5: FIX — was missing! Enables dynamic lots
                 },
                 oi=entry_oi,
                 spot_price=sig.get('spot', 0),
@@ -2166,8 +2135,11 @@ class PaperTrader:
 
     def execute_reversal(self, pos, exit_reason, spot=None):
         """After closing a position, open a reverse trade.
-        Works for both OI/IV exits and SL hits with confirmation.
+        v2.5: DISABLED — reversals net -Rs 7,468 combined on Feb 27 backtest.
+        CPR Reversal 0% WR, Gamma Blast Reversal net negative.
+        BUG: SELL reversal targets still at broken 0.1x/1.5x (never fixed in v2.4).
         """
+        return  # v2.5: Disabled
         try:
             symbol = pos['symbol']
             strategy = pos['strategy']
@@ -2362,10 +2334,10 @@ class PaperTrader:
 
             self.portfolio.update_position(pos['id'], current_premium)
 
-            # ---- TIME-BASED EXIT: Close stale positions (>4 hours with <5% profit) ----
-            if hours_held > 4:
+            # ---- TIME-BASED EXIT: Close stale positions (v2.5: >3 hours with <10% profit) ----
+            if hours_held > 3:  # v2.5: Reduced from 4 hours
                 profit_pct = (pos['unrealized_pnl'] / max(pos['entry_premium'] * pos['lot_size'], 1)) * 100
-                if abs(profit_pct) < 5:
+                if abs(profit_pct) < 10:  # v2.5: Raised from 5% — exit unless clearly profitable
                     logger.info(f"  TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only {profit_pct:.1f}% profit")
                     self.portfolio.close_position(pos['id'], current_premium, 'TIME_EXIT_NO_PROGRESS')
                     self._track_exit(pos, 'TIME_EXIT_NO_PROGRESS')
