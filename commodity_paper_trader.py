@@ -157,6 +157,7 @@ MCX_GST = 0.18
 MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)  # 11:30 PM
 COMMODITY_TRADE_START = dtime(9, 15)  # Commodity trades from 9:15 AM (no time barrier)
+MCX_LAST_ENTRY_TIME = dtime(22, 30)  # v2.5.2: No new entries after 10:30 PM (60 min before close)
 
 ANGEL_CRED_FILE = os.environ.get('ANGEL_CRED_FILE', r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt")
 
@@ -1420,20 +1421,37 @@ class CommodityPaperTrader:
                            f"& moving toward target. Holding despite OI={oi_change:.1f}%/IV={iv_change:.1f}%.")
                 return None, False
 
-        # Rule 1: OI surge (time-adaptive)
-        if oi_change > oi_threshold:
-            should_reverse = oi_change > MCX_OI_REVERSE_PCT
-            logger.info(f"  MCX_OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
-                       f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')})")
-            return 'OI_SURGE_EXIT', should_reverse
+        # v2.5.2: Get unrealized PnL for loss-only exits
+        unrealized_pnl = pos.get('unrealized_pnl', 0)
 
-        # Rule 2: IV spike (v2.4: strategy-adjusted)
+        # Rule 1: OI surge (time-adaptive) — v2.5.2: only exit when trade is LOSING
+        if oi_change > oi_threshold:
+            if unrealized_pnl >= -200:
+                logger.info(f"  MCX_OI_HOLD: {pos['id']} OI={oi_change:.1f}% > {oi_threshold:.0f}% "
+                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+            else:
+                should_reverse = oi_change > MCX_OI_REVERSE_PCT
+                logger.info(f"  MCX_OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
+                           f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
+                           f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')})")
+                return 'OI_SURGE_EXIT', should_reverse
+
+        # Rule 2: IV spike (v2.4: strategy-adjusted) — v2.5.2: skip on low-premium trades
         iv_threshold = MCX_IV_SPIKE_PCT * strat_mult['iv']
         if iv_change > iv_threshold:
-            should_reverse = iv_change > MCX_IV_REVERSE_PCT
-            logger.info(f"  MCX_IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
-                       f"(entry={entry_iv}%, current={current_iv}%)")
-            return 'IV_SPIKE_EXIT', should_reverse
+            entry_premium = pos.get('entry_premium', 0)
+            if entry_premium < 30:
+                logger.info(f"  MCX_IV_HOLD_LOW_PREM: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
+                           f"but entry premium Rs {entry_premium:.2f} < 30. Holding.")
+            elif unrealized_pnl >= -200:
+                logger.info(f"  MCX_IV_HOLD: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
+                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+            else:
+                should_reverse = iv_change > MCX_IV_REVERSE_PCT
+                logger.info(f"  MCX_IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
+                           f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
+                           f"(entry={entry_iv}%, current={current_iv}%)")
+                return 'IV_SPIKE_EXIT', should_reverse
 
         # Rule 3: Combined OI+IV
         if oi_change > MCX_OI_IV_COMBO_OI and iv_change > MCX_OI_IV_COMBO_IV:
@@ -1652,6 +1670,12 @@ class CommodityPaperTrader:
             logger.warning(f"  {len(signals)} signals found but MCX CLOSED - NOT executing")
             return
 
+        # v2.5.2: No new entries after 10:30 PM — trades need 60 min to develop
+        if datetime.now().time() > MCX_LAST_ENTRY_TIME:
+            logger.warning(f"  MCX_LATE_ENTRY_BLOCK: {len(signals)} signals at {datetime.now().strftime('%H:%M')} "
+                          f"after {MCX_LAST_ENTRY_TIME.strftime('%H:%M')} cutoff — skipping to avoid EOD force close")
+            return
+
         # Daily trade cap check
         if self.daily_trade_count >= MCX_MAX_TRADES_PER_DAY:
             logger.warning(f"  MCX_MAX_TRADES_REACHED: {self.daily_trade_count} trades today (limit {MCX_MAX_TRADES_PER_DAY}). Skipping all signals.")
@@ -1695,6 +1719,17 @@ class CommodityPaperTrader:
             if conflicting:
                 logger.info(f"  SKIP (conflicting): {sig['type']} conflicts with "
                            f"{conflicting[0]['signal_type']} on {sig['commodity']} {sig['strike']}")
+                skipped += 1
+                continue
+
+            # v2.5.2: Block opposite direction from SAME strategy on same commodity
+            opposite_dir = [p for p in self.portfolio.positions
+                           if p['commodity'] == sig['commodity']
+                           and p['strategy'] == sig['strategy']
+                           and (('CE' in p['signal_type']) != (opt_type == 'CE'))]
+            if opposite_dir:
+                logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['commodity']} {sig['type']} "
+                           f"— already holding {opposite_dir[0]['signal_type']} from same strategy")
                 skipped += 1
                 continue
 

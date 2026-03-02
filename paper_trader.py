@@ -126,6 +126,7 @@ STRATEGY_WEIGHTS = {
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 PRE_MARKET = dtime(9, 0)
+LAST_ENTRY_TIME = dtime(14, 30)  # v2.5.2: No new entries after 2:30 PM (need 50 min to develop)
 
 # Angel API config
 ANGEL_CRED_FILE = os.environ.get('ANGEL_CRED_FILE', r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt")
@@ -1652,6 +1653,12 @@ class PaperTrader:
             logger.warning(f"  {len(signals)} signals found but MARKET CLOSED - NOT executing")
             return
 
+        # v2.5.2: No new entries after 2:30 PM — trades need 50+ min to develop
+        if datetime.now().time() > LAST_ENTRY_TIME:
+            logger.warning(f"  LATE_ENTRY_BLOCK: {len(signals)} signals at {datetime.now().strftime('%H:%M')} "
+                          f"after {LAST_ENTRY_TIME.strftime('%H:%M')} cutoff — skipping to avoid EOD force close")
+            return
+
         # Daily trade cap check
         if self.daily_trade_count >= MAX_TRADES_PER_DAY:
             logger.warning(f"  MAX_TRADES_REACHED: {self.daily_trade_count} trades today (limit {MAX_TRADES_PER_DAY}). Skipping all signals.")
@@ -1697,6 +1704,18 @@ class PaperTrader:
             if conflicting:
                 logger.info(f"  SKIP (conflicting): {sig['type']} conflicts with "
                            f"{conflicting[0]['signal_type']} on {sig['symbol']} {sig['strike']}")
+                skipped += 1
+                continue
+
+            # v2.5.2: Block opposite direction from SAME strategy on same symbol
+            # e.g., Gamma Blast BUY_CE + Gamma Blast BUY_PE on NIFTY = hedged loss
+            opposite_dir = [p for p in self.portfolio.positions
+                           if p['symbol'] == sig['symbol']
+                           and p['strategy'] == sig['strategy']
+                           and (('CE' in p['signal_type']) != (opt_type == 'CE'))]  # opposite CE/PE
+            if opposite_dir:
+                logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['symbol']} {sig['type']} "
+                           f"— already holding {opposite_dir[0]['signal_type']} from same strategy")
                 skipped += 1
                 continue
 
@@ -2059,19 +2078,39 @@ class PaperTrader:
                            f"& moving toward target. Holding despite OI={oi_change:.1f}%/IV={iv_change:.1f}%.")
                 return None, False
 
-        # Rule 1: OI surge (time-adaptive)
-        if oi_change > oi_threshold:
-            should_reverse = oi_change > OI_REVERSE_PCT
-            logger.info(f"  OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
-                       f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')}). Reverse={should_reverse}")
-            return 'OI_SURGE_EXIT', should_reverse
+        # v2.5.2: Get unrealized PnL for loss-only exits
+        unrealized_pnl = pos.get('unrealized_pnl', 0)
 
-        # Rule 2: IV spike (BANKNIFTY-aware)
+        # Rule 1: OI surge (time-adaptive) — v2.5.2: only exit when trade is LOSING
+        if oi_change > oi_threshold:
+            if unrealized_pnl >= -200:
+                # Trade is flat or profitable — don't exit on OI noise
+                logger.info(f"  OI_HOLD: {pos['id']} OI={oi_change:.1f}% > {oi_threshold:.0f}% "
+                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+            else:
+                should_reverse = oi_change > OI_REVERSE_PCT
+                logger.info(f"  OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
+                           f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
+                           f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')}). Reverse={should_reverse}")
+                return 'OI_SURGE_EXIT', should_reverse
+
+        # Rule 2: IV spike (BANKNIFTY-aware) — v2.5.2: skip on low-premium trades
         if iv_change > iv_threshold:
-            should_reverse = iv_change > IV_REVERSE_PCT
-            logger.info(f"  IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
-                       f"(entry={entry_iv}%, current={current_iv}%, threshold={iv_threshold:.0f}%). Reverse={should_reverse}")
-            return 'IV_SPIKE_EXIT', should_reverse
+            entry_premium = pos.get('entry_premium', 0)
+            if entry_premium < 30:
+                # Low premium options have noisy IV — skip exit
+                logger.info(f"  IV_HOLD_LOW_PREM: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
+                           f"but entry premium Rs {entry_premium:.2f} < 30. Holding (noisy IV on cheap options).")
+            elif unrealized_pnl >= -200:
+                # Trade is flat or profitable — hold despite IV change
+                logger.info(f"  IV_HOLD: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
+                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+            else:
+                should_reverse = iv_change > IV_REVERSE_PCT
+                logger.info(f"  IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
+                           f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
+                           f"(entry={entry_iv}%, current={current_iv}%, threshold={iv_threshold:.0f}%). Reverse={should_reverse}")
+                return 'IV_SPIKE_EXIT', should_reverse
 
         # Rule 3: Combined OI+IV (lower thresholds, also VIX-adjusted)
         combo_oi = OI_IV_COMBO_OI * vix_mult
