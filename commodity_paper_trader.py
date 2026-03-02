@@ -61,7 +61,7 @@ COMMODITIES = {
     'CRUDEOILM': {
         'lot_size': 10, 'multiplier': 10, 'margin': 8000,
         'strike_interval': 50, 'vol_adj': 1.4,
-        'file': 'CRUDEOIL_spot_one_day_2000d.csv',  # Use standard data
+        'file': 'CRUDEOILM_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Crude Oil Mini (10 bbl)',
     },
     'GOLD': {
@@ -104,9 +104,11 @@ MAX_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
 MAX_POSITIONS_PER_COMMODITY = 3                         # Prevent cascade (e.g., 16 SILVERM trades)
 MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 30,000 (10% daily loss limit)
 
-# v2.4: Dynamic lot sizing for commodities
+# v2.5.3: Tiered lot sizing — scale lots by signal quality + available capital
 MCX_MAX_LOTS = {'GOLDM': 5, 'SILVERM': 3, 'CRUDEOILM': 5}
-MCX_STRONG_TRADE_MIN_SCORE = 60  # Only multi-lot on quality score >= 60
+MCX_LOT_TIER_ELITE = 80     # Score >= 80: allocate 30% of available capital
+MCX_LOT_TIER_STRONG = 60    # Score >= 60: allocate 20% of available capital
+MCX_LOT_TIER_STANDARD = 50  # Score >= 50: allocate 10% of available capital
 
 # Trailing Stop Loss Parameters (multi-phase for max profit capture)
 TSL_BREAKEVEN_TRIGGER_PCT = 30   # Phase 1: Lock breakeven when 30% of target reached
@@ -408,7 +410,7 @@ class CommodityPortfolio:
                 total_locked += p['entry_premium'] * p['lot_size'] * p['multiplier']
         available_capital = self.capital - total_locked
 
-        # v2.4: Dynamic lot sizing for commodities
+        # v2.5.3: Tiered lot sizing — scale lots by signal quality + available capital
         quality_score = (details or {}).get('quality_score', 0) if details else 0
         cost_per_lot = spec['margin'] if is_sell else entry_premium * base_lot * mult
 
@@ -416,13 +418,27 @@ class CommodityPortfolio:
         hwm = max(self.initial_capital, self.capital)
         dd_pct = (hwm - self.capital) / hwm * 100
 
-        # Determine number of lots
+        # Determine number of lots using tiered allocation
         max_lots_cap = MCX_MAX_LOTS.get(commodity, 3)
-        if quality_score >= MCX_STRONG_TRADE_MIN_SCORE and cost_per_lot > 0 and dd_pct <= 5:
-            affordable_lots = int(available_capital // cost_per_lot)
-            num_lots = max(1, min(affordable_lots, max_lots_cap))
-        else:
+        if dd_pct > 5 or cost_per_lot <= 0:
             num_lots = 1
+            tier_name = 'DD_CAP' if dd_pct > 5 else 'MIN'
+        elif quality_score >= MCX_LOT_TIER_ELITE:
+            capital_alloc = available_capital * 0.30  # Elite: 30%
+            num_lots = max(1, min(int(capital_alloc // cost_per_lot), max_lots_cap))
+            tier_name = 'ELITE'
+        elif quality_score >= MCX_LOT_TIER_STRONG:
+            capital_alloc = available_capital * 0.20  # Strong: 20%
+            num_lots = max(1, min(int(capital_alloc // cost_per_lot), max_lots_cap))
+            tier_name = 'STRONG'
+        else:
+            capital_alloc = available_capital * 0.10  # Standard: 10%
+            num_lots = max(1, min(int(capital_alloc // cost_per_lot), max_lots_cap))
+            tier_name = 'STANDARD'
+
+        logger.info(f"  MCX_LOT_TIER: {commodity} {strategy} score={quality_score} tier={tier_name} "
+                    f"lots={num_lots}/{max_lots_cap} cost/lot=Rs {cost_per_lot:,.0f} "
+                    f"avail=Rs {available_capital:,.0f} DD={dd_pct:.1f}%")
 
         lot = base_lot * num_lots
 

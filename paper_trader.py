@@ -61,9 +61,11 @@ MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
 MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
 MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
 
-# v2.4: Dynamic lot sizing
+# v2.5.3: Tiered lot sizing — scale lots by signal quality + available capital
 MAX_LOTS = {'NIFTY': 3, 'BANKNIFTY': 3, 'SENSEX': 4}  # Hard cap on lots per trade
-STRONG_TRADE_MIN_SCORE = 60  # Only multi-lot on quality score >= 60 (strong trades)
+LOT_TIER_ELITE = 80     # Score >= 80: allocate 30% of available capital
+LOT_TIER_STRONG = 60    # Score >= 60: allocate 20% of available capital
+LOT_TIER_STANDARD = 50  # Score >= 50: allocate 10% of available capital (MIN_SIGNAL_SCORE)
 
 # OI + IV Exit Thresholds (INCREASED — 15% was too aggressive, caused 82% premature exits)
 OI_SURGE_PCT = 35                # Exit if OI changes >35% from entry (was 15%)
@@ -670,7 +672,7 @@ class PaperPortfolio:
                     total_exposure += p['entry_premium'] * p['lot_size']
         available_capital = segment_capital - total_exposure
 
-        # v2.4: Dynamic lot sizing — scale up for strong trades when capital available
+        # v2.5.3: Tiered lot sizing — scale lots by signal quality + available capital
         quality_score = (details or {}).get('quality_score', 0) if details else 0
         if is_sell:
             cost_per_lot = MARGIN_PER_LOT.get(symbol, 120000)
@@ -681,13 +683,27 @@ class PaperPortfolio:
         equity_hwm = max(self.initial_capital, self.capital)
         current_dd_pct = (equity_hwm - self.capital) / equity_hwm * 100
 
-        # Determine number of lots
+        # Determine number of lots using tiered allocation
         max_lots_cap = MAX_LOTS.get(symbol, 2)
-        if quality_score >= STRONG_TRADE_MIN_SCORE and cost_per_lot > 0 and current_dd_pct <= 5:
-            affordable_lots = int(available_capital // cost_per_lot)
-            num_lots = max(1, min(affordable_lots, max_lots_cap))
-        else:
+        if current_dd_pct > 5 or cost_per_lot <= 0:
             num_lots = 1
+            tier_name = 'DD_CAP' if current_dd_pct > 5 else 'MIN'
+        elif quality_score >= LOT_TIER_ELITE:
+            capital_alloc = available_capital * 0.30  # Elite: 30%
+            num_lots = max(1, min(int(capital_alloc // cost_per_lot), max_lots_cap))
+            tier_name = 'ELITE'
+        elif quality_score >= LOT_TIER_STRONG:
+            capital_alloc = available_capital * 0.20  # Strong: 20%
+            num_lots = max(1, min(int(capital_alloc // cost_per_lot), max_lots_cap))
+            tier_name = 'STRONG'
+        else:
+            capital_alloc = available_capital * 0.10  # Standard: 10%
+            num_lots = max(1, min(int(capital_alloc // cost_per_lot), max_lots_cap))
+            tier_name = 'STANDARD'
+
+        logger.info(f"  LOT_TIER: {symbol} {strategy} score={quality_score} tier={tier_name} "
+                    f"lots={num_lots}/{max_lots_cap} cost/lot=Rs {cost_per_lot:,.0f} "
+                    f"avail=Rs {available_capital:,.0f} DD={current_dd_pct:.1f}%")
 
         lot_size = base_lot * num_lots
 
