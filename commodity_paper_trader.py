@@ -91,7 +91,9 @@ COMMODITIES = {
 }
 
 # For paper trading with Rs 3L, focus on affordable mini contracts
-PAPER_TRADE_COMMODITIES = ['GOLDM', 'SILVERM', 'CRUDEOILM']
+# v2.5.2: Removed SILVERM — premium Rs 18K × lot 5 × mult 5 = Rs 450K+ per trade,
+# far exceeds Rs 75K per-trade limit. Needs Rs 15L+ capital to trade.
+PAPER_TRADE_COMMODITIES = ['GOLDM', 'CRUDEOILM']
 
 # ====================================================================
 # CAPITAL & RISK MANAGEMENT FOR COMMODITY TRADING
@@ -620,29 +622,53 @@ class CommodityStrategyEngine:
         return None
 
     def _download_historical_commodity(self, commodity, save_path):
-        """Download daily OHLC data from Angel SmartAPI for MCX commodity."""
+        """Download daily OHLC data from Angel SmartAPI for MCX commodity.
+        v2.5.2: If current-month futures token has no data (just rolled),
+        try next-month token from instrument master as fallback.
+        """
         try:
-            # Use the futures token from angel connection
             token = self.angel._futures_tokens.get(commodity)
             if not token:
                 logger.warning(f"No futures token for {commodity}, skipping download")
                 return
 
-            logger.info(f"Downloading historical data for {commodity} (token={token})...")
-            all_data = []
-            chunk_start = datetime.now() - timedelta(days=2000)
+            # v2.5.2: Collect all futures tokens for this commodity (current + next months)
+            tokens_to_try = [token]
+            try:
+                master_path = os.path.join(DATA_DIR, 'instrument_master.csv')
+                if os.path.exists(master_path):
+                    import csv
+                    with open(master_path, 'r') as f:
+                        reader = csv.reader(f)
+                        for row in reader:
+                            if len(row) >= 7 and row[1].startswith(commodity) and 'FUT' in row[1] and row[6] == 'FUTCOM':
+                                t = row[0]
+                                if t not in tokens_to_try:
+                                    tokens_to_try.append(t)
+            except Exception:
+                pass
 
-            while chunk_start < datetime.now():
-                chunk_end = min(chunk_start + timedelta(days=500), datetime.now())
-                data = self.angel.get_historical(
-                    'MCX', token, 'ONE_DAY',
-                    chunk_start.strftime('%Y-%m-%d 09:00'),
-                    chunk_end.strftime('%Y-%m-%d 23:30')
-                )
-                if data:
-                    all_data.extend(data)
-                chunk_start = chunk_end + timedelta(days=1)
-                time.sleep(2)  # v2.5.1: Increased from 0.5s to 2s to avoid rate limiting
+            all_data = []
+            for try_token in tokens_to_try:
+                logger.info(f"Downloading historical data for {commodity} (token={try_token})...")
+                chunk_start = datetime.now() - timedelta(days=2000)
+                while chunk_start < datetime.now():
+                    chunk_end = min(chunk_start + timedelta(days=500), datetime.now())
+                    data = self.angel.get_historical(
+                        'MCX', try_token, 'ONE_DAY',
+                        chunk_start.strftime('%Y-%m-%d 09:00'),
+                        chunk_end.strftime('%Y-%m-%d 23:30')
+                    )
+                    if data:
+                        all_data.extend(data)
+                    chunk_start = chunk_end + timedelta(days=1)
+                    time.sleep(2)
+
+                if all_data:
+                    logger.info(f"Got {len(all_data)} rows from token {try_token}")
+                    break  # Found data, stop trying other tokens
+                else:
+                    logger.info(f"Token {try_token} returned no data, trying next...")
 
             if all_data:
                 df = pd.DataFrame(all_data, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])
@@ -650,7 +676,7 @@ class CommodityStrategyEngine:
                 df.to_csv(save_path, index=False)
                 logger.info(f"Downloaded {len(df)} days for {commodity} → {save_path}")
             else:
-                logger.warning(f"No data returned from Angel API for {commodity}")
+                logger.warning(f"No data returned from Angel API for {commodity} (tried {len(tokens_to_try)} tokens)")
         except Exception as e:
             logger.error(f"Download failed for {commodity}: {e}")
 
@@ -1186,6 +1212,7 @@ class CommodityPaperTrader:
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         # Caches to reduce REST API calls
         self._option_ltp_cache = {}  # {cache_key: {'ltp': float, 'time': datetime}}
+        self._ohlc_cache = {}  # v2.5.2: {commodity: {'data': ohlc_dict, 'time': datetime}}
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
@@ -1220,6 +1247,51 @@ class CommodityPaperTrader:
         df = self.engine.historical_data.get(commodity)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
+        return None
+
+    def get_intraday_ohlc(self, commodity):
+        """v2.5.2: Get today's intraday OHLC from 5-min candles (like equity does).
+        Without this, Gamma Blast never fires (body = spot - open = 0 always).
+        Cached for 60s to avoid rate limiting.
+        """
+        token = self.angel._futures_tokens.get(commodity)
+        if not token:
+            return None
+
+        # Check cache (60-second TTL)
+        cached = self._ohlc_cache.get(commodity)
+        if cached and (datetime.now() - cached['time']).total_seconds() < 60:
+            return cached['data']
+
+        try:
+            today = datetime.now()
+            from_date = today.strftime('%Y-%m-%d 09:00')
+            to_date = today.strftime('%Y-%m-%d %H:%M')
+            data = self.angel.get_historical(
+                'MCX', token, 'FIVE_MINUTE', from_date, to_date
+            )
+            if data:
+                opens = [c[1] for c in data]
+                highs = [c[2] for c in data]
+                lows = [c[3] for c in data]
+                closes = [c[4] for c in data]
+                volumes = [c[5] for c in data]
+                ohlc = {
+                    'open': opens[0],
+                    'high': max(highs),
+                    'low': min(lows),
+                    'close': closes[-1],
+                    'volume': sum(volumes),
+                }
+                self._ohlc_cache[commodity] = {'data': ohlc, 'time': datetime.now()}
+                return ohlc
+        except Exception as e:
+            logger.error(f"MCX intraday OHLC error for {commodity}: {e}")
+
+        # Fallback: use spot for all (old behavior)
+        spot = self.get_spot(commodity)
+        if spot:
+            return {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0}
         return None
 
     def _get_commodity_option_ltp(self, pos):
@@ -1622,8 +1694,12 @@ class CommodityPaperTrader:
                 logger.warning(f"  No spot data for {commodity}")
                 continue
 
-            ohlc = {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0}
-            logger.info(f"  Spot: {spot:,.2f}")
+            # v2.5.2: Fetch real intraday OHLC (enables Gamma Blast signals)
+            ohlc = self.get_intraday_ohlc(commodity)
+            if not ohlc:
+                ohlc = {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0}
+            logger.info(f"  Spot: {spot:,.2f} | O: {ohlc['open']:,.2f} H: {ohlc['high']:,.2f} "
+                       f"L: {ohlc['low']:,.2f} C: {ohlc['close']:,.2f}")
 
             indicators = self.engine.compute_indicators(commodity, ohlc)
             if not indicators:
