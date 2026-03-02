@@ -641,7 +641,7 @@ class CommodityStrategyEngine:
                 if data:
                     all_data.extend(data)
                 chunk_start = chunk_end + timedelta(days=1)
-                time.sleep(0.5)  # Rate limit between API calls
+                time.sleep(2)  # v2.5.1: Increased from 0.5s to 2s to avoid rate limiting
 
             if all_data:
                 df = pd.DataFrame(all_data, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])

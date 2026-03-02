@@ -74,7 +74,7 @@ def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_pric
 
     instance_line = ""
     if instance_id:
-        label = '☁️ GCloud VM' if instance_id == 'gcloud' else '🖥️ Local Machine'
+        label = '☁️ Vultr VPS' if instance_id == 'vultr' else '🖥️ Local Machine'
         instance_line = f"<b>📍 Instance:</b> {label}\n"
 
     msg = (
@@ -119,7 +119,7 @@ def notify_trade_exit(market, strategy, symbol, signal_type, strike,
 
     instance_line = ""
     if instance_id:
-        label = '☁️ GCloud VM' if instance_id == 'gcloud' else '🖥️ Local Machine'
+        label = '☁️ Vultr VPS' if instance_id == 'vultr' else '🖥️ Local Machine'
         instance_line = f"<b>📍 Instance:</b> {label}\n"
 
     msg = (
@@ -189,7 +189,7 @@ def notify_scanner_start(instance_id=None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if instance_id:
-        label = '☁️ GCloud VM' if instance_id == 'gcloud' else '🖥️ Local Machine'
+        label = '☁️ Vultr VPS' if instance_id == 'vultr' else '🖥️ Local Machine'
         instance_line = f"<b>📍 Running on:</b> {label}\n"
         warning_line = f"⚠️ Ensure the other instance is STOPPED to avoid duplicate trades!\n"
     else:

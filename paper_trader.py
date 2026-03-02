@@ -116,10 +116,12 @@ TSL_TIGHT_TRIGGER_PCT = 100      # Phase 3: Tighter trail once past target
 TSL_TIGHT_DISTANCE_PCT = 15      # Phase 3 trail: 15% below peak (capture max profit)
 
 # Strategy weights from backtest (Sharpe-weighted)
+# v3.1: PCR+VWAP promoted to main strategy (Survivor halted — redistributed allocation)
 STRATEGY_WEIGHTS = {
-    'CPR': 0.88,          # 87.9% allocation (dominant)
-    'Gamma Blast': 0.094, # 9.4%
-    'Ghost Zone': 0.026,  # 2.7%
+    'CPR': 0.55,          # 55% allocation (still dominant, reduced from 80%)
+    'Gamma Blast': 0.09,  # 9%
+    'Ghost Zone': 0.03,   # 3%
+    'PCR+VWAP': 0.33,    # 33% — promoted to main strategy (was 8%)
 }
 
 # Market hours (IST)
@@ -219,13 +221,33 @@ def greeks_from_market_price(market_price, S, K, T, r, opt_type='CE'):
 
 
 def calc_costs(premium, qty, is_sell=False):
-    """Real trading costs."""
+    """Real trading costs (backward compatible)."""
     turnover = premium * qty
     brokerage = BROKERAGE * 2
     stt = turnover * STT_SELL if is_sell else 0
     exchange = turnover * EXCHANGE_CHARGES
     gst = brokerage * GST_RATE
     return brokerage + stt + exchange + gst
+
+
+def calc_costs_detailed(premium, qty, is_sell=False, slippage_amount=0):
+    """Detailed cost breakdown including slippage.
+    Returns dict: {brokerage, stt, exchange, gst, slippage, total}
+    """
+    turnover = premium * qty
+    brokerage = BROKERAGE * 2
+    stt = turnover * STT_SELL if is_sell else 0
+    exchange = turnover * EXCHANGE_CHARGES
+    gst = brokerage * GST_RATE
+    total = brokerage + stt + exchange + gst + slippage_amount
+    return {
+        'brokerage': round(brokerage, 2),
+        'stt': round(stt, 2),
+        'exchange': round(exchange, 2),
+        'gst': round(gst, 2),
+        'slippage': round(slippage_amount, 2),
+        'total': round(total, 2),
+    }
 
 
 def passes_profit_filter(premium, lot_size, target_multiplier, is_sell=False):
@@ -321,7 +343,7 @@ def compute_signal_score(signal, spot, indicators, vix=None):
             score += 5
 
     # 5. PCR CONFIRMATION (0-15)
-    pcr = indicators.get('pcr', 1.0)
+    pcr = indicators.get('pcr') or 1.0  # Default to neutral if None
     if is_buy:
         if (is_ce and pcr > 1.0) or (not is_ce and pcr < 1.0):
             score += 15
@@ -335,6 +357,26 @@ def compute_signal_score(signal, spot, indicators, vix=None):
         else:
             score += 8
 
+    # 6. PCR+VWAP STRATEGY BONUS (0-10): reward strong PCR divergence + VWAP proximity
+    # v3.1: Ensures PCR+VWAP signals get fair multi-lot scoring (promoted to main strategy)
+    strategy = signal.get('strategy', '')
+    if strategy == 'PCR+VWAP' and pcr is not None:
+        pcr_strength = abs(pcr - 1.0)  # Distance from neutral
+        vwap = indicators.get('vwap')
+        if pcr_strength > 0.30:      # PCR > 1.30 or < 0.70 = very strong
+            score += 10
+        elif pcr_strength > 0.20:    # PCR > 1.20 or < 0.80 = strong
+            score += 7
+        elif pcr_strength > 0.10:    # PCR > 1.10 or < 0.90 = moderate
+            score += 4
+        # VWAP proximity bonus (tighter = better setup)
+        if vwap and vwap > 0 and spot > 0:
+            vwap_dist_pct = abs(spot - vwap) / spot * 100
+            if vwap_dist_pct < 0.1:    # Within 0.1% of VWAP = excellent
+                score += 5
+            elif vwap_dist_pct < 0.3:  # Within 0.3%
+                score += 3
+
     return min(score, 100)
 
 
@@ -344,6 +386,12 @@ def compute_signal_score(signal, spot, indicators, vix=None):
 class AngelConnection:
     """Manages Angel One SmartAPI connection."""
 
+    INDEX_TOKENS = {
+        'NIFTY': ('NSE', '99926000'),
+        'BANKNIFTY': ('NSE', '99926009'),
+        'SENSEX': ('BSE', '99919000'),
+    }
+
     def __init__(self):
         self.obj = None
         self.session = None
@@ -351,6 +399,9 @@ class AngelConnection:
         self._connected = False
         self._last_api_call = 0  # Timestamp of last REST API call
         self._api_min_interval = 0.5  # Minimum 500ms between REST calls
+        self._option_chain_cache = {}  # symbol -> {'data': ..., 'time': ...}
+        self._pcr_cache = {'data': None, 'time': 0}
+        self._vwap_cache = {}  # symbol -> {'data': ..., 'time': ...}
 
     def load_credentials(self):
         """Load Angel credentials."""
@@ -557,6 +608,307 @@ class AngelConnection:
         if len(matches) > 0:
             return matches.iloc[0].to_dict()
         return None
+
+    # ------------------------------------------------------------------
+    # Real-time data fetchers (Angel SmartAPI live market data)
+    # ------------------------------------------------------------------
+
+    def _get_nearest_expiry(self, symbol):
+        """Find nearest weekly expiry date string in 'DDMONYYYY' format for option chain API."""
+        if self.instruments is None:
+            self.load_instruments()
+        exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
+        mask = (
+            (self.instruments['name'] == symbol) &
+            (self.instruments['exch_seg'] == exchange) &
+            (self.instruments['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))
+        )
+        matches = self.instruments[mask]
+        if len(matches) == 0:
+            return None
+        try:
+            today = datetime.now().date()
+            matches = matches.copy()
+            matches['expiry_date'] = pd.to_datetime(matches['expiry'], format='mixed', dayfirst=True)
+            future = matches[matches['expiry_date'].dt.date >= today]
+            if len(future) == 0:
+                return None
+            nearest = future['expiry_date'].min()
+            # Angel API expects format like "28FEB2026"
+            return nearest.strftime('%d%b%Y').upper()
+        except Exception as e:
+            logger.error(f"Nearest expiry lookup failed for {symbol}: {e}")
+            return None
+
+    def fetch_option_chain(self, symbol):
+        """Fetch full option chain via Angel optionGreek() API.
+
+        Returns list of option data dicts or None.
+        Caches for 120 seconds per symbol.
+        """
+        if not self._connected:
+            return None
+
+        # Check cache
+        now = time.time()
+        cached = self._option_chain_cache.get(symbol)
+        if cached and (now - cached['time']) < 120:
+            return cached['data']
+
+        # Map symbol name for the API
+        name_map = {'NIFTY': 'NIFTY', 'BANKNIFTY': 'BANKNIFTY', 'SENSEX': 'SENSEX'}
+        api_name = name_map.get(symbol)
+        if not api_name:
+            logger.error(f"fetch_option_chain: unsupported symbol {symbol}")
+            return None
+
+        expiry = self._get_nearest_expiry(symbol)
+        if not expiry:
+            logger.error(f"fetch_option_chain: no expiry found for {symbol}")
+            return None
+
+        try:
+            self._throttle()
+            resp = self.obj.optionGreek({
+                "name": api_name,
+                "expirydate": expiry
+            })
+            if resp and resp.get('data'):
+                chain = resp['data']
+                self._option_chain_cache[symbol] = {'data': chain, 'time': now}
+                return chain
+            else:
+                logger.error(f"fetch_option_chain: empty response for {symbol}")
+        except Exception as e:
+            logger.error(f"fetch_option_chain error ({symbol}): {e}")
+        return None
+
+    def fetch_real_pcr(self, symbol):
+        """Fetch real-time PCR from Angel putCallRatio() API.
+
+        Returns float PCR value for the given symbol, or None.
+        Caches for 120 seconds.
+        """
+        if not self._connected:
+            return None
+
+        # Check cache
+        now = time.time()
+        if self._pcr_cache['data'] is not None and (now - self._pcr_cache['time']) < 120:
+            pcr_data = self._pcr_cache['data']
+        else:
+            # Fetch fresh data
+            try:
+                self._throttle()
+                resp = self.obj.putCallRatio()
+                if resp and resp.get('data'):
+                    pcr_data = resp['data']
+                    self._pcr_cache = {'data': pcr_data, 'time': now}
+                else:
+                    logger.error("fetch_real_pcr: empty response")
+                    return None
+            except Exception as e:
+                logger.error(f"fetch_real_pcr error: {e}")
+                return None
+
+        # Parse symbol-specific PCR from the response list
+        try:
+            if isinstance(pcr_data, list):
+                name_map = {'NIFTY': 'NIFTY', 'BANKNIFTY': 'BANKNIFTY', 'SENSEX': 'SENSEX'}
+                target = name_map.get(symbol, symbol)
+                for entry in pcr_data:
+                    # Angel API uses 'tradingSymbol' key (e.g., 'NIFTY30MAR26FUT')
+                    entry_name = (entry.get('tradingSymbol', '')
+                                  or entry.get('name', '')
+                                  or entry.get('symbol', ''))
+                    if target.upper() in entry_name.upper():
+                        pcr_val = entry.get('pcr') or entry.get('putCallRatio')
+                        if pcr_val is not None:
+                            return float(pcr_val)
+            elif isinstance(pcr_data, dict):
+                pcr_val = pcr_data.get('pcr') or pcr_data.get('putCallRatio')
+                if pcr_val is not None:
+                    return float(pcr_val)
+        except Exception as e:
+            logger.error(f"fetch_real_pcr parse error ({symbol}): {e}")
+        return None
+
+    def fetch_intraday_vwap(self, symbol):
+        """Compute intraday VWAP from 5-minute candles via get_historical().
+
+        Uses INDEX_TOKENS for spot data. Since index spot candles have
+        Volume=0, falls back to a range-weighted proxy:
+            VWAP ~ cumsum(typical_price * range) / cumsum(range)
+        where range = high - low per candle.
+
+        Returns float VWAP or None. Caches for 60 seconds.
+        """
+        if not self._connected:
+            return None
+
+        # Check cache
+        now = time.time()
+        cached = self._vwap_cache.get(symbol)
+        if cached and (now - cached['time']) < 60:
+            return cached['data']
+
+        token_info = self.INDEX_TOKENS.get(symbol)
+        if not token_info:
+            logger.error(f"fetch_intraday_vwap: no token for {symbol}")
+            return None
+
+        exchange, token = token_info
+        today = datetime.now()
+        from_date = today.replace(hour=9, minute=15, second=0).strftime('%Y-%m-%d %H:%M')
+        to_date = today.strftime('%Y-%m-%d %H:%M')
+
+        try:
+            candles = self.get_historical(exchange, token, 'FIVE_MINUTE', from_date, to_date)
+            if not candles or len(candles) == 0:
+                logger.error(f"fetch_intraday_vwap: no candles for {symbol}")
+                return None
+
+            # Candle format: [timestamp, open, high, low, close, volume]
+            highs = np.array([float(c[2]) for c in candles])
+            lows = np.array([float(c[3]) for c in candles])
+            closes = np.array([float(c[4]) for c in candles])
+            volumes = np.array([float(c[5]) for c in candles])
+            typical = (highs + lows + closes) / 3.0
+
+            total_vol = np.sum(volumes)
+            if total_vol > 0:
+                # Standard VWAP with real volume
+                vwap = np.sum(typical * volumes) / total_vol
+            else:
+                # Index spot: volume is 0, use range proxy
+                ranges = highs - lows
+                ranges = np.where(ranges < 0.01, 0.01, ranges)  # avoid zero
+                total_range = np.sum(ranges)
+                if total_range > 0:
+                    vwap = np.sum(typical * ranges) / total_range
+                else:
+                    vwap = float(closes[-1])
+
+            vwap = float(round(vwap, 2))
+            self._vwap_cache[symbol] = {'data': vwap, 'time': now}
+            return vwap
+        except Exception as e:
+            logger.error(f"fetch_intraday_vwap error ({symbol}): {e}")
+        return None
+
+    def fetch_real_atm_iv(self, symbol, spot):
+        """Get ATM implied volatility from the option chain.
+
+        Finds the ATM strike nearest to spot and returns its IV as a
+        decimal (e.g. 0.15 for 15% IV). Uses STRIKE_INTERVALS for
+        rounding: NIFTY=50, BANKNIFTY=100, SENSEX=100.
+
+        Returns float IV or None.
+        """
+        if not self._connected:
+            return None
+
+        try:
+            chain = self.fetch_option_chain(symbol)
+            if not chain:
+                return None
+
+            interval = STRIKE_INTERVALS.get(symbol, 50)
+            atm_strike = round(spot / interval) * interval
+
+            # Search chain for the ATM strike — check both CE and PE,
+            # average their IV for a cleaner read
+            ivs = []
+            for opt in chain:
+                strike_val = float(opt.get('strikePrice', 0) or opt.get('strike', 0))
+                if abs(strike_val - atm_strike) < 0.01:
+                    iv = opt.get('impliedVolatility') or opt.get('iv')
+                    if iv is not None:
+                        iv_f = float(iv)
+                        # API may return percentage (e.g. 15.3) or decimal (0.153)
+                        if iv_f > 1.0:
+                            iv_f = iv_f / 100.0
+                        ivs.append(iv_f)
+
+            if ivs:
+                return float(round(np.mean(ivs), 4))
+
+            logger.error(f"fetch_real_atm_iv: ATM strike {atm_strike} not found in chain for {symbol}")
+        except Exception as e:
+            logger.error(f"fetch_real_atm_iv error ({symbol}, spot={spot}): {e}")
+        return None
+
+    def find_best_strike(self, symbol, spot, opt_type, chain=None):
+        """Find best strike for trading using real option chain data.
+
+        For CE: picks ATM or 1-strike slightly ITM (below spot).
+        For PE: picks ATM or 1-strike slightly ITM (above spot).
+        Returns (strike, chain_data_dict) with real Greeks, bid, ask, LTP
+        from the chain, or (None, None) if unavailable.
+        """
+        if not self._connected:
+            return None, None
+
+        try:
+            if chain is None:
+                chain = self.fetch_option_chain(symbol)
+            if not chain:
+                return None, None
+
+            interval = STRIKE_INTERVALS.get(symbol, 50)
+            atm_strike = round(spot / interval) * interval
+
+            # Determine target strikes: ATM and 1-strike ITM
+            if opt_type == 'CE':
+                # For CE, ITM means strike < spot → ATM or one step below
+                candidates = [atm_strike, atm_strike - interval]
+            else:
+                # For PE, ITM means strike > spot → ATM or one step above
+                candidates = [atm_strike, atm_strike + interval]
+
+            # Filter chain for the given opt_type
+            type_key = opt_type.upper()
+            filtered = []
+            for opt in chain:
+                opt_type_val = (
+                    opt.get('optionType', '') or
+                    opt.get('option_type', '') or
+                    opt.get('type', '')
+                ).upper()
+                if type_key in opt_type_val:
+                    filtered.append(opt)
+
+            # Find best match among candidates
+            best = None
+            best_strike = None
+            for target_strike in candidates:
+                for opt in filtered:
+                    strike_val = float(opt.get('strikePrice', 0) or opt.get('strike', 0))
+                    if abs(strike_val - target_strike) < 0.01:
+                        ltp = float(opt.get('ltp', 0) or opt.get('lastPrice', 0) or 0)
+                        # Prefer strikes with non-zero LTP (liquid)
+                        if ltp > 0:
+                            best = opt
+                            best_strike = target_strike
+                            break
+                if best is not None:
+                    break
+
+            # Fallback: if no liquid candidate, take ATM regardless
+            if best is None:
+                for opt in filtered:
+                    strike_val = float(opt.get('strikePrice', 0) or opt.get('strike', 0))
+                    if abs(strike_val - atm_strike) < 0.01:
+                        best = opt
+                        best_strike = atm_strike
+                        break
+
+            if best is not None:
+                return best_strike, best
+            return None, None
+        except Exception as e:
+            logger.error(f"find_best_strike error ({symbol}, {opt_type}, spot={spot}): {e}")
+        return None, None
 
     def get_pcr(self):
         """Get market PCR."""
@@ -785,22 +1137,58 @@ class PaperPortfolio:
                 return pos
         return None
 
-    def close_position(self, pos_id, exit_premium, reason=''):
-        """Close a paper position."""
+    def close_position(self, pos_id, exit_premium, reason='', exit_bid=None, exit_ask=None):
+        """Close a paper position with detailed cost breakdown."""
         for i, pos in enumerate(self.positions):
             if pos['id'] == pos_id:
-                exit_cost = calc_costs(exit_premium, pos['lot_size'], not pos['is_sell'])
+                # Compute exit slippage from bid-ask if available
+                exit_slippage = 0
+                if exit_bid and exit_ask and exit_bid > 0 and exit_ask > 0:
+                    mid = (exit_bid + exit_ask) / 2
+                    # BUY position closes by selling → fills at bid
+                    # SELL position closes by buying → fills at ask
+                    if pos['is_sell']:
+                        slipped = exit_ask
+                    else:
+                        slipped = exit_bid
+                    exit_slippage = abs(slipped - mid) * pos['lot_size']
+
+                # Total slippage (entry + exit)
+                entry_slippage = pos.get('details', {}).get('entry_slippage', 0)
+                total_slippage = entry_slippage + exit_slippage
+
+                # Detailed cost breakdown
+                exit_cost_detail = calc_costs_detailed(
+                    exit_premium, pos['lot_size'], not pos['is_sell'], exit_slippage
+                )
+                entry_cost_raw = pos['entry_cost']
+
+                # Gross PnL (before any costs)
                 if pos['is_sell']:
-                    pnl = (pos['entry_premium'] - exit_premium) * pos['lot_size']
+                    gross_pnl = (pos['entry_premium'] - exit_premium) * pos['lot_size']
                 else:
-                    pnl = (exit_premium - pos['entry_premium']) * pos['lot_size']
-                pnl -= (pos['entry_cost'] + exit_cost)
+                    gross_pnl = (exit_premium - pos['entry_premium']) * pos['lot_size']
+
+                # Net PnL = Gross - entry cost - exit cost (exit cost includes exit slippage)
+                entry_cost_with_slip = entry_cost_raw + entry_slippage
+                net_pnl = gross_pnl - entry_cost_with_slip - exit_cost_detail['total']
 
                 trade = {
                     **pos,
                     'exit_premium': round(exit_premium, 2),
-                    'exit_cost': round(exit_cost, 2),
-                    'pnl': round(pnl, 2),
+                    'exit_cost': round(exit_cost_detail['total'], 2),
+                    'gross_pnl': round(gross_pnl, 2),
+                    'pnl': round(net_pnl, 2),
+                    'total_slippage': round(total_slippage, 2),
+                    'cost_breakdown': {
+                        'entry_brokerage': round(entry_cost_raw, 2),
+                        'entry_slippage': round(entry_slippage, 2),
+                        'exit_brokerage': round(exit_cost_detail['brokerage'], 2),
+                        'exit_stt': round(exit_cost_detail['stt'], 2),
+                        'exit_exchange': round(exit_cost_detail['exchange'], 2),
+                        'exit_gst': round(exit_cost_detail['gst'], 2),
+                        'exit_slippage': round(exit_slippage, 2),
+                    },
                     'exit_reason': reason,
                     'exit_time': datetime.now().isoformat(),
                     'status': 'CLOSED'
@@ -809,13 +1197,18 @@ class PaperPortfolio:
                 self.positions.pop(i)
 
                 today = datetime.now().strftime('%Y-%m-%d')
-                self.daily_pnl[today] = self.daily_pnl.get(today, 0) + pnl
-                self.capital += pnl
-                trade['capital_after'] = round(self.capital, 2)  # v2.4
+                self.daily_pnl[today] = self.daily_pnl.get(today, 0) + net_pnl
+                self.capital += net_pnl
+                trade['capital_after'] = round(self.capital, 2)
 
+                total_costs = entry_cost_with_slip + exit_cost_detail['total']
                 logger.info(f"  CLOSED: {pos['signal_type']} {pos['symbol']} {pos['strike']} "
-                           f"| Entry: Rs {pos['entry_premium']:.2f} Exit: Rs {exit_premium:.2f} "
-                           f"| PnL: Rs {pnl:,.2f} | Reason: {reason} | Capital: Rs {self.capital:,.0f}")
+                           f"| Entry: Rs {pos['entry_premium']:.2f} Exit: Rs {exit_premium:.2f}")
+                logger.info(f"    Gross: Rs {gross_pnl:,.0f} | Bkge: {entry_cost_raw + exit_cost_detail['brokerage']:.0f} "
+                           f"| STT: {exit_cost_detail['stt']:.0f} | Exch: {exit_cost_detail['exchange']:.0f} "
+                           f"| GST: {exit_cost_detail['gst']:.0f} | Slip: {total_slippage:.0f} "
+                           f"| NET: Rs {net_pnl:,.0f}")
+                logger.info(f"    Reason: {reason} | Capital: Rs {self.capital:,.0f}")
 
                 self.save_state()
                 return trade
@@ -926,7 +1319,10 @@ class StrategyEngine:
         try:
             # Well-known Angel One tokens for indices
             token_map = {'NIFTY': '99926000', 'BANKNIFTY': '99926009', 'SENSEX': '99919000'}
+            # v2.5.1: SENSEX is on BSE, not NSE
+            exchange_map = {'NIFTY': 'NSE', 'BANKNIFTY': 'NSE', 'SENSEX': 'BSE'}
             token = token_map.get(symbol)
+            exchange = exchange_map.get(symbol, 'NSE')
 
             if not token:
                 # Fallback: look up from instrument master
@@ -935,7 +1331,7 @@ class StrategyEngine:
                 if self.angel.instruments is not None:
                     nse_df = self.angel.instruments[
                         (self.angel.instruments['name'] == symbol) &
-                        (self.angel.instruments['exch_seg'] == 'NSE')
+                        (self.angel.instruments['exch_seg'] == exchange)
                     ]
                     if len(nse_df) > 0:
                         token = str(nse_df.iloc[0]['token'])
@@ -944,21 +1340,21 @@ class StrategyEngine:
                 logger.warning(f"Could not find Angel token for {symbol}, skipping download")
                 return
 
-            logger.info(f"Downloading historical data for {symbol} (token={token})...")
+            logger.info(f"Downloading historical data for {symbol} (token={token}, exchange={exchange})...")
             all_data = []
             chunk_start = datetime.now() - timedelta(days=2000)
 
             while chunk_start < datetime.now():
                 chunk_end = min(chunk_start + timedelta(days=500), datetime.now())
                 data = self.angel.get_historical(
-                    'NSE', token, 'ONE_DAY',
+                    exchange, token, 'ONE_DAY',  # v2.5.1: Use correct exchange per symbol
                     chunk_start.strftime('%Y-%m-%d 09:15'),
                     chunk_end.strftime('%Y-%m-%d 15:30')
                 )
                 if data:
                     all_data.extend(data)
                 chunk_start = chunk_end + timedelta(days=1)
-                time.sleep(0.5)  # Rate limit between API calls
+                time.sleep(2)  # v2.5.1: Increased from 0.5s to 2s to avoid rate limiting
 
             if all_data:
                 df = pd.DataFrame(all_data, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])
@@ -970,8 +1366,15 @@ class StrategyEngine:
         except Exception as e:
             logger.error(f"Download failed for {symbol}: {e}")
 
-    def compute_indicators(self, symbol, current_ohlc=None):
-        """Compute all indicators needed for strategies."""
+    def compute_indicators(self, symbol, current_ohlc=None,
+                            real_pcr=None, real_iv=None, real_vwap=None):
+        """Compute all indicators needed for strategies.
+        Args:
+            real_pcr: Real PCR from Angel putCallRatio() API, or None
+            real_iv: Real ATM IV from Angel optionGreek() API, or None
+            real_vwap: Real intraday VWAP from Angel 5-min candles, or None
+        If real data is None, the indicator is set to None (not proxied).
+        """
         df = self.historical_data.get(symbol)
         if df is None:
             df = self.load_historical(symbol)
@@ -996,22 +1399,18 @@ class StrategyEngine:
         # ATR
         atr = (df['High'].tail(14) - df['Low'].tail(14)).mean()
 
-        # Historical Volatility
+        # Historical Volatility (always compute for fallback reference)
         log_ret = np.log(df['Close'] / df['Close'].shift(1))
         hv = log_ret.tail(20).std() * np.sqrt(252)
-        iv = max(min(hv * 1.15, 0.60), 0.08)
 
-        # VWAP (rolling 5-day)
-        if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
-            tp = (df['High'] + df['Low'] + df['Close']) / 3
-            vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
-        else:
-            vwap = (df['High'].tail(5) + df['Low'].tail(5) + df['Close'].tail(5)).mean() / 3
+        # IV: Use real Angel API data if available, otherwise None (no proxy)
+        iv = real_iv if real_iv is not None else None
 
-        # PCR proxy
-        close_chg = df['Close'].pct_change()
-        pcr_proxy = 1 + (close_chg.tail(5).mean() * 10)
-        pcr_proxy = max(0.5, min(2.0, pcr_proxy))
+        # VWAP: Use real intraday VWAP from Angel API if available, otherwise None
+        vwap = real_vwap if real_vwap is not None else None
+
+        # PCR: Use real Angel API PCR if available, otherwise None (no proxy)
+        pcr = real_pcr if real_pcr is not None else None
 
         # CPR from previous day
         prev = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
@@ -1044,7 +1443,7 @@ class StrategyEngine:
             'iv': iv,
             'hv': hv,
             'vwap': vwap,
-            'pcr': pcr_proxy,
+            'pcr': pcr,
             'pivot': pivot,
             'bc': bc,
             'tc': tc,
@@ -1066,11 +1465,20 @@ class StrategyEngine:
         }
 
     def check_cpr_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """CPR Strategy - Gomathi Shankar."""
+        """CPR Strategy - Gomathi Shankar.
+        v3.0: Uses real IV from Angel API. Falls back to HV*1.15 if unavailable.
+        """
         signals = []
         ind = indicators
         T = dte / 365
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
+
+        # IV: use real or HV fallback (CPR doesn't strictly need IV but BS pricing does)
+        iv = ind.get('iv')
+        if iv is None:
+            hv = ind.get('hv', 0.15)
+            iv = max(min(hv * 1.15, 0.60), 0.08)
+        ind = {**ind, 'iv': iv}  # Inject IV for bs_greeks calls below
 
         # NARROW CPR (< 0.3%) = BREAKOUT expected
         if ind['cpr_width'] < 0.3:
@@ -1138,9 +1546,18 @@ class StrategyEngine:
         return signals
 
     def check_gamma_blast_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Gamma Blast - all days mode (paper trading test)."""
+        """Gamma Blast - all days mode (paper trading test).
+        v3.0: Uses real IV from Angel API. Falls back to HV*1.15 if unavailable.
+        """
         signals = []
         ind = indicators
+
+        # IV: use real or HV fallback
+        iv = ind.get('iv')
+        if iv is None:
+            hv = ind.get('hv', 0.15)
+            iv = max(min(hv * 1.15, 0.60), 0.08)
+        ind = {**ind, 'iv': iv}
 
         # Calculate actual DTE to next expiry for IV/target adjustment
         if symbol == 'BANKNIFTY':
@@ -1220,26 +1637,60 @@ class StrategyEngine:
 
     def check_pcr_vwap_signals(self, symbol, spot, ohlc, indicators, dow, dte):
         """PCR+VWAP Strategy - CA Nitin Muraka.
-        v2.5: DISABLED — zero signals ever generated. Proxy PCR never exceeds 1.05/0.95 thresholds.
-        Revive only when real OI chain PCR data is integrated.
+        v3.0: RE-ENABLED with real Angel API data (PCR, VWAP, IV, strikes).
+        Requires real PCR and VWAP from Angel SmartAPI — skips if unavailable.
         """
-        return []  # v2.5: Disabled
         signals = []
         ind = indicators
         T = dte / 365
-        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
 
-        if ind['iv'] > 0.40:
+        # GUARD: Skip if real PCR or VWAP not available (Angel API required)
+        pcr = ind.get('pcr')
+        vwap = ind.get('vwap')
+        iv = ind.get('iv')
+        if pcr is None or vwap is None:
+            return signals  # No proxy — Angel API data required
+
+        # Use HV fallback for IV if API didn't return it
+        if iv is None:
+            hv = ind.get('hv', 0.15)
+            iv = max(min(hv * 1.15, 0.60), 0.08)
+
+        # Skip extremely volatile days
+        if iv > 0.40:
             return signals
 
-        tolerance = max(ind['atr'] * 0.1, spot * 0.003)
-        vwap = ind['vwap']
-        pcr = ind['pcr']
+        # Adaptive VWAP tolerance based on ATR
+        atr = ind['atr']
+        tolerance = max(atr * 0.1, spot * 0.003)
 
-        # BUY CE: PCR > 1.05 (bullish), near VWAP
-        if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot >= vwap * 0.995:
-            ce_strike = round(spot / strike_interval) * strike_interval
-            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
+        # PCR thresholds calibrated from intraday backtest
+        PCR_BULLISH = 1.10   # PCR > 1.10 = bullish (put writing dominant)
+        PCR_BEARISH = 0.90   # PCR < 0.90 = bearish (call writing dominant)
+
+        # Try to get real strike from Angel option chain
+        trader = getattr(self, 'trader', None)
+
+        # BUY CE: PCR bullish + spot near/above VWAP
+        if pcr > PCR_BULLISH and abs(spot - vwap) < tolerance * 2 and spot >= vwap * 0.995:
+            # Get real strike from option chain
+            strike_data = None
+            if trader:
+                best_strike, chain_data = trader.angel.find_best_strike(symbol, spot, 'CE')
+                if best_strike and chain_data:
+                    strike_data = chain_data
+                    ce_strike = best_strike
+                else:
+                    ce_strike = round(spot / STRIKE_INTERVALS.get(symbol, 50)) * STRIKE_INTERVALS.get(symbol, 50)
+            else:
+                ce_strike = round(spot / STRIKE_INTERVALS.get(symbol, 50)) * STRIKE_INTERVALS.get(symbol, 50)
+
+            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
+
+            # Use real LTP from chain if available
+            if strike_data and strike_data.get('ltp', 0) > 0:
+                g['price'] = float(strike_data['ltp'])
+
             if g['price'] > MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
                 signals.append({
                     'type': 'BUY_CE',
@@ -1247,14 +1698,28 @@ class StrategyEngine:
                     'premium': g['price'],
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.5,
+                    'target': g['price'] * 2.0,
                     'sl': g['price'] * 0.4,
                 })
 
-        # BUY PE: PCR < 0.95 (bearish), near VWAP
-        elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot <= vwap * 1.005:
-            pe_strike = round(spot / strike_interval) * strike_interval
-            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
+        # BUY PE: PCR bearish + spot near/below VWAP
+        elif pcr < PCR_BEARISH and abs(spot - vwap) < tolerance * 2 and spot <= vwap * 1.005:
+            strike_data = None
+            if trader:
+                best_strike, chain_data = trader.angel.find_best_strike(symbol, spot, 'PE')
+                if best_strike and chain_data:
+                    strike_data = chain_data
+                    pe_strike = best_strike
+                else:
+                    pe_strike = round(spot / STRIKE_INTERVALS.get(symbol, 50)) * STRIKE_INTERVALS.get(symbol, 50)
+            else:
+                pe_strike = round(spot / STRIKE_INTERVALS.get(symbol, 50)) * STRIKE_INTERVALS.get(symbol, 50)
+
+            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
+
+            if strike_data and strike_data.get('ltp', 0) > 0:
+                g['price'] = float(strike_data['ltp'])
+
             if g['price'] > MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
                 signals.append({
                     'type': 'BUY_PE',
@@ -1262,7 +1727,7 @@ class StrategyEngine:
                     'premium': g['price'],
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.5,
+                    'target': g['price'] * 2.0,
                     'sl': g['price'] * 0.4,
                 })
 
@@ -1346,6 +1811,7 @@ class PaperTrader:
         self.angel = AngelConnection()
         self.portfolio = PaperPortfolio()
         self.engine = StrategyEngine(self.angel, self.portfolio)
+        self.engine.trader = self  # Back-reference for strategy functions to access fetchers
         self._running = False
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         self._index_tokens = {
@@ -1456,9 +1922,10 @@ class PaperTrader:
             return VIX_HIGH_MULTIPLIER
         return 1.0
 
-    def _get_option_ltp(self, pos):
+    def _get_option_ltp(self, pos, with_bid_ask=False):
         """Get real-time option LTP for a position, with 15s cache.
         Returns LTP float or None if unavailable.
+        If with_bid_ask=True, returns (ltp, bid, ask) tuple.
         """
         details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
         option_token = details.get('option_token')
@@ -1474,7 +1941,6 @@ class PaperTrader:
                 if option_info:
                     option_token = str(option_info.get('token', ''))
                     exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
-                    # Store in position so we don't re-lookup every cycle
                     if isinstance(details, dict):
                         details['option_token'] = option_token
                         details['option_exchange'] = exchange
@@ -1482,23 +1948,39 @@ class PaperTrader:
                         pos['details'] = {'option_token': option_token, 'option_exchange': exchange}
 
         if not option_token or not exchange:
-            return None
+            return (None, None, None) if with_bid_ask else None
 
         # Check cache (15-second TTL)
         cache_key = f"{exchange}_{option_token}"
         cached = self._option_ltp_cache.get(cache_key)
         if cached and (datetime.now() - cached['time']).total_seconds() < 15:
+            if with_bid_ask:
+                return cached['ltp'], cached.get('bid'), cached.get('ask')
             return cached['ltp']
 
         try:
-            ltp = self.angel.get_ltp(exchange, option_token)
-            if ltp and ltp > 0:
-                self._option_ltp_cache[cache_key] = {'ltp': ltp, 'time': datetime.now()}
-                return ltp
+            if with_bid_ask:
+                # Use full market data to get bid/ask
+                mkt_data = self.angel.get_market_data(exchange, option_token)
+                if mkt_data:
+                    ltp = float(mkt_data.get('ltp', 0) or 0)
+                    bid = float(mkt_data.get('best_bid_price', mkt_data.get('bidPrice', 0)) or 0)
+                    ask = float(mkt_data.get('best_ask_price', mkt_data.get('askPrice', 0)) or 0)
+                    if ltp > 0:
+                        self._option_ltp_cache[cache_key] = {
+                            'ltp': ltp, 'bid': bid, 'ask': ask, 'time': datetime.now()
+                        }
+                        return ltp, bid, ask
+                return None, None, None
+            else:
+                ltp = self.angel.get_ltp(exchange, option_token)
+                if ltp and ltp > 0:
+                    self._option_ltp_cache[cache_key] = {'ltp': ltp, 'time': datetime.now()}
+                    return ltp
         except Exception as e:
             logger.debug(f"  Option LTP fetch failed for {cache_key}: {e}")
 
-        return None
+        return (None, None, None) if with_bid_ask else None
 
     def get_intraday_ohlc(self, symbol):
         """Get today's OHLC so far. Cached for 60s to avoid rate limiting."""
@@ -1600,13 +2082,27 @@ class PaperTrader:
             logger.info(f"  Spot: {spot:.2f} | O: {ohlc['open']:.2f} H: {ohlc['high']:.2f} "
                        f"L: {ohlc['low']:.2f} C: {ohlc['close']:.2f}")
 
-            indicators = self.engine.compute_indicators(symbol, ohlc)
+            # Fetch REAL data from Angel SmartAPI (no proxies)
+            real_pcr = self.angel.fetch_real_pcr(symbol)
+            real_iv = self.angel.fetch_real_atm_iv(symbol, spot)
+            real_vwap = self.angel.fetch_intraday_vwap(symbol)
+
+            pcr_str = f"{real_pcr:.2f}" if real_pcr is not None else "N/A"
+            iv_str = f"{real_iv*100:.1f}%" if real_iv is not None else "N/A"
+            vwap_str = f"{real_vwap:.0f}" if real_vwap is not None else "N/A"
+            logger.info(f"  LIVE DATA: {symbol} PCR={pcr_str} IV={iv_str} VWAP={vwap_str} [ANGEL API]")
+
+            indicators = self.engine.compute_indicators(
+                symbol, ohlc, real_pcr=real_pcr, real_iv=real_iv, real_vwap=real_vwap
+            )
             if not indicators:
                 logger.warning(f"  No indicators for {symbol}")
                 continue
 
-            logger.info(f"  ATR: {indicators['atr']:.2f} | IV: {indicators['iv']*100:.1f}% | "
-                       f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f}")
+            iv_display = f"{indicators['iv']*100:.1f}%" if indicators['iv'] is not None else "N/A"
+            pcr_display = f"{indicators['pcr']:.2f}" if indicators['pcr'] is not None else "N/A"
+            logger.info(f"  ATR: {indicators['atr']:.2f} | IV: {iv_display} | "
+                       f"CPR: {indicators['cpr_width']:.3f}% | PCR: {pcr_display}")
             logger.info(f"  Pivot: {indicators['pivot']:.0f} | TC: {indicators['tc']:.0f} | "
                        f"BC: {indicators['bc']:.0f}")
             logger.info(f"  Cam R3: {indicators['cam_r3']:.0f} R4: {indicators['cam_r4']:.0f} | "
@@ -1786,6 +2282,28 @@ class PaperTrader:
             except Exception as e:
                 logger.info(f"  OI/LTP fetch at entry failed for {sig['symbol']}: {e}")
 
+            # Compute entry slippage from bid-ask spread
+            entry_slippage = 0
+            entry_bid = None
+            entry_ask = None
+            if mkt_data:
+                entry_bid = float(mkt_data.get('best_bid_price', mkt_data.get('bidPrice', 0)) or 0)
+                entry_ask = float(mkt_data.get('best_ask_price', mkt_data.get('askPrice', 0)) or 0)
+                if entry_bid > 0 and entry_ask > 0:
+                    spread = entry_ask - entry_bid
+                    is_buy_trade = 'BUY' in sig['type']
+                    # BUY fills at ask, SELL fills at bid
+                    if is_buy_trade:
+                        slipped_price = entry_ask
+                    else:
+                        slipped_price = entry_bid
+                    # Slippage = difference from mid-price
+                    mid_price = (entry_bid + entry_ask) / 2
+                    entry_slippage = abs(slipped_price - mid_price) * LOT_SIZES.get(sig['symbol'], 50)
+                    logger.info(f"  SLIPPAGE: {sig['symbol']} {sig['strike']}{opt_type} "
+                               f"Bid={entry_bid:.2f} Ask={entry_ask:.2f} Spread={spread:.2f} "
+                               f"Slip=Rs {entry_slippage:.2f}")
+
             # Replace BS premium with real market LTP + compute real Greeks
             bs_premium = sig['premium']
             if real_ltp and real_ltp > 0:
@@ -1840,7 +2358,10 @@ class PaperTrader:
                     'spot': sig.get('spot'),
                     'option_token': option_token,
                     'option_exchange': option_exchange,
-                    'quality_score': sig.get('quality_score', 0),  # v2.5: FIX — was missing! Enables dynamic lots
+                    'quality_score': sig.get('quality_score', 0),
+                    'entry_slippage': entry_slippage,
+                    'entry_bid': entry_bid,
+                    'entry_ask': entry_ask,
                 },
                 oi=entry_oi,
                 spot_price=sig.get('spot', 0),

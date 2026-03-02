@@ -66,7 +66,7 @@ def acquire_lock(instance_id, force=False):
     """Acquire PID lock file. Exits if another instance is running on this machine.
 
     Args:
-        instance_id: 'local' or 'gcloud' (auto-detected from TRADING_INSTANCE env)
+        instance_id: 'local' or 'vultr' (auto-detected from TRADING_INSTANCE env)
         force: If True, override existing lock regardless
     """
     os.makedirs(LOCK_DIR, exist_ok=True)
@@ -122,8 +122,8 @@ def release_lock():
 
 def get_instance_label(instance_id):
     """Get human-readable label for instance ID."""
-    if instance_id == 'gcloud':
-        return '☁️ GCloud VM'
+    if instance_id == 'vultr':
+        return '☁️ Vultr VPS'
     else:
         return '🖥️ Local Machine'
 
@@ -321,24 +321,9 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
 
 
 def crypto_loop(interval_sec=300, stop_event=None):
-    """Crypto scanning thread: 24/7, every 5 minutes."""
-    logger.info(f"[CryptoThread] Starting | Interval: {interval_sec}s | 24/7")
-
-    scan_count = 0
-
-    while not stop_event.is_set():
-        scan_count += 1
-        try:
-            from crypto_paper_trader import CryptoPortfolio, run_scan as run_crypto_scan
-            logger.info(f"[CryptoThread] Scan #{scan_count} | {datetime.now().strftime('%H:%M:%S')}")
-            crypto_portfolio = CryptoPortfolio()
-            run_crypto_scan(crypto_portfolio)
-        except Exception as e:
-            logger.error(f"[CryptoThread] Scan error: {e}")
-
-        stop_event.wait(interval_sec)
-
-    logger.info(f"[CryptoThread] Exited after {scan_count} scans")
+    """Crypto scanning thread: DISABLED v2.5.1 — user requested halt."""
+    logger.info(f"[CryptoThread] DISABLED by user request (v2.5.1). Exiting immediately.")
+    return  # v2.5.1: Crypto halted
 
 
 def _send_heartbeat(instance_id='local'):
@@ -438,7 +423,7 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
         commodity_interval: Seconds between commodity scans (default 10 — fast with WebSocket LTP)
         crypto_interval: Seconds between crypto scans (default 300)
         offline: If True, don't connect to Angel API
-        instance_id: 'local' or 'gcloud' (identifies this instance)
+        instance_id: 'local' or 'vultr' (identifies this instance)
         force: If True, override existing PID lock
     """
     # Acquire PID lock — prevents duplicate instances on same machine
@@ -632,7 +617,7 @@ def main():
     parser.add_argument('--equity-only', action='store_true', help='Only run equity')
     parser.add_argument('--commodity-only', action='store_true', help='Only run commodity')
     parser.add_argument('--instance', type=str, default=None,
-                        help='Instance ID (auto-detected: local/gcloud via TRADING_INSTANCE env)')
+                        help='Instance ID (auto-detected: local/vultr via TRADING_INSTANCE env)')
     parser.add_argument('--force', action='store_true',
                         help='Override existing PID lock (use if previous instance crashed)')
     args = parser.parse_args()
