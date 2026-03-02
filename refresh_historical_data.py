@@ -22,25 +22,68 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ============================================================
 # Angel SmartAPI connection
 # ============================================================
-def connect_angel():
-    """Connect to Angel SmartAPI."""
-    creds_path = os.path.join(BASE_DIR, 'angel_credentials.json')
-    if not os.path.exists(creds_path):
-        print(f"ERROR: {creds_path} not found!")
+def load_credentials():
+    """Load Angel credentials from the same file as paper_trader.py."""
+    cred_file = os.environ.get('ANGEL_CRED_FILE',
+                                os.path.join(BASE_DIR, 'angel_credentials.json'))
+    print(f"Loading credentials from: {cred_file}")
+
+    if not os.path.exists(cred_file):
+        print(f"ERROR: {cred_file} not found!")
         return None
 
-    with open(creds_path) as f:
-        creds = json.load(f)
+    # Support both JSON and key=value formats
+    if cred_file.endswith('.json'):
+        with open(cred_file) as f:
+            creds = json.load(f)
+        return creds
 
+    # Key=value format (same as paper_trader.py)
+    creds = {}
+    with open(cred_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, val = line.split('=', 1)
+                key = key.strip()
+                raw_val = val.strip()
+                if key == 'ANGEL_TOTP_KEY' and '#' in raw_val:
+                    parts = raw_val.split('#')
+                    comment_val = parts[-1].strip()
+                    main_val = parts[0].strip()
+                    if 'your_' in main_val.lower() or 'secret' in main_val.lower():
+                        val = comment_val
+                    else:
+                        val = main_val
+                else:
+                    val = raw_val.split('#')[0].strip()
+                creds[key] = val
+    return creds
+
+
+def connect_angel():
+    """Connect to Angel SmartAPI."""
     from SmartApi import SmartConnect
     import pyotp
 
-    obj = SmartConnect(api_key=creds['api_key'])
-    totp = pyotp.TOTP(creds['totp_secret']).now()
-    data = obj.generateSession(creds['client_id'], creds['password'], totp)
+    creds = load_credentials()
+    if not creds:
+        return None
 
-    if data.get('status'):
-        print(f"Connected to Angel as {creds['client_id']}")
+    # Support both JSON and key=value credential formats
+    api_key = creds.get('api_key', creds.get('ANGEL_API_KEY', ''))
+    client_id = creds.get('client_id', creds.get('ANGEL_CLIENT_CODE', ''))
+    password = creds.get('password', creds.get('ANGEL_PIN', ''))
+    totp_secret = creds.get('totp_secret', creds.get('ANGEL_TOTP_KEY', ''))
+
+    obj = SmartConnect(api_key=api_key)
+    totp = pyotp.TOTP(totp_secret).now()
+    data = obj.generateSession(client_id, password, totp)
+
+    if data and data.get('status'):
+        print(f"Connected to Angel as {client_id}")
         return obj
     else:
         print(f"Angel connection FAILED: {data}")
