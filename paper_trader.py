@@ -571,6 +571,37 @@ class AngelConnection:
             logger.error(f"PCR error: {e}")
         return None
 
+    def get_real_pcr(self, name, expiry_date):
+        """v2.5.2: Compute real PCR from option chain OI data.
+        PCR = Total Put OI / Total Call OI for all strikes.
+        Returns float PCR or None if unavailable.
+        """
+        if not self._connected:
+            return None
+        try:
+            self._throttle()
+            data = self.obj.optionGreek({
+                "name": name,
+                "expirydate": expiry_date
+            })
+            if data and data.get('data'):
+                total_put_oi = 0
+                total_call_oi = 0
+                for strike_data in data['data']:
+                    opt_type = strike_data.get('optionType', '')
+                    oi = float(strike_data.get('opnInterest', 0) or 0)
+                    if opt_type == 'PE':
+                        total_put_oi += oi
+                    elif opt_type == 'CE':
+                        total_call_oi += oi
+                if total_call_oi > 0:
+                    pcr = total_put_oi / total_call_oi
+                    logger.info(f"  REAL_PCR: {name} Put OI={total_put_oi:,.0f} Call OI={total_call_oi:,.0f} PCR={pcr:.3f}")
+                    return pcr
+        except Exception as e:
+            logger.error(f"Real PCR error for {name}: {e}")
+        return None
+
 
 # ====================================================================
 # PAPER POSITION TRACKER
@@ -1224,10 +1255,9 @@ class StrategyEngine:
 
     def check_pcr_vwap_signals(self, symbol, spot, ohlc, indicators, dow, dte):
         """PCR+VWAP Strategy - CA Nitin Muraka.
-        v2.5: DISABLED — zero signals ever generated. Proxy PCR never exceeds 1.05/0.95 thresholds.
-        Revive only when real OI chain PCR data is integrated.
+        v2.5.2: RE-ENABLED — now using real option chain PCR from OI data.
+        Previously disabled because proxy PCR (from price changes) never exceeded 1.05/0.95.
         """
-        return []  # v2.5: Disabled
         signals = []
         ind = indicators
         T = dte / 365
@@ -1274,10 +1304,9 @@ class StrategyEngine:
 
     def check_survivor_signals(self, symbol, spot, ohlc, indicators, dow, dte):
         """Survivor V2 - Raahi Bhushan option selling.
-        v2.5: DISABLED for equity — zero signals on Feb 27, needs Rs 100K margin/lot.
-        Too capital-intensive for Rs 3L portfolio.
+        v2.5.2: RE-ENABLED with single-lot constraint. Needs Rs 95-100K margin/lot.
+        Only trades when portfolio has enough free capital for margin.
         """
-        return []  # v2.5: Disabled for equity
         signals = []
         ind = indicators
         T = dte / 365
@@ -1286,8 +1315,9 @@ class StrategyEngine:
         if dow > 3:
             return signals
 
-        margin_ok = self.portfolio.capital >= MARGIN_PER_LOT.get(symbol, 120000)
-        if not margin_ok:
+        # v2.5.2: Check if enough capital for at least 1 lot margin
+        margin_needed = MARGIN_PER_LOT.get(symbol, 120000)
+        if self.portfolio.capital < margin_needed:
             return signals
 
         # Day-specific distances (RESTORED wider values)
@@ -1361,6 +1391,7 @@ class PaperTrader:
         self._ohlc_cache = {}      # {symbol: {'data': ohlc_dict, 'time': datetime}}
         self._greeks_cache = {}    # {cache_key: {'data': greeks, 'time': datetime}}
         self._option_ltp_cache = {}  # {exchange_token: {'ltp': float, 'time': datetime}}
+        self._pcr_cache = {}  # v2.5.2: {symbol: {'pcr': float, 'time': datetime}}
         # EOD signal tracking
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
@@ -1550,6 +1581,19 @@ class PaperTrader:
             return ohlc
         return None
 
+    def get_real_pcr_cached(self, symbol):
+        """v2.5.2: Get real PCR from option chain OI, cached for 5 minutes."""
+        cached = self._pcr_cache.get(symbol)
+        if cached and (datetime.now() - cached['time']).total_seconds() < 300:
+            return cached['pcr']
+        expiry = self._get_nearest_expiry(symbol)
+        if expiry:
+            pcr = self.angel.get_real_pcr(symbol, expiry)
+            if pcr is not None:
+                self._pcr_cache[symbol] = {'pcr': pcr, 'time': datetime.now()}
+                return pcr
+        return None
+
     def is_market_open(self):
         """Check if equity market is currently open (9:15 AM - 3:30 PM IST, Mon-Fri)."""
         now = datetime.now()
@@ -1609,8 +1653,16 @@ class PaperTrader:
                 logger.warning(f"  No indicators for {symbol}")
                 continue
 
+            # v2.5.2: Replace proxy PCR with real option chain PCR
+            real_pcr = self.get_real_pcr_cached(symbol)
+            if real_pcr is not None:
+                indicators['pcr'] = real_pcr
+                indicators['pcr_source'] = 'REAL_OI'
+            else:
+                indicators['pcr_source'] = 'PROXY'
+
             logger.info(f"  ATR: {indicators['atr']:.2f} | IV: {indicators['iv']*100:.1f}% | "
-                       f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f}")
+                       f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f} ({indicators['pcr_source']})")
             logger.info(f"  Pivot: {indicators['pivot']:.0f} | TC: {indicators['tc']:.0f} | "
                        f"BC: {indicators['bc']:.0f}")
             logger.info(f"  Cam R3: {indicators['cam_r3']:.0f} R4: {indicators['cam_r4']:.0f} | "
