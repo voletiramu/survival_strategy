@@ -33,7 +33,7 @@ YAHOO_DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 
 INITIAL_CAPITAL = 300000
 RISK_FREE_RATE = 0.065
-LOT_SIZES = {'NIFTY50': 25, 'BANKNIFTY': 15, 'SENSEX': 10}
+LOT_SIZES = {'NIFTY50': 65, 'BANKNIFTY': 30, 'SENSEX': 20}  # NSE revised Jan 2026
 MARGIN_PER_LOT = {'NIFTY50': 120000, 'BANKNIFTY': 150000, 'SENSEX': 100000}
 
 # Trading costs

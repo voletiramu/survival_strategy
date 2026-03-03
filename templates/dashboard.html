@@ -168,7 +168,7 @@
             }
         }
 
-        .refresh-btn {
+        .refresh-btn, .export-btn {
             background: #2a3a4a;
             border: none;
             color: #8899aa;
@@ -176,8 +176,11 @@
             border-radius: 4px;
             cursor: pointer;
             font-size: 12px;
+            margin-left: 4px;
         }
-        .refresh-btn:hover { background: #3a4a5a; color: #fff; }
+        .refresh-btn:hover, .export-btn:hover { background: #3a4a5a; color: #fff; }
+        .export-btn { background: #1a3a2a; color: #66bb6a; }
+        .export-btn:hover { background: #2a4a3a; color: #81c784; }
 
         .loading {
             text-align: center;
@@ -191,6 +194,9 @@
         <h1>Algo Trading Dashboard</h1>
         <div>
             <button class="refresh-btn" onclick="refreshAll()">Refresh</button>
+            <button class="export-btn" onclick="exportTrades()">Export Trades</button>
+            <button class="export-btn" onclick="exportPositions()">Export Positions</button>
+            <button class="export-btn" onclick="exportSummary()">Save Report</button>
             <span class="status" id="lastUpdate">Loading...</span>
         </div>
     </div>
@@ -532,6 +538,16 @@
             } catch (e) {
                 console.error('Refresh failed:', e);
             }
+        }
+
+        function exportTrades() {
+            window.location.href = '/api/export/trades?market=all';
+        }
+        function exportPositions() {
+            window.location.href = '/api/export/positions';
+        }
+        function exportSummary() {
+            window.location.href = '/api/export/summary';
         }
 
         // Initial load

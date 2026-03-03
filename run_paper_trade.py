@@ -142,7 +142,7 @@ def print_banner():
     print("  " + "-" * 64)
     print("  CRYPTO:     BTC | ETH | SOL (24/7)")
     print("  " + "-" * 64)
-    print(f"  Capital: Rs 3,00,000 (Rs 2L equity + Rs 1L commodity)")
+    print(f"  Capital: Rs 6,00,000 (Rs 3L equity + Rs 3L commodity)")
     print("=" * 70 + "\n")
 
 
@@ -356,10 +356,10 @@ def show_combined_status():
 
     # Combined summary
     try:
-        eq_capital = eq_port.capital if eq_port else 200000
-        comm_capital = comm_port.capital if comm_port else 100000
+        eq_capital = eq_port.capital if eq_port else 300000
+        comm_capital = comm_port.capital if comm_port else 300000
         total_capital = eq_capital + comm_capital
-        total_initial = 300000  # Rs 3L total (2L equity + 1L commodity)
+        total_initial = 600000  # Rs 6L total (3L equity + 3L commodity)
         total_return = (total_capital - total_initial) / total_initial * 100
 
         eq_trades = len(eq_port.closed_trades) if eq_port else 0
@@ -388,26 +388,26 @@ def show_combined_status():
 
 
 def reset_all():
-    """Reset both portfolios."""
+    """Reset both portfolios to Rs 3L each (Rs 6L total)."""
     try:
         from paper_trader import PaperPortfolio
         eq = PaperPortfolio()
-        eq.capital = 200000; eq.positions = []; eq.closed_trades = []; eq.daily_pnl = {}
+        eq.capital = 300000; eq.positions = []; eq.closed_trades = []; eq.daily_pnl = {}
         eq.save_state()
-        print("  Equity portfolio reset to Rs 2,00,000")
+        print("  Equity portfolio reset to Rs 3,00,000")
     except Exception as e:
         print(f"  Equity reset error: {e}")
 
     try:
         from commodity_paper_trader import CommodityPortfolio
         comm = CommodityPortfolio()
-        comm.capital = 100000; comm.positions = []; comm.closed_trades = []; comm.daily_pnl = {}
+        comm.capital = 300000; comm.positions = []; comm.closed_trades = []; comm.daily_pnl = {}
         comm.save_state()
-        print("  Commodity portfolio reset to Rs 1,00,000")
+        print("  Commodity portfolio reset to Rs 3,00,000")
     except Exception as e:
         print(f"  Commodity reset error: {e}")
 
-    print("  Total starting capital: Rs 3,00,000 (Rs 2L equity + Rs 1L commodity)")
+    print("  Total starting capital: Rs 6,00,000 (Rs 3L equity + Rs 3L commodity)")
 
 
 # ====================================================================
@@ -475,7 +475,7 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
     logger.info(f"  Equity hours:       {EQUITY_OPEN} - {EQUITY_CLOSE}")
     logger.info(f"  Commodity hours:    {MCX_OPEN} - {MCX_CLOSE}")
     logger.info(f"  Crypto hours:       24/7")
-    logger.info(f"  Capital:            Rs 2,00,000 (equity) + Rs 1,00,000 (commodity)")
+    logger.info(f"  Capital:            Rs 3,00,000 (equity) + Rs 3,00,000 (commodity)")
     logger.info(f"  PID:                {os.getpid()}")
     logger.info(f"  Press Ctrl+C to stop")
     logger.info("=" * 70 + "\n")
@@ -543,11 +543,11 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
                     # Send Telegram EOD summary
                     from trade_notifier import notify_daily_summary
                     notify_daily_summary(
-                        equity_capital=200000,
+                        equity_capital=300000,
                         equity_pnl=eq_summary.get('actual_pnl', 0),
                         equity_positions=eq_summary.get('open_positions', 0),
                         equity_closed=eq_closed,
-                        commodity_capital=100000,
+                        commodity_capital=300000,
                         commodity_pnl=comm_summary.get('actual_pnl', 0),
                         commodity_positions=comm_summary.get('open_positions', 0),
                         commodity_closed=comm_closed,

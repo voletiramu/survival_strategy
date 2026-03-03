@@ -5,8 +5,10 @@ v2.4: Added lots, capital invested, capital available, capital after close.
 """
 import json
 import os
+import csv
+import io
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, Response, request
 
 app = Flask(__name__)
 
@@ -247,6 +249,203 @@ def api_summary():
         'equity_available': round(eq_capital - eq_invested, 2),
         'commodity_available': round(cm_capital - cm_invested, 2),
         'last_updated': datetime.now().isoformat(),
+    })
+
+
+# ====================================================================
+# EXPORT ENDPOINTS
+# ====================================================================
+REPORTS_DIR = os.path.join(BASE_DIR, 'reports')
+os.makedirs(REPORTS_DIR, exist_ok=True)
+
+
+def _get_all_closed_trades(market='all'):
+    """Get ALL closed trades (not just today) from portfolio state."""
+    trades = []
+    if market in ('all', 'equity'):
+        eq_data = load_json(EQUITY_STATE)
+        if eq_data:
+            for t in eq_data.get('closed_trades', []):
+                details = t.get('details', {}) if isinstance(t.get('details'), dict) else {}
+                trades.append({
+                    'timestamp': t.get('timestamp', ''),
+                    'exit_time': t.get('exit_time', ''),
+                    'symbol': t.get('symbol', ''),
+                    'strategy': t.get('strategy', ''),
+                    'type': t.get('signal_type', ''),
+                    'strike': t.get('strike', 0),
+                    'entry_price': t.get('entry_premium', 0),
+                    'exit_price': t.get('exit_premium', 0),
+                    'gross_pnl': t.get('gross_pnl', t.get('pnl', 0)),
+                    'pnl': t.get('pnl', 0),
+                    'total_slippage': t.get('total_slippage', 0),
+                    'exit_reason': t.get('exit_reason', ''),
+                    'num_lots': t.get('num_lots', 1),
+                    'lot_size': t.get('lot_size', 0),
+                    'capital_after': t.get('capital_after', 0),
+                    'market': 'equity',
+                })
+    if market in ('all', 'commodity'):
+        cm_data = load_json(COMMODITY_STATE)
+        if cm_data:
+            for t in cm_data.get('closed_trades', []):
+                details = t.get('details', {}) if isinstance(t.get('details'), dict) else {}
+                trades.append({
+                    'timestamp': t.get('timestamp', ''),
+                    'exit_time': t.get('exit_time', t.get('closed_at', '')),
+                    'symbol': t.get('symbol', t.get('commodity', '')),
+                    'strategy': t.get('strategy', ''),
+                    'type': t.get('signal_type', ''),
+                    'strike': t.get('strike', 0),
+                    'entry_price': t.get('entry_premium', t.get('entry_price', 0)),
+                    'exit_price': t.get('exit_premium', t.get('exit_price', 0)),
+                    'gross_pnl': t.get('gross_pnl', t.get('pnl', 0)),
+                    'pnl': t.get('pnl', 0),
+                    'total_slippage': t.get('total_slippage', 0),
+                    'exit_reason': t.get('exit_reason', ''),
+                    'num_lots': t.get('num_lots', 1),
+                    'lot_size': t.get('lot_size', 0),
+                    'capital_after': t.get('capital_after', 0),
+                    'market': 'commodity',
+                })
+    trades.sort(key=lambda x: x.get('exit_time', x.get('timestamp', '')))
+    return trades
+
+
+@app.route('/api/export/trades')
+def export_trades():
+    """Download all closed trades as CSV."""
+    market = request.args.get('market', 'all')
+    date_filter = request.args.get('date', None)
+
+    trades = _get_all_closed_trades(market)
+
+    # Optional date filter
+    if date_filter:
+        trades = [t for t in trades
+                  if date_filter in t.get('timestamp', '') or date_filter in t.get('exit_time', '')]
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        'timestamp', 'exit_time', 'symbol', 'strategy', 'type', 'strike',
+        'entry_price', 'exit_price', 'gross_pnl', 'pnl', 'total_slippage',
+        'exit_reason', 'num_lots', 'lot_size', 'capital_after', 'market'
+    ])
+    writer.writeheader()
+    writer.writerows(trades)
+
+    today_str = datetime.now().strftime('%Y%m%d')
+    filename = f"trades_{market}_{today_str}.csv"
+
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+    )
+
+
+@app.route('/api/export/positions')
+def export_positions():
+    """Download open positions as CSV."""
+    eq_data = load_json(EQUITY_STATE)
+    cm_data = load_json(COMMODITY_STATE)
+
+    eq_positions = parse_positions(eq_data, 'equity') if eq_data else []
+    cm_positions = parse_positions(cm_data, 'commodity') if cm_data else []
+    all_positions = eq_positions + cm_positions
+
+    output = io.StringIO()
+    fieldnames = [
+        'id', 'symbol', 'strategy', 'type', 'strike', 'entry_price',
+        'current_price', 'pnl', 'entry_time', 'duration', 'delta',
+        'tsl', 'target', 'sl', 'is_sell', 'score', 'market',
+        'lot_size', 'num_lots', 'capital_invested', 'capital_available'
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+    writer.writeheader()
+    writer.writerows(all_positions)
+
+    today_str = datetime.now().strftime('%Y%m%d')
+    filename = f"positions_{today_str}.csv"
+
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+    )
+
+
+@app.route('/api/export/summary')
+def export_summary():
+    """Download daily summary as JSON."""
+    # Reuse existing summary endpoint data
+    eq_data = load_json(EQUITY_STATE)
+    cm_data = load_json(COMMODITY_STATE)
+
+    eq_positions = parse_positions(eq_data, 'equity') if eq_data else []
+    cm_positions = parse_positions(cm_data, 'commodity') if cm_data else []
+    eq_closed = parse_closed_trades(eq_data, 'equity') if eq_data else []
+    cm_closed = parse_closed_trades(cm_data, 'commodity') if cm_data else []
+
+    all_closed = eq_closed + cm_closed
+    all_positions = eq_positions + cm_positions
+
+    total_open_pnl = sum(p['pnl'] for p in all_positions)
+    total_closed_pnl = sum(t['pnl'] for t in all_closed)
+    wins = sum(1 for t in all_closed if t['pnl'] > 0)
+    losses = sum(1 for t in all_closed if t['pnl'] <= 0)
+
+    eq_capital = eq_data.get('capital', EQUITY_CAPITAL) if eq_data else EQUITY_CAPITAL
+    cm_capital = cm_data.get('capital', COMMODITY_CAPITAL) if cm_data else COMMODITY_CAPITAL
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    summary = {
+        'date': today,
+        'timestamp': datetime.now().isoformat(),
+        'equity_capital': round(eq_capital, 2),
+        'commodity_capital': round(cm_capital, 2),
+        'total_capital': round(eq_capital + cm_capital, 2),
+        'total_pnl': round(total_open_pnl + total_closed_pnl, 2),
+        'open_pnl': round(total_open_pnl, 2),
+        'closed_pnl': round(total_closed_pnl, 2),
+        'open_positions': len(all_positions),
+        'closed_today': len(all_closed),
+        'wins': wins,
+        'losses': losses,
+        'win_rate': round(wins / max(wins + losses, 1) * 100, 1),
+        'positions': all_positions,
+        'closed_trades': all_closed,
+    }
+
+    today_str = datetime.now().strftime('%Y%m%d')
+    filename = f"summary_{today_str}.json"
+
+    return Response(
+        json.dumps(summary, indent=2, default=str),
+        mimetype='application/json',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+    )
+
+
+@app.route('/api/export/save_report')
+def save_daily_report():
+    """Save daily report to reports/ directory (callable from dashboard or cron)."""
+    trades = _get_all_closed_trades('all')
+    today_str = datetime.now().strftime('%Y%m%d')
+
+    # Save trades CSV
+    trades_path = os.path.join(REPORTS_DIR, f'dashboard_report_{today_str}.csv')
+    if trades:
+        import csv as csv_mod
+        with open(trades_path, 'w', newline='') as f:
+            writer = csv_mod.DictWriter(f, fieldnames=list(trades[0].keys()))
+            writer.writeheader()
+            writer.writerows(trades)
+
+    return jsonify({
+        'status': 'ok',
+        'trades_saved': len(trades),
+        'path': trades_path,
     })
 
 

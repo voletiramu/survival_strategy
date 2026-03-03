@@ -51,8 +51,8 @@ COMMODITIES = {
         'description': 'Gold Standard (1 kg)',
     },
     'GOLDM': {
-        'lot_size': 100,     # 100 grams
-        'multiplier': 10,    # 100g = 10 x 10g units
+        'lot_size': 1,       # 1 lot (trading 1 lot at a time)
+        'multiplier': 10,    # 100g = 10 x 10g units → Rs 10 PnL per Re 1 premium move
         'tick_size': 1,
         'margin': 15000,     # Lower margin for mini
         'strike_interval': 100,
@@ -61,8 +61,8 @@ COMMODITIES = {
         'description': 'Gold Mini (100g)',
     },
     'SILVER': {
-        'lot_size': 30,      # 30 kg
-        'multiplier': 30,    # 30kg units
+        'lot_size': 1,       # 1 lot (trading 1 lot at a time)
+        'multiplier': 30,    # 30 kg per lot → Rs 30 PnL per Re 1 premium move
         'tick_size': 1,
         'margin': 80000,
         'strike_interval': 500,
@@ -71,8 +71,8 @@ COMMODITIES = {
         'description': 'Silver Standard (30 kg)',
     },
     'SILVERM': {
-        'lot_size': 5,       # 5 kg
-        'multiplier': 5,
+        'lot_size': 1,       # 1 lot (trading 1 lot at a time)
+        'multiplier': 5,     # 5 kg per lot → Rs 5 PnL per Re 1 premium move
         'tick_size': 1,
         'margin': 15000,
         'strike_interval': 500,
@@ -81,8 +81,8 @@ COMMODITIES = {
         'description': 'Silver Mini (5 kg)',
     },
     'CRUDEOIL': {
-        'lot_size': 100,     # 100 barrels
-        'multiplier': 100,
+        'lot_size': 1,       # 1 lot (trading 1 lot at a time)
+        'multiplier': 100,   # 100 bbl per lot → Rs 100 PnL per Re 1 premium move
         'tick_size': 1,
         'margin': 60000,
         'strike_interval': 50,
@@ -91,8 +91,8 @@ COMMODITIES = {
         'description': 'Crude Oil (100 bbl)',
     },
     'NATURALGAS': {
-        'lot_size': 1250,    # 1250 mmBtu
-        'multiplier': 1250,
+        'lot_size': 1,       # 1 lot (trading 1 lot at a time)
+        'multiplier': 1250,  # 1250 mmBtu per lot → Rs 1250 PnL per Re 1 premium move
         'tick_size': 0.1,
         'margin': 70000,
         'strike_interval': 5,
@@ -101,8 +101,8 @@ COMMODITIES = {
         'description': 'Natural Gas (1250 mmBtu)',
     },
     'COPPER': {
-        'lot_size': 2500,    # 2500 kg
-        'multiplier': 2500,
+        'lot_size': 1,       # 1 lot (trading 1 lot at a time)
+        'multiplier': 2500,  # 2500 kg per lot → Rs 2500 PnL per Re 1 premium move
         'tick_size': 0.05,
         'margin': 60000,
         'strike_interval': 5,

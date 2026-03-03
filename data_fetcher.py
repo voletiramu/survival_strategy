@@ -17,11 +17,11 @@ SYMBOLS = {
     "SENSEX": "^BSESN",
 }
 
-# Lot sizes (as of 2024-2025)
+# Lot sizes (NSE revised Jan 2026)
 LOT_SIZES = {
-    "NIFTY50": 25,
-    "BANKNIFTY": 15,
-    "SENSEX": 10,
+    "NIFTY50": 65,
+    "BANKNIFTY": 30,
+    "SENSEX": 20,
 }
 
 

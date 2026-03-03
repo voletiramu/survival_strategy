@@ -1,6 +1,7 @@
 Strategy,Total PnL (All),Trades,Win Rate %,Avg Annual Return %,Avg Max DD %,Avg Sharpe,Avg Sortino,Avg Profit Factor,Avg Calmar
-Survivor (Raahi Bhushan),"53,523,726",4522,90.9,114.9,-4.1,5.00,6.82,75.20,28.08
-PCR+VWAP (CA Nitin Muraka),"1,936,706",1289,98.8,27.1,-0.0,7.91,216.74,7629.44,2890.28
-CPR (Gomathi Shankar),"507,081",1700,69.6,9.3,-3.4,0.87,1.12,1.76,3.18
-Ghost Trade Zone (GTZ),"409,625",183,98.4,7.8,-0.0,0.31,0.00,4270.80,1104.89
-Wave Extractor (Raahi Bhushan),"-1,357,860",6034,44.3,0.0,-152.6,-0.31,-0.21,0.70,0.00
+Survivor (Raahi Bhushan),"108,734,309",4522,91.0,149.3,-7.1,4.48,4.69,76.21,20.80
+Gamma Blast (Expiry),"4,427,068",932,92.6,43.4,-1.1,4.67,11.47,20.67,43.30
+PCR+VWAP (CA Nitin Muraka),"4,254,125",1289,99.1,44.1,-0.0,8.26,316.78,15743.50,5936.03
+CPR (Gomathi Shankar),"1,174,293",1700,70.2,18.2,-5.5,1.82,2.38,1.83,4.21
+Ghost Trade Zone (GTZ),"863,900",183,98.4,14.3,-0.0,1.51,0.00,18323.12,5696.55
+Wave Extractor (Raahi Bhushan),"-2,698,759",6034,44.9,0.0,-301.6,0.57,1.46,0.72,0.00

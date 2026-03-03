@@ -1,6 +1,8 @@
 """
-Master backtest runner - Runs all 5 strategies on Nifty50, BankNifty, Sensex
-Generates comparison report with charts.
+Master backtest runner - Unified Equity + Commodity Backtesting
+Runs 6 equity strategies on Nifty50, BankNifty, Sensex (Rs 3L capital)
+Runs 3 commodity strategies on 7 MCX commodities (Rs 3L capital)
+Generates comparison report with charts and capital allocation.
 
 DISCLAIMER: This is for educational and research purposes only.
 Past performance does not guarantee future results.
@@ -29,10 +31,30 @@ from strategies.wave_strategy import WaveStrategy
 from strategies.pcr_vwap_strategy import PCRVWAPStrategy
 from strategies.ghost_zone_strategy import GhostZoneStrategy
 from strategies.cpr_strategy import CPRStrategy
+from strategies.gamma_blast_strategy import GammaBlastStrategy
+
+# Commodity imports
+from commodity_backtest import (
+    backtest_cpr_commodity, backtest_gamma_blast_commodity,
+    backtest_ghost_zone_commodity, load_commodity_data,
+    compute_stats, COMMODITIES, INITIAL_CAPITAL as COMMODITY_INITIAL_CAPITAL
+)
 
 # Configuration
-INITIAL_CAPITAL = 300000  # 3 Lakhs
+EQUITY_CAPITAL = 300000     # Rs 3 Lakhs TOTAL for all equity strategies
+COMMODITY_CAPITAL = 300000  # Rs 3 Lakhs TOTAL for all commodity strategies
+
+# Equity: 6 strategies share Rs 3L → Rs 50K per strategy
+NUM_EQUITY_STRATEGIES = 6
+EQUITY_PER_STRATEGY = EQUITY_CAPITAL // NUM_EQUITY_STRATEGIES  # Rs 50,000
+
+# Commodity: 3 strategies share Rs 3L → Rs 1L per strategy
+NUM_COMMODITY_STRATEGIES = 3
+COMMODITY_PER_STRATEGY = COMMODITY_CAPITAL // NUM_COMMODITY_STRATEGIES  # Rs 1,00,000
+
+INITIAL_CAPITAL = EQUITY_PER_STRATEGY  # Used by equity BacktestEngine
 SYMBOLS = ["NIFTY50", "BANKNIFTY", "SENSEX"]
+COMMODITY_SYMBOLS = ['GOLD', 'GOLDM', 'SILVER', 'SILVERM', 'CRUDEOIL', 'NATURALGAS', 'COPPER']
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
 
@@ -64,6 +86,7 @@ def run_all_backtests():
             PCRVWAPStrategy(pcr_lookback=5, vwap_tolerance_pct=0.3),
             GhostZoneStrategy(zone_lookback=20, volume_threshold=1.2, min_impulse_atr_mult=0.8, target_rr=2.0),
             CPRStrategy(risk_per_trade_pct=1.0, max_trades_per_day=2),
+            GammaBlastStrategy(),
         ]
 
         for strat in strategies:
@@ -88,6 +111,49 @@ def run_all_backtests():
                 traceback.print_exc()
 
     return all_results
+
+
+def run_commodity_backtests():
+    """Run commodity strategies on all MCX commodities."""
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    all_commodity_stats = []
+
+    strategy_fns = {
+        'CPR': backtest_cpr_commodity,
+        'Gamma Blast': backtest_gamma_blast_commodity,
+        'Ghost Zone': backtest_ghost_zone_commodity,
+    }
+
+    for commodity in COMMODITY_SYMBOLS:
+        spec = COMMODITIES.get(commodity)
+        if spec is None:
+            print(f"  Unknown commodity: {commodity}")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"BACKTESTING ON {commodity} - {spec['description']}")
+        print(f"Lots: {spec['lot_size']} | Contract Mult: {spec['multiplier']} | Margin: Rs {spec['margin']:,}")
+        print(f"{'='*60}")
+
+        df = load_commodity_data(commodity)
+        if df is None:
+            print(f"  No data for {commodity}")
+            continue
+
+        print(f"  Data: {len(df)} days ({df.index[0].date()} to {df.index[-1].date()})")
+
+        for strat_name, strat_fn in strategy_fns.items():
+            label = f"{strat_name} ({commodity})"
+            try:
+                trades_list, curve, final = strat_fn(df, COMMODITY_PER_STRATEGY, commodity)
+                stats = compute_stats(trades_list, curve, COMMODITY_PER_STRATEGY, label)
+                all_commodity_stats.append(stats)
+            except Exception as e:
+                print(f"    ERROR in {label}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    return all_commodity_stats
 
 
 def generate_comparison_table(results: list):
@@ -116,35 +182,47 @@ def generate_comparison_table(results: list):
 
 
 def generate_strategy_summary(results: list):
-    """Aggregate results per strategy across all symbols."""
+    """Aggregate results per strategy — AVERAGE across symbols (not sum).
+
+    Each strategy gets Rs 50K capital. It runs on each symbol independently
+    for comparison. The summary shows AVERAGE performance across symbols
+    since in practice you'd trade one symbol at a time from your Rs 50K pool.
+    """
     strategy_agg = {}
     for r in results:
         name = r.strategy_name
         if name not in strategy_agg:
             strategy_agg[name] = {
-                'total_pnl': 0, 'total_trades': 0, 'wins': 0,
+                'pnls': [], 'trade_counts': [], 'win_counts': [],
                 'max_dd_pcts': [], 'sharpes': [], 'sortinos': [],
-                'profit_factors': [], 'annual_returns': [], 'calmars': []
+                'profit_factors': [], 'annual_returns': [], 'calmars': [],
+                'return_pcts': []
             }
         agg = strategy_agg[name]
-        agg['total_pnl'] += r.total_pnl
-        agg['total_trades'] += r.total_trades
-        agg['wins'] += r.winning_trades
+        agg['pnls'].append(r.total_pnl)
+        agg['trade_counts'].append(r.total_trades)
+        agg['win_counts'].append(r.winning_trades)
         agg['max_dd_pcts'].append(r.max_drawdown_pct)
         agg['sharpes'].append(r.sharpe_ratio)
         agg['sortinos'].append(r.sortino_ratio)
         agg['profit_factors'].append(r.profit_factor)
         agg['annual_returns'].append(r.annualized_return_pct)
         agg['calmars'].append(r.calmar_ratio)
+        agg['return_pcts'].append(r.total_return_pct)
 
     rows = []
     for name, agg in strategy_agg.items():
-        win_rate = agg['wins'] / max(agg['total_trades'], 1) * 100
+        total_wins = sum(agg['win_counts'])
+        total_trades = sum(agg['trade_counts'])
+        win_rate = total_wins / max(total_trades, 1) * 100
+        avg_pnl = np.mean(agg['pnls'])
         rows.append({
             'Strategy': name,
-            'Total PnL (All)': f"{agg['total_pnl']:,.0f}",
-            'Trades': agg['total_trades'],
+            'Capital (Rs)': f"{EQUITY_PER_STRATEGY:,.0f}",
+            'Avg PnL/Symbol': f"{avg_pnl:,.0f}",
+            'Avg Trades': f"{np.mean(agg['trade_counts']):.0f}",
             'Win Rate %': f"{win_rate:.1f}",
+            'Avg Return %': f"{np.mean(agg['return_pcts']):.1f}",
             'Avg Annual Return %': f"{np.mean(agg['annual_returns']):.1f}",
             'Avg Max DD %': f"{np.mean(agg['max_dd_pcts']):.1f}",
             'Avg Sharpe': f"{np.mean(agg['sharpes']):.2f}",
@@ -153,8 +231,8 @@ def generate_strategy_summary(results: list):
             'Avg Calmar': f"{np.mean(agg['calmars']):.2f}",
         })
 
-    # Sort by total PnL
-    rows.sort(key=lambda x: float(x['Total PnL (All)'].replace(',', '')), reverse=True)
+    # Sort by avg PnL
+    rows.sort(key=lambda x: float(x['Avg PnL/Symbol'].replace(',', '')), reverse=True)
     return pd.DataFrame(rows)
 
 
@@ -165,7 +243,7 @@ def plot_equity_curves(results: list):
 
     for symbol in symbols:
         fig, axes = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
-        fig.suptitle(f'Strategy Comparison - {symbol}\nInitial Capital: ₹3,00,000 | 5-Year Backtest',
+        fig.suptitle(f'Strategy Comparison - {symbol}\nPer-Strategy Capital: ₹{EQUITY_PER_STRATEGY:,.0f} (Total: ₹{EQUITY_CAPITAL:,.0f} / {NUM_EQUITY_STRATEGIES} strategies)',
                      fontsize=14, fontweight='bold')
 
         symbol_results = [r for r in results if r.symbol == symbol]
@@ -332,54 +410,165 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
 
 def main():
     print("="*60)
-    print("ALGORITHMIC TRADING STRATEGY BACKTEST")
-    print("Capital: ₹3,00,000 | Period: 5 Years | Indices: Nifty50, BankNifty, Sensex")
+    print("UNIFIED ALGORITHMIC TRADING STRATEGY BACKTEST")
+    print(f"Equity Capital: Rs {EQUITY_CAPITAL:,.0f} | Commodity Capital: Rs {COMMODITY_CAPITAL:,.0f}")
+    print(f"Total Capital: Rs {EQUITY_CAPITAL + COMMODITY_CAPITAL:,.0f}")
+    print("Equity: Nifty50, BankNifty, Sensex | Commodities: 7 MCX instruments")
     print("="*60)
     print("\nDISCLAIMER: This is for EDUCATIONAL purposes only.")
     print("Past performance does NOT guarantee future results.")
     print("Options trading involves substantial risk of loss.\n")
 
-    # Run backtests
+    # ============================================================
+    # PART 1: EQUITY BACKTESTS
+    # ============================================================
+    print("\n" + "="*60)
+    print("PART 1: EQUITY INDEX STRATEGIES")
+    print(f"Total Equity Pool: Rs {EQUITY_CAPITAL:,.0f} | {NUM_EQUITY_STRATEGIES} strategies | Rs {EQUITY_PER_STRATEGY:,.0f} per strategy")
+    print(f"Indices: NIFTY50, BANKNIFTY, SENSEX")
+    print("="*60)
+
     results = run_all_backtests()
 
-    if not results:
-        print("No results generated. Check data availability.")
-        return
+    if results:
+        print("\n" + "="*60)
+        print("EQUITY DETAILED RESULTS - ALL STRATEGIES x ALL SYMBOLS")
+        print("="*60)
+        comparison = generate_comparison_table(results)
+        print(tabulate(comparison, headers='keys', tablefmt='grid', showindex=False))
+        comparison.to_csv(os.path.join(RESULTS_DIR, 'equity_detailed_results.csv'), index=False)
 
-    # Generate comparison table
-    print("\n" + "="*60)
-    print("DETAILED RESULTS - ALL STRATEGIES x ALL SYMBOLS")
+        print("\n" + "="*60)
+        print("EQUITY STRATEGY SUMMARY (AGGREGATED ACROSS ALL SYMBOLS)")
+        print("="*60)
+        equity_summary = generate_strategy_summary(results)
+        print(tabulate(equity_summary, headers='keys', tablefmt='grid', showindex=False))
+        equity_summary.to_csv(os.path.join(RESULTS_DIR, 'equity_strategy_summary.csv'), index=False)
+
+        print("\nGenerating equity charts...")
+        plot_equity_curves(results)
+        plot_monthly_heatmap(results)
+
+        print("\n" + "="*60)
+        print(f"EQUITY CAPITAL ALLOCATION (Rs {EQUITY_CAPITAL:,.0f})")
+        print("="*60)
+        equity_allocation = compute_allocation(equity_summary, EQUITY_CAPITAL)
+        pd.DataFrame(equity_allocation).to_csv(
+            os.path.join(RESULTS_DIR, 'equity_allocation.csv'), index=False)
+    else:
+        print("No equity results generated. Check data availability.")
+        equity_summary = None
+        equity_allocation = []
+
+    # ============================================================
+    # PART 2: COMMODITY BACKTESTS
+    # ============================================================
+    print("\n\n" + "="*60)
+    print("PART 2: COMMODITY STRATEGIES (MCX)")
+    print(f"Total Commodity Pool: Rs {COMMODITY_CAPITAL:,.0f} | {NUM_COMMODITY_STRATEGIES} strategies | Rs {COMMODITY_PER_STRATEGY:,.0f} per strategy")
+    print(f"Black-76 Model | Real MCX Costs")
     print("="*60)
-    comparison = generate_comparison_table(results)
-    print(tabulate(comparison, headers='keys', tablefmt='grid', showindex=False))
-    comparison.to_csv(os.path.join(RESULTS_DIR, 'detailed_results.csv'), index=False)
 
-    # Strategy summary
-    print("\n" + "="*60)
-    print("STRATEGY SUMMARY (AGGREGATED ACROSS ALL SYMBOLS)")
+    commodity_stats = run_commodity_backtests()
+
+    if commodity_stats:
+        print("\n" + "="*60)
+        print("COMMODITY DETAILED RESULTS")
+        print("="*60)
+        commodity_df = pd.DataFrame(commodity_stats)
+        print(tabulate(commodity_df, headers='keys', tablefmt='grid', showindex=False))
+        commodity_df.to_csv(os.path.join(RESULTS_DIR, 'commodity_detailed_results.csv'), index=False)
+
+        # Commodity allocation by Sharpe
+        commodity_df['Sharpe_num'] = pd.to_numeric(commodity_df['Sharpe'], errors='coerce')
+        commodity_df['Trades_num'] = pd.to_numeric(commodity_df['Trades'], errors='coerce')
+        valid_comm = commodity_df[commodity_df['Trades_num'] >= 10].copy()
+
+        if len(valid_comm) > 0:
+            valid_comm = valid_comm.sort_values('Sharpe_num', ascending=False)
+            print("\n" + "="*60)
+            print(f"COMMODITY CAPITAL ALLOCATION (Rs {COMMODITY_CAPITAL:,.0f})")
+            print("Ranked by Sharpe (min 10 trades)")
+            print("="*60)
+
+            profitable = valid_comm[valid_comm['Sharpe_num'] > 0]
+            if len(profitable) > 0:
+                total_sharpe = profitable['Sharpe_num'].sum()
+                comm_alloc = []
+                for _, row in profitable.iterrows():
+                    w = row['Sharpe_num'] / total_sharpe if total_sharpe > 0 else 1/len(profitable)
+                    w = max(0.05, min(0.40, w))  # Constrain 5-40%
+                    comm_alloc.append({
+                        'Strategy': row['Strategy'],
+                        'Score (Sharpe)': f"{row['Sharpe_num']:.2f}",
+                        'Weight': f"{w*100:.1f}%",
+                        'Amount (Rs)': f"{COMMODITY_CAPITAL * w:,.0f}",
+                        'Win Rate': row['Win Rate'],
+                        'Ann Return': row['Ann Return'],
+                        'Max DD': row['Max DD'],
+                    })
+                # Renormalize weights
+                total_w = sum(float(c['Weight'].replace('%',''))/100 for c in comm_alloc)
+                for c in comm_alloc:
+                    orig_w = float(c['Weight'].replace('%',''))/100
+                    norm_w = orig_w / total_w
+                    c['Weight'] = f"{norm_w*100:.1f}%"
+                    c['Amount (Rs)'] = f"{COMMODITY_CAPITAL * norm_w:,.0f}"
+
+                comm_alloc_df = pd.DataFrame(comm_alloc)
+                print(tabulate(comm_alloc_df, headers='keys', tablefmt='grid', showindex=False))
+                comm_alloc_df.to_csv(os.path.join(RESULTS_DIR, 'commodity_allocation.csv'), index=False)
+            else:
+                print("No profitable commodity strategies found.")
+    else:
+        print("No commodity results generated. Check data availability.")
+
+    # ============================================================
+    # PART 3: COMBINED SUMMARY
+    # ============================================================
+    print("\n\n" + "="*60)
+    print("COMBINED PORTFOLIO SUMMARY")
+    print(f"Total Capital: Rs {EQUITY_CAPITAL + COMMODITY_CAPITAL:,.0f}")
+    print(f"  Equity Pool:    Rs {EQUITY_CAPITAL:,.0f} ({NUM_EQUITY_STRATEGIES} strategies x Rs {EQUITY_PER_STRATEGY:,.0f} each)")
+    print(f"  Commodity Pool: Rs {COMMODITY_CAPITAL:,.0f} ({NUM_COMMODITY_STRATEGIES} strategies x Rs {COMMODITY_PER_STRATEGY:,.0f} each)")
     print("="*60)
-    summary = generate_strategy_summary(results)
-    print(tabulate(summary, headers='keys', tablefmt='grid', showindex=False))
-    summary.to_csv(os.path.join(RESULTS_DIR, 'strategy_summary.csv'), index=False)
 
-    # Plot charts
-    print("\nGenerating charts...")
-    plot_equity_curves(results)
-    plot_monthly_heatmap(results)
+    # Save combined results
+    if results:
+        all_equity_rows = []
+        for r in results:
+            all_equity_rows.append({
+                'Market': 'Equity',
+                'Strategy': r.strategy_name,
+                'Symbol': r.symbol,
+                'Trades': r.total_trades,
+                'Win Rate %': f"{r.win_rate:.1f}",
+                'Total PnL': f"{r.total_pnl:,.0f}",
+                'Sharpe': f"{r.sharpe_ratio:.2f}",
+            })
 
-    # Capital allocation
-    allocation = compute_allocation(summary, INITIAL_CAPITAL)
+        if commodity_stats:
+            for cs in commodity_stats:
+                all_equity_rows.append({
+                    'Market': 'Commodity',
+                    'Strategy': cs['Strategy'],
+                    'Symbol': '-',
+                    'Trades': cs['Trades'],
+                    'Win Rate %': cs['Win Rate'],
+                    'Total PnL': cs['Total PnL'],
+                    'Sharpe': cs['Sharpe'],
+                })
 
-    # Save allocation
-    alloc_df = pd.DataFrame(allocation)
-    alloc_df.to_csv(os.path.join(RESULTS_DIR, 'allocation.csv'), index=False)
+        combined_df = pd.DataFrame(all_equity_rows)
+        combined_df.to_csv(os.path.join(RESULTS_DIR, 'combined_results.csv'), index=False)
 
     print(f"\nAll results saved to: {RESULTS_DIR}")
     print("\nFinal Notes:")
-    print("- These backtests simulate option P&L from spot price movements")
+    print("- Equity strategies simulate option P&L from spot price movements (delta=0.5)")
+    print("- Commodity strategies use Black-76 model with real MCX costs")
     print("- Real options have Greeks (gamma, theta, vega) that affect P&L")
     print("- Slippage and liquidity in real markets may differ")
-    print("- Consider paper trading before deploying real capital")
+    print("- Paper trade for 1-2 weeks before deploying real capital")
     print("- Weekly or monthly rebalancing of allocation is recommended")
 
 

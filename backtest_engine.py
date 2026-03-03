@@ -106,30 +106,45 @@ class BacktestEngine:
         return max(premium, 1.0)  # minimum 1 rupee
 
     def simulate_option_pnl_from_spot(self, spot_entry: float, spot_exit: float,
-                                       trade_type: TradeType, lots: int = 1) -> float:
+                                       trade_type: TradeType, lots: int = 1,
+                                       delta: float = 0.5, gamma: float = 0.0) -> float:
         """
         Simulate option P&L from spot price movement.
-        Uses delta-based approximation for ATM options.
+        Uses delta-based approximation with optional gamma acceleration.
+
+        Args:
+            spot_entry: Spot price at entry
+            spot_exit: Spot price at exit
+            trade_type: BUY_CE, BUY_PE, SELL_CE, SELL_PE
+            lots: Number of lots
+            delta: Starting delta (0.4-0.6 for ATM, default 0.5)
+            gamma: Delta change per point of spot move (0 = no gamma effect)
+                   Typical expiry-day ATM gamma: 0.0005-0.002
         """
         spot_move = spot_exit - spot_entry
+        abs_move = abs(spot_move)
         qty = lots * self.lot_size
+
+        # If gamma is provided, compute average delta over the move
+        if gamma > 0 and abs_move > 0:
+            # Delta changes as option goes ITM/OTM
+            end_delta = min(delta + gamma * abs_move, 0.95)
+            avg_delta = (delta + end_delta) / 2
+        else:
+            avg_delta = delta
 
         if trade_type == TradeType.BUY_CE:
             # Long call benefits from up move
-            delta = 0.5
-            pnl = spot_move * delta * qty
+            pnl = spot_move * avg_delta * qty
         elif trade_type == TradeType.BUY_PE:
             # Long put benefits from down move
-            delta = 0.5
-            pnl = -spot_move * delta * qty
+            pnl = -spot_move * avg_delta * qty
         elif trade_type == TradeType.SELL_CE:
             # Short call benefits from down move (theta + direction)
-            delta = 0.5
-            pnl = -spot_move * delta * qty
+            pnl = -spot_move * avg_delta * qty
         elif trade_type == TradeType.SELL_PE:
             # Short put benefits from up move (theta + direction)
-            delta = 0.5
-            pnl = spot_move * delta * qty
+            pnl = spot_move * avg_delta * qty
         else:
             pnl = 0.0
 

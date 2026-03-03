@@ -1,0 +1,7 @@
+Strategy,Capital (Rs),Avg PnL/Symbol,Avg Trades,Win Rate %,Avg Return %,Avg Annual Return %,Avg Max DD %,Avg Sharpe,Avg Sortino,Avg Profit Factor,Avg Calmar
+Survivor (Raahi Bhushan),"50,000","36,244,770",1507,91.0,72489.5,256.2,-24.4,2.80,2.18,76.21,10.92
+Gamma Blast (All Days),"50,000","4,075,616",778,91.3,8151.2,145.2,-1.1,4.51,27.58,26.31,146.70
+PCR+VWAP (CA Nitin Muraka),"50,000","1,418,042",430,99.1,2836.1,102.8,-0.0,6.40,463.99,15743.50,9857.15
+CPR (Gomathi Shankar),"50,000","391,431",567,70.2,782.9,54.8,-20.1,2.01,1.92,1.83,3.75
+Ghost Trade Zone (GTZ),"50,000","287,967",61,98.4,575.9,46.1,-0.0,2.06,0.00,18323.12,10401.74
+Wave Extractor (Raahi Bhushan),"50,000","-899,586",2011,44.9,-1799.2,0.0,-1699.3,-0.15,0.09,0.72,0.00
