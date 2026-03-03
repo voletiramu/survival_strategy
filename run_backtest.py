@@ -329,7 +329,13 @@ def plot_monthly_heatmap(results: list):
 
 
 def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
-    """Compute capital allocation based on risk-adjusted returns."""
+    """Compute capital allocation based on risk-adjusted returns.
+
+    v3.1: Rebalanced scoring to properly weight absolute PnL and annual return.
+    - Caps Calmar/Sortino to prevent distortion from tiny-drawdown strategies
+    - Adds absolute PnL contribution to scoring
+    - Raises max allocation to 50% for dominant strategies like Survivor
+    """
     print("\n" + "="*60)
     print("CAPITAL ALLOCATION RECOMMENDATION")
     print(f"Total Capital: ₹{total_capital:,.0f}")
@@ -344,22 +350,31 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
         pf = float(row['Avg Profit Factor'])
         dd = abs(float(row['Avg Max DD %']))
         annual_ret = float(row['Avg Annual Return %'])
+        avg_pnl = float(str(row['Avg PnL/Symbol']).replace(',', ''))
 
-        # Composite score (higher is better)
-        # Weighted: Sharpe 25%, Sortino 20%, Calmar 15%, PF 15%, Return 15%, Low DD 10%
+        # v3.1: Cap extreme ratios to prevent distortion
+        # Gamma Blast Calmar=113 vs Survivor=17 was dominating allocation unfairly
+        sharpe_capped = min(sharpe, 5.0)
+        sortino_capped = min(sortino, 10.0)
+        calmar_capped = min(calmar, 25.0)
+
+        # v3.1: Composite score — rebalanced weights
+        # Sharpe 20%, Annual Return 25%, PnL 20%, Sortino 10%, Calmar 10%, PF 10%, DD 5%
         score = (
-            sharpe * 0.25 +
-            sortino * 0.20 +
-            calmar * 0.15 +
-            min(pf, 5) * 0.15 +  # Cap PF at 5 to avoid inf distortion
-            (annual_ret / 10) * 0.15 +
-            max(0, (20 - dd) / 20) * 0.10  # Lower DD = higher score
+            sharpe_capped * 0.20 +
+            (annual_ret / 100) * 0.25 +         # Annual return as direct percentage
+            (avg_pnl / 1_000_000) * 0.20 +       # Absolute PnL in millions
+            sortino_capped * 0.10 +
+            calmar_capped * 0.10 +
+            min(pf, 5) * 0.10 +
+            max(0, (25 - dd) / 25) * 0.05        # Lower DD = higher score, gentler
         )
 
         strategies.append({
             'name': row['Strategy'],
             'score': max(score, 0),
             'annual_ret': annual_ret,
+            'avg_pnl': avg_pnl,
             'max_dd': dd,
             'sharpe': sharpe,
         })
@@ -367,16 +382,15 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
     # Normalize scores
     total_score = sum(s['score'] for s in strategies)
     if total_score <= 0:
-        # Equal allocation if all scores negative
         for s in strategies:
             s['allocation_pct'] = 100 / len(strategies)
     else:
         for s in strategies:
             s['allocation_pct'] = (s['score'] / total_score) * 100
 
-    # Apply constraints: min 5%, max 40%
+    # v3.1: Apply constraints: min 5%, max 50% (raised from 40% for dominant strategies)
     for s in strategies:
-        s['allocation_pct'] = max(5, min(40, s['allocation_pct']))
+        s['allocation_pct'] = max(5, min(50, s['allocation_pct']))
 
     # Renormalize
     total_alloc = sum(s['allocation_pct'] for s in strategies)
@@ -396,6 +410,7 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
             'Score': f"{s['score']:.2f}",
             'Allocation %': f"{s['allocation_pct']:.1f}%",
             'Amount (₹)': f"{s['allocation_amount']:,.0f}",
+            'Avg PnL (₹)': f"{s.get('avg_pnl', 0):,.0f}",
             'Annual Return %': f"{s['annual_ret']:.1f}%",
             'Max DD %': f"{s['max_dd']:.1f}%",
             'Sharpe': f"{s['sharpe']:.2f}",

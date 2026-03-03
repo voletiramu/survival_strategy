@@ -117,11 +117,14 @@ TSL_MIN_PROFIT_LOCK_PCT = 10     # Never let trailing SL go below entry+10% of m
 TSL_TIGHT_TRIGGER_PCT = 100      # Phase 3: Tighter trail once past target
 TSL_TIGHT_DISTANCE_PCT = 15      # Phase 3 trail: 15% below peak (capture max profit)
 
-# Strategy weights from backtest (Sharpe-weighted)
+# v3.1: Strategy weights from Angel One backtest (PnL + risk-adjusted)
+# Survivor highest PnL (Rs 36.5M avg, 257% annual), Gamma Blast best risk-adjusted (Sharpe 4.42)
 STRATEGY_WEIGHTS = {
-    'CPR': 0.88,          # 87.9% allocation (dominant)
-    'Gamma Blast': 0.094, # 9.4%
-    'Ghost Zone': 0.026,  # 2.7%
+    'Survivor': 0.40,     # 40% — highest absolute PnL, 91% win rate, 257% annual
+    'Gamma Blast': 0.30,  # 30% — best Sharpe (4.42), lowest DD (1.4%), 91% win rate
+    'CPR': 0.20,          # 20% — solid 70% win rate, consistent across symbols
+    'PCR+VWAP': 0.05,     # 5% — needs real OI data (0 trades in daily backtest)
+    'Ghost Zone': 0.05,   # 5% — needs intraday data (0 trades in daily backtest)
 }
 
 # Market hours (IST)
