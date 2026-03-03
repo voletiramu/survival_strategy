@@ -1,0 +1,7 @@
+Strategy,Symbol,Trades,CE Trades,PE Trades,Win Rate,Total PnL,Gross PnL,Total Costs,Final Capital,Return,Max DD,Sharpe,Profit Factor,Avg Win,Avg Loss,Largest Win,Largest Loss
+PCR+VWAP V1,NIFTY50,477,210,267,99.0%,"Rs 942,969","Rs 971,946","Rs 28,977","Rs 1,242,969",314.3%,-0.0%,7.59,5510.61,"Rs 1,998",Rs -34,"Rs 4,623",Rs -62
+PCR+VWAP V2,NIFTY50,78,32,46,100.0%,"Rs 168,750","Rs 173,399","Rs 4,648","Rs 468,750",56.3%,0.0%,1.05,inf,"Rs 2,163",Rs 0,"Rs 6,687",Rs 0
+PCR+VWAP V1,BANKNIFTY,477,232,245,99.8%,"Rs 1,030,070","Rs 1,061,688","Rs 31,618","Rs 1,330,070",343.4%,-0.0%,7.65,12371.25,"Rs 2,164",Rs -83,"Rs 4,749",Rs -83
+PCR+VWAP V2,BANKNIFTY,84,50,34,100.0%,"Rs 239,908","Rs 245,204","Rs 5,296","Rs 539,908",80.0%,0.0%,1.58,inf,"Rs 2,856",Rs 0,"Rs 9,330",Rs 0
+PCR+VWAP V1,SENSEX,460,214,246,99.3%,"Rs 907,399","Rs 935,729","Rs 28,330","Rs 1,207,399",302.5%,-0.0%,7.29,6538.46,"Rs 1,986",Rs -46,"Rs 4,867",Rs -72
+PCR+VWAP V2,SENSEX,87,40,47,98.9%,"Rs 215,237","Rs 220,535","Rs 5,298","Rs 515,237",71.7%,-0.0%,1.53,6591.22,"Rs 2,503",Rs -33,"Rs 8,479",Rs -33

@@ -1,0 +1,4 @@
+Strategy,Symbol,Trades,CE Trades,PE Trades,Win Rate,Total PnL,Gross PnL,Total Costs,Final Capital,Return,Max DD,Sharpe,Profit Factor,Avg Win,Avg Loss,Target Exits,SL Exits,EOD Exits
+PCR+VWAP Intraday,NIFTY,228,107,121,70.2%,"Rs 223,389","Rs 237,882","Rs 14,493","Rs 523,389",74.5%,-3.4%,7.95,2.72,"Rs 2,209","Rs -1,914",75,34,119
+PCR+VWAP Intraday,BANKNIFTY,228,120,108,61.4%,"Rs 206,060","Rs 220,753","Rs 14,693","Rs 506,060",68.7%,-4.4%,5.61,2.2,"Rs 2,699","Rs -1,953",74,53,101
+PCR+VWAP Intraday,SENSEX,228,118,110,63.6%,"Rs 132,317","Rs 146,756","Rs 14,440","Rs 432,317",44.1%,-6.3%,4.79,1.77,"Rs 2,094","Rs -2,064",71,51,106
