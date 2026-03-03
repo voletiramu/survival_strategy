@@ -1,9 +1,16 @@
 """
-PAPER TRADING SYSTEM - ALL 5 STRATEGIES
-========================================
-Live paper trading with Angel One SmartAPI + Zerodha Sensibull (optional)
-Runs all 5 strategies simultaneously on NIFTY, BANKNIFTY, SENSEX
-Generates signals, tracks paper P&L, and logs everything
+PAPER TRADING SYSTEM - 4 ACTIVE STRATEGIES (v7.1)
+===================================================
+Live paper trading with Angel One SmartAPI
+Active: Gamma Blast (40%), CPR (30%), Ghost Zone v7 (20%), PCR+VWAP (10%)
+Halted: Survivor (needs Rs 1L+ capital per symbol)
+Runs on NIFTY, BANKNIFTY, SENSEX with live Angel data
+
+Per-Strategy Capital Allocation (Rs 3L total):
+  Gamma Blast:  40% = Rs 1,20,000 — best risk-adjusted (Sharpe 4.42)
+  CPR:          30% = Rs 90,000 — solid 70% WR, consistent
+  Ghost Zone:   20% = Rs 60,000 — v7 institutional methodology
+  PCR+VWAP:     10% = Rs 30,000 — needs live OI data to prove
 
 Usage:
     python paper_trader.py              # Run paper trading
@@ -60,6 +67,38 @@ MAX_COMMODITY_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
 MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
 MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
 MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
+
+# ====================================================================
+# PER-STRATEGY CAPITAL ALLOCATION (v7.1)
+# ====================================================================
+# With Survivor HALTED, redistribute Rs 3L equity among 4 active strategies.
+# Based on Angel backtest results: Gamma Blast (Sharpe 4.42, best risk-adjusted),
+# CPR (70% WR, consistent), Ghost Zone v7 (100% WR on daily, 22-24 trades),
+# PCR+VWAP (needs intraday OI — lower allocation until proven live).
+STRATEGY_ALLOCATION = {
+    'Gamma Blast': 0.40,    # 40% = Rs 1,20,000 — best risk-adjusted (Sharpe 4.42)
+    'CPR':         0.30,    # 30% = Rs 90,000 — solid 70% WR, consistent
+    'Ghost Zone':  0.20,    # 20% = Rs 60,000 — v7 institutional methodology
+    'PCR+VWAP':    0.10,    # 10% = Rs 30,000 — needs live OI data to prove
+    # 'Survivor':  0.00,    # HALTED — needs Rs 1L+ per symbol
+}
+
+def get_strategy_capital_limit(strategy_name):
+    """Get maximum capital allowed for a strategy."""
+    pct = STRATEGY_ALLOCATION.get(strategy_name, 0.10)  # Default 10% if unknown
+    return EQUITY_CAPITAL * pct
+
+def get_strategy_used_capital(positions, strategy_name):
+    """Calculate capital currently used by a specific strategy."""
+    used = 0
+    for p in positions:
+        if p.get('strategy', '') != strategy_name:
+            continue
+        if p.get('is_sell', False):
+            used += MARGIN_PER_LOT.get(p['symbol'], 120000) * p.get('num_lots', 1)
+        else:
+            used += p['entry_premium'] * p.get('lot_size', LOT_SIZES.get(p['symbol'], 50))
+    return used
 
 # v2.5.3: Tiered lot sizing — scale lots by signal quality + available capital
 MAX_LOTS = {'NIFTY': 3, 'BANKNIFTY': 3, 'SENSEX': 4}  # Hard cap on lots per trade
@@ -2229,13 +2268,13 @@ class PaperTrader:
 
             dte = max(1, (3 - dow) + 1) if dow <= 3 else 1
 
-            # Run all 5 strategies
+            # Run active strategies (Survivor HALTED — needs Rs 1L+ capital per symbol)
             strategy_checks = [
                 ('CPR', self.engine.check_cpr_signals),
                 ('Gamma Blast', self.engine.check_gamma_blast_signals),
                 ('Ghost Zone', self.engine.check_ghost_zone_signals),
                 ('PCR+VWAP', self.engine.check_pcr_vwap_signals),
-                ('Survivor', self.engine.check_survivor_signals),
+                # ('Survivor', self.engine.check_survivor_signals),  # HALTED v7 — needs more capital
             ]
 
             for strat_name, check_fn in strategy_checks:
@@ -2339,6 +2378,29 @@ class PaperTrader:
                 logger.info(f"  SKIP_CROSS_HEDGE: {sig['strategy']} {sig['symbol']} {sig['type']} "
                            f"— would hedge {cross_strategy_opposite[0]['strategy']} "
                            f"{cross_strategy_opposite[0]['signal_type']} on same symbol")
+                skipped += 1
+                continue
+
+            # ---- v7.1: Per-strategy capital allocation check ----
+            strat_name = sig.get('strategy', 'Unknown')
+            strat_limit = get_strategy_capital_limit(strat_name)
+            strat_used = get_strategy_used_capital(self.portfolio.positions, strat_name)
+            strat_available = strat_limit - strat_used
+            if strat_available <= 0:
+                logger.info(f"  SKIP_STRAT_CAP: {strat_name} used Rs {strat_used:,.0f} / "
+                           f"Rs {strat_limit:,.0f} ({STRATEGY_ALLOCATION.get(strat_name, 0.10)*100:.0f}%). "
+                           f"No allocation left.")
+                skipped += 1
+                continue
+            # Estimate trade cost for this signal
+            is_sell_est = 'SELL' in sig['type']
+            if is_sell_est:
+                est_cost = MARGIN_PER_LOT.get(sig['symbol'], 120000)
+            else:
+                est_cost = sig['premium'] * LOT_SIZES.get(sig['symbol'], 50)
+            if est_cost > strat_available:
+                logger.info(f"  SKIP_STRAT_CAP: {strat_name} needs Rs {est_cost:,.0f} but only "
+                           f"Rs {strat_available:,.0f} of Rs {strat_limit:,.0f} available.")
                 skipped += 1
                 continue
 

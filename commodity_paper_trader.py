@@ -1,11 +1,16 @@
 """
-COMMODITY PAPER TRADING SYSTEM
-================================
+COMMODITY PAPER TRADING SYSTEM (v7.1)
+=======================================
 Paper trading for MCX commodity options using Angel One SmartAPI
-Adapted CPR, Gamma Blast, Ghost Zone strategies for commodities
+3 ACTIVE STRATEGIES: CPR (45%), Gamma Blast (35%), Ghost Zone (20%)
 Uses Black-76 model (options on futures)
 
-Focus: Gold Mini, Silver Mini, Crude Oil Mini (affordable with Rs 3L)
+Focus: Gold Mini, Crude Oil Mini (affordable with Rs 3L)
+
+Per-Strategy Capital Allocation (Rs 3L total):
+  CPR:          45% = Rs 1,35,000 — best Sharpe on commodities
+  Gamma Blast:  35% = Rs 1,05,000 — solid across all commodities
+  Ghost Zone:   20% = Rs 60,000 — good WR, lower Sharpe
 
 Trading Hours: MCX 9:00 AM - 11:30 PM (extended vs equity 9:15-3:30)
 
@@ -103,6 +108,36 @@ MAX_RISK_PCT = 25                                       # Max 25% of capital per
 MAX_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
 MAX_POSITIONS_PER_COMMODITY = 3                         # Prevent cascade (e.g., 16 SILVERM trades)
 MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 30,000 (10% daily loss limit)
+
+# ====================================================================
+# PER-STRATEGY CAPITAL ALLOCATION FOR COMMODITIES (v7.1)
+# ====================================================================
+# 3 active commodity strategies: CPR, Gamma Blast, Ghost Zone
+# Based on commodity backtest: CPR has best Sharpe (8.91 GOLDM, 6.2 SILVERM),
+# Gamma Blast second (6.28 GOLDM, 5.61 NATGAS), Ghost Zone third (3.85 GOLDM).
+MCX_STRATEGY_ALLOCATION = {
+    'CPR':          0.45,    # 45% = Rs 1,35,000 — best Sharpe on commodities
+    'Gamma Blast':  0.35,    # 35% = Rs 1,05,000 — solid across all commodities
+    'Ghost Zone':   0.20,    # 20% = Rs 60,000 — good WR but lower Sharpe
+}
+
+def get_mcx_strategy_capital_limit(strategy_name):
+    """Get maximum capital allowed for a commodity strategy."""
+    pct = MCX_STRATEGY_ALLOCATION.get(strategy_name, 0.10)
+    return COMMODITY_CAPITAL * pct
+
+def get_mcx_strategy_used_capital(positions, strategy_name, commodities_spec=None):
+    """Calculate capital currently used by a specific commodity strategy."""
+    used = 0
+    for p in positions:
+        if p.get('strategy', '') != strategy_name:
+            continue
+        spec = (commodities_spec or COMMODITIES).get(p['commodity'], {})
+        if p.get('is_sell', False):
+            used += spec.get('margin', 15000) * p.get('num_lots', 1)
+        else:
+            used += p['entry_premium'] * p.get('lot_size', spec.get('lot_size', 1)) * p.get('multiplier', spec.get('multiplier', 1))
+    return used
 
 # v2.5.3: Tiered lot sizing — scale lots by signal quality + available capital
 MCX_MAX_LOTS = {'GOLDM': 5, 'SILVERM': 3, 'CRUDEOILM': 5}
@@ -1730,12 +1765,14 @@ class CommodityPaperTrader:
             # Monthly expiry - estimate DTE
             dte = max(5, 15 - (now.day % 28))
 
+            # v7.1: Only 3 commodity strategies — PCR+VWAP needs equity OI data,
+            # Survivor halted (needs more capital)
             checks = [
                 ('CPR', self.engine.check_cpr_signals),
                 ('Gamma Blast', self.engine.check_gamma_blast_signals),
                 ('Ghost Zone', self.engine.check_ghost_zone_signals),
-                ('PCR+VWAP', self.engine.check_pcr_vwap_signals),
-                ('Survivor', self.engine.check_survivor_signals),
+                # ('PCR+VWAP', ...),  # Not applicable to commodities (needs equity OI chain)
+                # ('Survivor', ...),  # HALTED v7 — needs more capital
             ]
 
             for strat_name, check_fn in checks:
@@ -1822,6 +1859,30 @@ class CommodityPaperTrader:
             if opposite_dir:
                 logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['commodity']} {sig['type']} "
                            f"— already holding {opposite_dir[0]['signal_type']} from same strategy")
+                skipped += 1
+                continue
+
+            # ---- v7.1: Per-strategy capital allocation check ----
+            strat_name = sig.get('strategy', 'Unknown')
+            strat_limit = get_mcx_strategy_capital_limit(strat_name)
+            strat_used = get_mcx_strategy_used_capital(self.portfolio.positions, strat_name)
+            strat_available = strat_limit - strat_used
+            if strat_available <= 0:
+                logger.info(f"  SKIP_STRAT_CAP: {strat_name} used Rs {strat_used:,.0f} / "
+                           f"Rs {strat_limit:,.0f} ({MCX_STRATEGY_ALLOCATION.get(strat_name, 0.10)*100:.0f}%). "
+                           f"No allocation left.")
+                skipped += 1
+                continue
+            # Estimate trade cost for this signal
+            spec = COMMODITIES.get(sig['commodity'], {})
+            is_sell_est = 'SELL' in sig['type']
+            if is_sell_est:
+                est_cost = spec.get('margin', 15000)
+            else:
+                est_cost = sig['premium'] * spec.get('lot_size', 1) * spec.get('multiplier', 1)
+            if est_cost > strat_available:
+                logger.info(f"  SKIP_STRAT_CAP: {strat_name} needs Rs {est_cost:,.0f} but only "
+                           f"Rs {strat_available:,.0f} of Rs {strat_limit:,.0f} available.")
                 skipped += 1
                 continue
 
