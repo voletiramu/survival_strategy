@@ -338,7 +338,17 @@ def compute_signal_score(signal, spot, indicators, vix=None):
         else:
             score += 8
 
-    return min(score, 100)
+    # v3.1: DATA QUALITY PENALTY — penalize when critical market data is missing
+    data_quality = indicators.get('_data_quality', {})
+    if not data_quality.get('has_iv', True):
+        score -= 15  # No IV data = blind entry, heavy penalty
+    if not data_quality.get('has_pcr', True):
+        score -= 10  # No PCR = no sentiment confirmation
+    # Missing VWAP is less critical, small penalty
+    if not data_quality.get('has_vwap', True):
+        score -= 5
+
+    return max(min(score, 100), 0)
 
 
 # ====================================================================
@@ -1677,6 +1687,12 @@ class PaperTrader:
             else:
                 indicators['pcr_source'] = 'PROXY'
 
+            # v3.1: Track data quality for this symbol
+            data_quality = {'has_iv': indicators.get('iv', 0) > 0,
+                           'has_pcr': indicators.get('pcr', 0) > 0,
+                           'has_vwap': indicators.get('vwap', 0) > 0}
+            indicators['_data_quality'] = data_quality
+
             logger.info(f"  ATR: {indicators['atr']:.2f} | IV: {indicators['iv']*100:.1f}% | "
                        f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f} ({indicators['pcr_source']})")
             logger.info(f"  Pivot: {indicators['pivot']:.0f} | TC: {indicators['tc']:.0f} | "
@@ -1787,6 +1803,18 @@ class PaperTrader:
                 skipped += 1
                 continue
 
+            # v3.1: Block opposite direction from ANY strategy on same symbol
+            # e.g., CPR BUY_PE + Gamma Blast BUY_CE on NIFTY = accidental hedge, guaranteed loss
+            cross_strategy_opposite = [p for p in self.portfolio.positions
+                                       if p['symbol'] == sig['symbol']
+                                       and (('CE' in p['signal_type']) != (opt_type == 'CE'))]
+            if cross_strategy_opposite:
+                logger.info(f"  SKIP_CROSS_HEDGE: {sig['strategy']} {sig['symbol']} {sig['type']} "
+                           f"— would hedge {cross_strategy_opposite[0]['strategy']} "
+                           f"{cross_strategy_opposite[0]['signal_type']} on same symbol")
+                skipped += 1
+                continue
+
             # ---- v2.3: Re-entry cooldown check ----
             now = datetime.now()
             cooldown_hit = False
@@ -1821,6 +1849,23 @@ class PaperTrader:
                            f"< VIX-adjusted min Rs {min_prem:.2f} (VIX mult={vix_mult}x)")
                 skipped += 1
                 continue
+
+            # ---- v3.1: Stale CPR pivot validation ----
+            # Reject CPR signals where spot is too far from pivot levels (stale pivots)
+            if 'CPR' in sig.get('strategy', '') or 'CPR' in sig.get('type', ''):
+                sig_indicators = self.engine.compute_indicators(sig['symbol'],
+                                 self.get_intraday_ohlc(sig['symbol']) or
+                                 {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
+                if sig_indicators:
+                    pivot = sig_indicators.get('pivot', 0)
+                    if pivot > 0:
+                        distance_pct = abs(sig['spot'] - pivot) / pivot * 100
+                        if distance_pct > 3.0:  # Spot more than 3% from pivot = stale/wrong data
+                            logger.info(f"  SKIP_STALE_CPR: {sig['symbol']} {sig['type']} "
+                                       f"spot={sig['spot']:.0f} is {distance_pct:.1f}% from pivot={pivot:.0f} "
+                                       f"(max 3%). Pivots may be stale.")
+                            skipped += 1
+                            continue
 
             # ---- v2.3: Signal quality score check ----
             indicators = self.engine.compute_indicators(sig['symbol'],
@@ -1879,6 +1924,16 @@ class PaperTrader:
             # Replace BS premium with real market LTP + compute real Greeks
             bs_premium = sig['premium']
             if real_ltp and real_ltp > 0:
+                # v3.1: Reject trades with extreme BS vs real premium mismatch (>100% gap)
+                if bs_premium > 0:
+                    premium_gap_pct = abs(real_ltp - bs_premium) / bs_premium * 100
+                    if premium_gap_pct > 100:
+                        logger.warning(f"  SKIP_PREMIUM_GAP: {sig['symbol']} {sig['type']} "
+                                      f"BS={bs_premium:.2f} vs Market={real_ltp:.2f} ({premium_gap_pct:.0f}% gap). "
+                                      f"Premium estimation unreliable.")
+                        skipped += 1
+                        continue
+
                 # Preserve target/SL ratios from strategy, apply to real premium
                 if bs_premium > 0:
                     target_ratio = sig.get('target', bs_premium * 1.5) / bs_premium
@@ -2149,16 +2204,23 @@ class PaperTrader:
         # v2.5.2: Get unrealized PnL for loss-only exits
         unrealized_pnl = pos.get('unrealized_pnl', 0)
 
-        # Rule 1: OI surge (time-adaptive) — v2.5.2: only exit when trade is LOSING
+        # v3.1: Dynamic loss threshold based on entry cost (not fixed -Rs 200)
+        # Use 15% of entry cost as loss threshold — proportional to position size
+        entry_premium = pos.get('entry_premium', 0)
+        lot_size = pos.get('lot_size', 50)
+        entry_cost = entry_premium * lot_size
+        oi_loss_threshold = max(-entry_cost * 0.15, -1500)  # 15% of entry cost, min -Rs 1500
+
+        # Rule 1: OI surge (time-adaptive) — v3.1: proportional loss threshold
         if oi_change > oi_threshold:
-            if unrealized_pnl >= -200:
-                # Trade is flat or profitable — don't exit on OI noise
+            if unrealized_pnl >= oi_loss_threshold:
+                # Trade loss is within acceptable range — don't exit on OI noise
                 logger.info(f"  OI_HOLD: {pos['id']} OI={oi_change:.1f}% > {oi_threshold:.0f}% "
-                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+                           f"but PnL Rs {unrealized_pnl:.0f} >= threshold Rs {oi_loss_threshold:.0f}. Holding.")
             else:
                 should_reverse = oi_change > OI_REVERSE_PCT
                 logger.info(f"  OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
-                           f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
+                           f"PnL Rs {unrealized_pnl:.0f} < threshold Rs {oi_loss_threshold:.0f}. "
                            f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')}). Reverse={should_reverse}")
                 return 'OI_SURGE_EXIT', should_reverse
 
@@ -2169,10 +2231,10 @@ class PaperTrader:
                 # Low premium options have noisy IV — skip exit
                 logger.info(f"  IV_HOLD_LOW_PREM: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
                            f"but entry premium Rs {entry_premium:.2f} < 30. Holding (noisy IV on cheap options).")
-            elif unrealized_pnl >= -200:
-                # Trade is flat or profitable — hold despite IV change
+            elif unrealized_pnl >= oi_loss_threshold:
+                # Trade loss is within acceptable range — hold despite IV change
                 logger.info(f"  IV_HOLD: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
-                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+                           f"but PnL Rs {unrealized_pnl:.0f} >= threshold Rs {oi_loss_threshold:.0f}. Holding.")
             else:
                 should_reverse = iv_change > IV_REVERSE_PCT
                 logger.info(f"  IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
@@ -2420,13 +2482,14 @@ class PaperTrader:
                 continue
 
             # ---- PREMIUM UPDATE: Real market LTP with fallback to delta+gamma+theta ----
+            # v3.1: Guard against None values in spot/delta/gamma to prevent NoneType crashes
             entry_spot = pos.get('entry_spot', 0)
-            if entry_spot == 0:
-                entry_spot = pos.get('details', {}).get('spot', spot)
+            if entry_spot == 0 or entry_spot is None:
+                entry_spot = pos.get('details', {}).get('spot', spot) if isinstance(pos.get('details'), dict) else spot
             entry_spot = float(entry_spot) if entry_spot else spot
-            spot_change = spot - entry_spot
-            delta_val = pos.get('delta', 0.5)
-            gamma_val = pos.get('gamma', 0)
+            spot_change = (spot or 0) - (entry_spot or 0)
+            delta_val = float(pos.get('delta', 0) or 0) if pos.get('delta') is not None else 0.5
+            gamma_val = float(pos.get('gamma', 0) or 0)
             hours_held = (datetime.now() - entry_time).total_seconds() / 3600
 
             # Try real option LTP first (15s cached)
@@ -2444,10 +2507,12 @@ class PaperTrader:
 
             self.portfolio.update_position(pos['id'], current_premium)
 
-            # ---- TIME-BASED EXIT: Close stale positions (v2.5: >3 hours with <10% profit) ----
-            if hours_held > 3:  # v2.5: Reduced from 4 hours
-                profit_pct = (pos['unrealized_pnl'] / max(pos['entry_premium'] * pos['lot_size'], 1)) * 100
-                if abs(profit_pct) < 10:  # v2.5: Raised from 5% — exit unless clearly profitable
+            # ---- TIME-BASED EXIT: Close stale positions (v3.1: >4 hours with <15% PnL of max risk) ----
+            if hours_held > 4:  # v3.1: Increased from 3 to 4 hours — give trades more time
+                # v3.1: Use max_risk as denominator (not premium*lot) for fair comparison across strategies
+                max_risk = pos.get('max_risk', pos['entry_premium'] * pos['lot_size'])
+                profit_pct = (pos['unrealized_pnl'] / max(max_risk, 1)) * 100
+                if abs(profit_pct) < 15:  # v3.1: Raised from 10% — exit only if truly stagnant
                     logger.info(f"  TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only {profit_pct:.1f}% profit")
                     self.portfolio.close_position(pos['id'], current_premium, 'TIME_EXIT_NO_PROGRESS')
                     self._track_exit(pos, 'TIME_EXIT_NO_PROGRESS')
@@ -2481,9 +2546,10 @@ class PaperTrader:
                     pos['peak_premium'] = round(current_premium, 2)
 
                 # Phase 1: Lock breakeven at 30% of target reached
+                # v3.1: Increased buffer from 1% to 5% — prevents intraday wick exits
                 if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
                     pos['breakeven_locked'] = True
-                    pos['trailing_sl'] = round(pos['entry_premium'] * 1.01, 2)  # entry + 1% buffer
+                    pos['trailing_sl'] = round(pos['entry_premium'] * 1.05, 2)  # entry + 5% buffer
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} locked SL at Rs {pos['trailing_sl']:.2f}")
 
                 # Phase 3: Tight trail past target (15% from peak — capture max profit)
@@ -2537,9 +2603,10 @@ class PaperTrader:
                     pos['trough_premium'] = round(current_premium, 2)
 
                 # Phase 1: Lock breakeven at 30% of target reached
+                # v3.1: Increased buffer from 1% to 5% — prevents intraday wick exits
                 if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
                     pos['breakeven_locked'] = True
-                    pos['trailing_sl'] = round(pos['entry_premium'] * 0.99, 2)  # entry - 1% buffer
+                    pos['trailing_sl'] = round(pos['entry_premium'] * 0.95, 2)  # entry - 5% buffer
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL locked SL at Rs {pos['trailing_sl']:.2f}")
 
                 # Phase 3: Tight trail past target (15% above trough — capture max profit)
