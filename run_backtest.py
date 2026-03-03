@@ -24,7 +24,7 @@ import seaborn as sns
 from tabulate import tabulate
 from datetime import datetime
 
-from data_fetcher import load_or_fetch, LOT_SIZES
+from data_fetcher import load_or_fetch, LOT_SIZES, DATA_SOURCE
 from backtest_engine import BacktestEngine, BacktestResult
 from strategies.survivor_strategy import SurvivorStrategy
 from strategies.wave_strategy import WaveStrategy
@@ -58,18 +58,23 @@ COMMODITY_SYMBOLS = ['GOLD', 'GOLDM', 'SILVER', 'SILVERM', 'CRUDEOIL', 'NATURALG
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
 
-def run_all_backtests():
-    """Run all strategies on all symbols."""
+def run_all_backtests(data_source=None):
+    """Run all strategies on all symbols.
+
+    Args:
+        data_source: 'angel' for Angel One data, 'csv' for legacy Yahoo CSV
+    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     all_results = []
+    source = data_source or DATA_SOURCE
 
     for symbol in SYMBOLS:
         print(f"\n{'='*60}")
-        print(f"BACKTESTING ON {symbol}")
+        print(f"BACKTESTING ON {symbol} [Data: {source.upper()}]")
         print(f"{'='*60}")
 
         try:
-            df = load_or_fetch(symbol, period="5y")
+            df = load_or_fetch(symbol, period="5y", source=source)
         except Exception as e:
             print(f"Error loading {symbol}: {e}")
             continue
@@ -409,8 +414,18 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Run backtests')
+    parser.add_argument('--source', choices=['angel', 'csv'], default=None,
+                        help='Data source: angel (Angel One) or csv (legacy Yahoo). Default: angel')
+    args = parser.parse_args()
+
+    data_source = args.source or DATA_SOURCE
+    source_label = "Angel One SmartAPI" if data_source == 'angel' else "Legacy Yahoo CSV"
+
     print("="*60)
     print("UNIFIED ALGORITHMIC TRADING STRATEGY BACKTEST")
+    print(f"Data Source: {source_label}")
     print(f"Equity Capital: Rs {EQUITY_CAPITAL:,.0f} | Commodity Capital: Rs {COMMODITY_CAPITAL:,.0f}")
     print(f"Total Capital: Rs {EQUITY_CAPITAL + COMMODITY_CAPITAL:,.0f}")
     print("Equity: Nifty50, BankNifty, Sensex | Commodities: 7 MCX instruments")
@@ -424,11 +439,12 @@ def main():
     # ============================================================
     print("\n" + "="*60)
     print("PART 1: EQUITY INDEX STRATEGIES")
+    print(f"Data Source: {source_label}")
     print(f"Total Equity Pool: Rs {EQUITY_CAPITAL:,.0f} | {NUM_EQUITY_STRATEGIES} strategies | Rs {EQUITY_PER_STRATEGY:,.0f} per strategy")
     print(f"Indices: NIFTY50, BANKNIFTY, SENSEX")
     print("="*60)
 
-    results = run_all_backtests()
+    results = run_all_backtests(data_source=data_source)
 
     if results:
         print("\n" + "="*60)

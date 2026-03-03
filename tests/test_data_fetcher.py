@@ -31,8 +31,8 @@ class TestConstants:
 class TestLoadOrFetch:
     def test_raises_on_missing_file(self):
         from data_fetcher import load_or_fetch
-        with pytest.raises(FileNotFoundError, match="Data file not found"):
-            load_or_fetch("NONEXISTENT_SYMBOL", period="1y")
+        with pytest.raises(FileNotFoundError):
+            load_or_fetch("NONEXISTENT_SYMBOL", period="1y", source="csv")
 
     def test_loads_existing_csv(self, tmp_path):
         from data_fetcher import load_or_fetch
