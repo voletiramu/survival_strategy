@@ -18,7 +18,7 @@ Combined with Camarilla pivots for additional confirmation.
 
 import pandas as pd
 import numpy as np
-from backtest_engine import BacktestEngine, Trade, TradeType, BacktestResult
+from backtest_engine import BacktestEngine, Trade, TradeType, BacktestResult, estimate_iv_from_atr
 
 
 class CPRStrategy:
@@ -75,10 +75,25 @@ class CPRStrategy:
         engine.reset()
         df = df.copy()
 
-        for i in range(2, len(df)):
+        # Compute ATR for IV estimation
+        df['TR'] = np.maximum(
+            df['High'] - df['Low'],
+            np.maximum(
+                abs(df['High'] - df['Close'].shift(1)),
+                abs(df['Low'] - df['Close'].shift(1))
+            )
+        )
+        df['ATR'] = df['TR'].rolling(14).mean()
+
+        for i in range(15, len(df)):
             row = df.iloc[i]
             prev = df.iloc[i - 1]
             date = df.index[i]
+            atr = df['ATR'].iloc[i]
+
+            if pd.isna(atr) or atr == 0:
+                engine.record_equity(date)
+                continue
 
             # Compute CPR from previous day
             cpr = self._compute_cpr(prev['High'], prev['Low'], prev['Close'])
@@ -88,15 +103,14 @@ class CPRStrategy:
             high = row['High']
             low = row['Low']
             close = row['Close']
+            iv = estimate_iv_from_atr(atr, close)
 
             is_narrow = cpr['cpr_width_pct'] < self.narrow_cpr_threshold_pct
             trades_today = 0
 
-            # ---- NARROW CPR: BREAKOUT STRATEGY ----
+            # ---- NARROW CPR: BREAKOUT STRATEGY (BUY only) ----
             if is_narrow:
-                # Bullish breakout: Open above CPR, first candle strong
-                if open_price > cpr['tc'] and close > cpr['r1']:
-                    # Buy CE targeting R2
+                if open_price > cpr['tc'] and close > cpr['r1'] and engine.can_trade(TradeType.BUY_CE):
                     entry_spot = cpr['r1']
                     sl_spot = cpr['pivot']
                     target_spot = cpr['r2']
@@ -110,21 +124,24 @@ class CPRStrategy:
 
                     risk_points = entry_spot - sl_spot
                     if risk_points > 0:
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            entry_spot, exit_spot, TradeType.BUY_CE, lots=1
+                        pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
+                            entry_spot, exit_spot, TradeType.BUY_CE, symbol,
+                            lots=1, iv=iv, atr=atr, trade_date=date
                         )
                         trade = Trade(
                             entry_date=date, exit_date=date,
                             trade_type=TradeType.BUY_CE,
                             entry_price=entry_spot, exit_price=exit_spot,
+                            option_entry_premium=entry_prem,
+                            option_exit_premium=exit_prem,
+                            strike=strike,
                             quantity=engine.lot_size,
                             pnl=pnl, status="CLOSED"
                         )
                         engine.add_trade(trade)
                         trades_today += 1
 
-                # Bearish breakout
-                elif open_price < cpr['bc'] and close < cpr['s1']:
+                elif open_price < cpr['bc'] and close < cpr['s1'] and engine.can_trade(TradeType.BUY_PE):
                     entry_spot = cpr['s1']
                     sl_spot = cpr['pivot']
                     target_spot = cpr['s2']
@@ -138,128 +155,84 @@ class CPRStrategy:
 
                     risk_points = sl_spot - entry_spot
                     if risk_points > 0:
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            entry_spot, exit_spot, TradeType.BUY_PE, lots=1
+                        pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
+                            entry_spot, exit_spot, TradeType.BUY_PE, symbol,
+                            lots=1, iv=iv, atr=atr, trade_date=date
                         )
                         trade = Trade(
                             entry_date=date, exit_date=date,
                             trade_type=TradeType.BUY_PE,
                             entry_price=entry_spot, exit_price=exit_spot,
+                            option_entry_premium=entry_prem,
+                            option_exit_premium=exit_prem,
+                            strike=strike,
                             quantity=engine.lot_size,
                             pnl=pnl, status="CLOSED"
                         )
                         engine.add_trade(trade)
                         trades_today += 1
 
-            # ---- WIDE CPR: MEAN REVERSION / OPTION SELLING ----
+            # ---- WIDE CPR: MEAN REVERSION (BUY on reversals) ----
+            # SELL trades skipped — need Rs 75K+ margin per lot, but we only have Rs 33K.
+            # Instead, use wide CPR reversals as BUY signals at pivot levels.
             else:
-                # Camarilla confirmation for selling
-                if self.use_camarilla:
-                    # If Cam R3 is inside CPR → Short (sell CE)
-                    if (cpr['bc'] <= cam['cam_r3'] <= cpr['tc']
-                            and high >= cam['cam_r3'] and close < cam['cam_r3']):
-                        entry_spot = cam['cam_r3']
-                        sl_spot = cpr['r1']
-                        target_spot = cpr['pivot']
+                if low <= cpr['bc'] * 1.002 and close > cpr['pivot'] and engine.can_trade(TradeType.BUY_CE):
+                    # Price tested bottom CPR and reversed up → Buy CE
+                    entry_spot = cpr['bc']
+                    sl_spot = cpr['s1']
+                    target_spot = cpr['tc']
 
-                        if low <= target_spot:
-                            exit_spot = target_spot
-                        elif high >= sl_spot:
-                            exit_spot = sl_spot
-                        else:
-                            exit_spot = close
+                    if high >= target_spot:
+                        exit_spot = target_spot
+                    elif low <= sl_spot:
+                        exit_spot = sl_spot
+                    else:
+                        exit_spot = close
 
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            entry_spot, exit_spot, TradeType.SELL_CE, lots=1
-                        )
-                        trade = Trade(
-                            entry_date=date, exit_date=date,
-                            trade_type=TradeType.SELL_CE,
-                            entry_price=entry_spot, exit_price=exit_spot,
-                            quantity=engine.lot_size,
-                            pnl=pnl, status="CLOSED"
-                        )
-                        engine.add_trade(trade)
-                        trades_today += 1
+                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
+                        entry_spot, exit_spot, TradeType.BUY_CE, symbol,
+                        lots=1, iv=iv, atr=atr, trade_date=date
+                    )
+                    trade = Trade(
+                        entry_date=date, exit_date=date,
+                        trade_type=TradeType.BUY_CE,
+                        entry_price=entry_spot, exit_price=exit_spot,
+                        option_entry_premium=entry_prem,
+                        option_exit_premium=exit_prem,
+                        strike=strike,
+                        quantity=engine.lot_size,
+                        pnl=pnl, status="CLOSED"
+                    )
+                    engine.add_trade(trade)
 
-                    # If Cam S3 is inside CPR → Long (sell PE)
-                    elif (cpr['bc'] <= cam['cam_s3'] <= cpr['tc']
-                          and low <= cam['cam_s3'] and close > cam['cam_s3']):
-                        entry_spot = cam['cam_s3']
-                        sl_spot = cpr['s1']
-                        target_spot = cpr['pivot']
+                elif high >= cpr['tc'] * 0.998 and close < cpr['pivot'] and engine.can_trade(TradeType.BUY_PE):
+                    # Price tested top CPR and reversed down → Buy PE
+                    entry_spot = cpr['tc']
+                    sl_spot = cpr['r1']
+                    target_spot = cpr['bc']
 
-                        if high >= target_spot:
-                            exit_spot = target_spot
-                        elif low <= sl_spot:
-                            exit_spot = sl_spot
-                        else:
-                            exit_spot = close
+                    if low <= target_spot:
+                        exit_spot = target_spot
+                    elif high >= sl_spot:
+                        exit_spot = sl_spot
+                    else:
+                        exit_spot = close
 
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            entry_spot, exit_spot, TradeType.SELL_PE, lots=1
-                        )
-                        trade = Trade(
-                            entry_date=date, exit_date=date,
-                            trade_type=TradeType.SELL_PE,
-                            entry_price=entry_spot, exit_price=exit_spot,
-                            quantity=engine.lot_size,
-                            pnl=pnl, status="CLOSED"
-                        )
-                        engine.add_trade(trade)
-                        trades_today += 1
-
-                # Standard wide CPR reversal if no Camarilla trade
-                if trades_today == 0:
-                    # Price bounces from CPR bottom → Bullish
-                    if low <= cpr['bc'] * 1.001 and close > cpr['pivot']:
-                        entry_spot = cpr['bc']
-                        sl_spot = cpr['s1']
-                        target_spot = cpr['tc']
-
-                        if high >= target_spot:
-                            exit_spot = target_spot
-                        elif low <= sl_spot:
-                            exit_spot = sl_spot
-                        else:
-                            exit_spot = close
-
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            entry_spot, exit_spot, TradeType.BUY_CE, lots=1
-                        )
-                        trade = Trade(
-                            entry_date=date, exit_date=date,
-                            trade_type=TradeType.BUY_CE,
-                            entry_price=entry_spot, exit_price=exit_spot,
-                            quantity=engine.lot_size,
-                            pnl=pnl, status="CLOSED"
-                        )
-                        engine.add_trade(trade)
-
-                    # Price rejected from CPR top → Bearish
-                    elif high >= cpr['tc'] * 0.999 and close < cpr['pivot']:
-                        entry_spot = cpr['tc']
-                        sl_spot = cpr['r1']
-                        target_spot = cpr['bc']
-
-                        if low <= target_spot:
-                            exit_spot = target_spot
-                        elif high >= sl_spot:
-                            exit_spot = sl_spot
-                        else:
-                            exit_spot = close
-
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            entry_spot, exit_spot, TradeType.BUY_PE, lots=1
-                        )
-                        trade = Trade(
-                            entry_date=date, exit_date=date,
-                            trade_type=TradeType.BUY_PE,
-                            entry_price=entry_spot, exit_price=exit_spot,
-                            quantity=engine.lot_size,
-                            pnl=pnl, status="CLOSED"
-                        )
-                        engine.add_trade(trade)
+                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
+                        entry_spot, exit_spot, TradeType.BUY_PE, symbol,
+                        lots=1, iv=iv, atr=atr, trade_date=date
+                    )
+                    trade = Trade(
+                        entry_date=date, exit_date=date,
+                        trade_type=TradeType.BUY_PE,
+                        entry_price=entry_spot, exit_price=exit_spot,
+                        option_entry_premium=entry_prem,
+                        option_exit_premium=exit_prem,
+                        strike=strike,
+                        quantity=engine.lot_size,
+                        pnl=pnl, status="CLOSED"
+                    )
+                    engine.add_trade(trade)
 
             engine.record_equity(date)
 

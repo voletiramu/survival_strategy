@@ -32,6 +32,9 @@ from strategies.pcr_vwap_strategy import PCRVWAPStrategy
 from strategies.ghost_zone_strategy import GhostZoneStrategy
 from strategies.cpr_strategy import CPRStrategy
 from strategies.gamma_blast_strategy import GammaBlastStrategy
+from strategies.orb_strategy import ORBStrategy
+from strategies.supertrend_strategy import SupertrendStrategy
+from strategies.macd_adx_strategy import MACDMomentumStrategy
 
 # Commodity imports
 from commodity_backtest import (
@@ -44,9 +47,9 @@ from commodity_backtest import (
 EQUITY_CAPITAL = 300000     # Rs 3 Lakhs TOTAL for all equity strategies
 COMMODITY_CAPITAL = 300000  # Rs 3 Lakhs TOTAL for all commodity strategies
 
-# Equity: 6 strategies share Rs 3L → Rs 50K per strategy
-NUM_EQUITY_STRATEGIES = 6
-EQUITY_PER_STRATEGY = EQUITY_CAPITAL // NUM_EQUITY_STRATEGIES  # Rs 50,000
+# Equity: 9 strategies share Rs 3L → ~Rs 33K per strategy
+NUM_EQUITY_STRATEGIES = 9
+EQUITY_PER_STRATEGY = EQUITY_CAPITAL // NUM_EQUITY_STRATEGIES  # Rs 33,333
 
 # Commodity: 3 strategies share Rs 3L → Rs 1L per strategy
 NUM_COMMODITY_STRATEGIES = 3
@@ -89,9 +92,12 @@ def run_all_backtests(data_source=None):
             SurvivorStrategy(pe_gap=30, ce_gap=30, reset_gap=90, max_positions=3),
             WaveStrategy(base_gap=25, max_trades_per_day=6),
             PCRVWAPStrategy(pcr_lookback=5, vwap_tolerance_pct=0.3),
-            GhostZoneStrategy(zone_lookback=20, volume_threshold=1.2, min_impulse_atr_mult=0.8, target_rr=2.0),
+            GhostZoneStrategy(volume_spike_mult=1.2, max_zone_age=80, max_zones=8, min_target_rr=2.5),
             CPRStrategy(risk_per_trade_pct=1.0, max_trades_per_day=2),
             GammaBlastStrategy(),
+            ORBStrategy(),
+            SupertrendStrategy(),
+            MACDMomentumStrategy(),
         ]
 
         for strat in strategies:
@@ -595,12 +601,14 @@ def main():
 
     print(f"\nAll results saved to: {RESULTS_DIR}")
     print("\nFinal Notes:")
-    print("- Equity strategies simulate option P&L from spot price movements (delta=0.5)")
+    print("- v5: Equity strategies use Black-Scholes premium pricing (entry + exit premiums)")
+    print("- Strike: ATM rounded to nearest interval (NIFTY=50, BANKNIFTY=100)")
+    print("- IV: derived from 14-day ATR x 1.2 (IV premium over historical vol)")
+    print("- DTE: computed from weekly expiry cycle (Thu=NIFTY, Wed=BANKNIFTY, Fri=SENSEX)")
+    print("- Premium PnL naturally captures gamma, theta, IV crush effects")
     print("- Commodity strategies use Black-76 model with real MCX costs")
-    print("- Real options have Greeks (gamma, theta, vega) that affect P&L")
-    print("- Slippage and liquidity in real markets may differ")
+    print("- Paper trader uses live Angel option chain for strike selection (best OI)")
     print("- Paper trade for 1-2 weeks before deploying real capital")
-    print("- Weekly or monthly rebalancing of allocation is recommended")
 
 
 if __name__ == "__main__":

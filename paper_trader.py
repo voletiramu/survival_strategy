@@ -617,6 +617,90 @@ class AngelConnection:
             logger.error(f"Real PCR error for {name}: {e}")
         return None
 
+    def select_optimal_strike(self, name, spot, opt_type, expiry_date=None, num_strikes=3):
+        """v5: Select best strike from live option chain based on OI and liquidity.
+
+        Instead of round(spot/interval)*interval, fetches real option chain
+        and picks the strike with best OI among ATM ± num_strikes.
+
+        Args:
+            name: Index name (NIFTY, BANKNIFTY, SENSEX)
+            spot: Current spot price
+            opt_type: 'CE' or 'PE'
+            expiry_date: Expiry in DDMMMYYYY format, or None for nearest
+            num_strikes: Number of strikes above/below ATM to consider
+
+        Returns:
+            dict: {strike, token, symbol, ltp, oi, volume} or None
+        """
+        if not self._connected:
+            return None
+
+        strike_interval = STRIKE_INTERVALS.get(name, 50)
+        atm_strike = round(spot / strike_interval) * strike_interval
+
+        # Generate candidate strikes: ATM ± num_strikes
+        candidates = [atm_strike + i * strike_interval
+                      for i in range(-num_strikes, num_strikes + 1)]
+
+        best = None
+        best_score = -1
+
+        try:
+            # Use optionGreek API to get OI + IV for all strikes (single API call)
+            if expiry_date:
+                self._throttle()
+                data = self.obj.optionGreek({
+                    "name": name,
+                    "expirydate": expiry_date
+                })
+                if data and data.get('data'):
+                    for strike_data in data['data']:
+                        sd_type = strike_data.get('optionType', '')
+                        if sd_type != opt_type:
+                            continue
+                        sd_strike = float(strike_data.get('strikePrice', 0) or 0)
+                        if sd_strike not in candidates:
+                            continue
+
+                        oi = float(strike_data.get('opnInterest', 0) or 0)
+                        ltp = float(strike_data.get('ltp', 0) or 0)
+                        iv = float(strike_data.get('impliedVolatility', 0) or 0)
+                        volume = float(strike_data.get('tradeVolume', 0) or 0)
+
+                        # Score: OI (60%) + volume (20%) + proximity to ATM (20%)
+                        distance = abs(sd_strike - atm_strike) / strike_interval
+                        proximity_score = max(0, 1 - distance * 0.3)  # Closer = higher
+                        score = (oi * 0.6) + (volume * 0.2) + (proximity_score * 1000 * 0.2)
+
+                        if score > best_score and ltp > 0:
+                            best_score = score
+                            best = {
+                                'strike': sd_strike,
+                                'ltp': ltp,
+                                'oi': oi,
+                                'iv': iv / 100 if iv > 1 else iv,  # Normalize to decimal
+                                'volume': volume,
+                            }
+
+                    if best:
+                        # Now find the token for this strike
+                        token_info = self.find_option_tokens(name, None, best['strike'], opt_type)
+                        if token_info:
+                            best['token'] = str(token_info.get('token', ''))
+                            best['symbol'] = token_info.get('symbol', '')
+                        logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
+                                   f"Selected={best['strike']} OI={best['oi']:,.0f} "
+                                   f"LTP={best['ltp']:.2f} IV={best.get('iv', 0)*100:.1f}%")
+                        return best
+
+        except Exception as e:
+            logger.error(f"Option chain strike selection error for {name}: {e}")
+
+        # Fallback: mathematical derivation
+        logger.info(f"  FALLBACK_STRIKE: {name} {opt_type} using ATM={atm_strike} (option chain unavailable)")
+        return {'strike': atm_strike, 'ltp': 0, 'oi': 0, 'iv': 0, 'volume': 0}
+
 
 # ====================================================================
 # PAPER POSITION TRACKER
@@ -1034,6 +1118,150 @@ class StrategyEngine:
         except Exception as e:
             logger.error(f"Download failed for {symbol}: {e}")
 
+    def _fetch_4h_ghost_zones(self, symbol):
+        """Fetch 5m candles from Angel SmartAPI → aggregate to 4H → detect Ghost Zones.
+
+        Multi-Timeframe Architecture (Manish Maheshwari):
+        - 4H charts: Identify Ghost Zones (institutional demand/supply zones)
+        - 5m/3m charts: Entry timing at 50% of zone
+
+        Returns: (demand_zones, supply_zones) lists, or ([], []) if fetch fails.
+        Cache: 4H zones cached for 30 min (zones don't change that often).
+        """
+        cache_key = f"4h_zones_{symbol}"
+        now = time.time()
+
+        # Check cache (30 min TTL)
+        if hasattr(self, '_zone_cache') and cache_key in self._zone_cache:
+            cached_time, cached_demand, cached_supply = self._zone_cache[cache_key]
+            if now - cached_time < 1800:  # 30 min
+                return cached_demand, cached_supply
+
+        if not hasattr(self, '_zone_cache'):
+            self._zone_cache = {}
+
+        if not self.angel or not self.angel._connected:
+            return [], []
+
+        try:
+            # Get token for index
+            token_map = {'NIFTY': '99926000', 'BANKNIFTY': '99926009', 'SENSEX': '99919000'}
+            exchange_map = {'NIFTY': 'NSE', 'BANKNIFTY': 'NSE', 'SENSEX': 'BSE'}
+            token = token_map.get(symbol)
+            exchange = exchange_map.get(symbol, 'NSE')
+            if not token:
+                return [], []
+
+            # Fetch last 5 days of 5-minute candles
+            to_date = datetime.now().strftime('%Y-%m-%d 15:30')
+            from_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d 09:15')
+
+            candles = self.angel.get_historical(exchange, token, 'FIVE_MINUTE', from_date, to_date)
+            if not candles or len(candles) < 48:  # Need at least one 4H block
+                return [], []
+
+            # Build 5m DataFrame
+            df_5m = pd.DataFrame(candles, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            df_5m['DateTime'] = pd.to_datetime(df_5m['DateTime'])
+            df_5m.set_index('DateTime', inplace=True)
+            df_5m = df_5m.astype(float)
+
+            # Aggregate to 4H OHLCV blocks
+            # Each 4H block: Open=first, High=max, Low=min, Close=last, Volume=sum
+            df_4h = df_5m.resample('4h').agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min',
+                'Close': 'last', 'Volume': 'sum'
+            }).dropna()
+
+            if len(df_4h) < 5:
+                return [], []
+
+            # ATR on 4H bars
+            tr_4h = pd.concat([
+                df_4h['High'] - df_4h['Low'],
+                abs(df_4h['High'] - df_4h['Close'].shift(1)),
+                abs(df_4h['Low'] - df_4h['Close'].shift(1))
+            ], axis=1).max(axis=1)
+            atr_4h = tr_4h.rolling(min(14, len(df_4h) - 1)).mean().iloc[-1]
+            avg_vol_4h = df_4h['Volume'].rolling(min(20, len(df_4h) - 1)).mean().iloc[-1]
+
+            # Detect institutional candles on 4H blocks
+            demand_zones = []
+            supply_zones = []
+
+            for j in range(1, len(df_4h) - 1):
+                bar = df_4h.iloc[j]
+                next_bar = df_4h.iloc[j + 1]
+
+                o, h, l, c = bar['Open'], bar['High'], bar['Low'], bar['Close']
+                body = abs(c - o)
+                full_range = h - l
+                if full_range <= 0:
+                    continue
+                body_ratio = body / full_range
+                lower_wick = min(o, c) - l
+                upper_wick = h - max(o, c)
+                vol = bar['Volume']
+
+                # Volume spike on 4H: >= 3x average (true Ghost Trader threshold)
+                vol_mult = vol / max(avg_vol_4h, 1) if avg_vol_4h > 0 else 1
+                if vol_mult < 3.0:
+                    continue  # Strict 3x threshold on 4H candles
+
+                candle_type = None
+                bias = 'bullish' if c > o else 'bearish'
+
+                # Injection (Pin Bar)
+                if body_ratio < 0.35:
+                    if lower_wick > full_range * 0.55:
+                        candle_type = 'injection'
+                        bias = 'bullish'
+                    elif upper_wick > full_range * 0.55:
+                        candle_type = 'injection'
+                        bias = 'bearish'
+
+                # Bat (Expansion)
+                if candle_type is None and body_ratio > 0.70 and body > atr_4h * 0.8:
+                    candle_type = 'bat'
+
+                # Belan (Doji)
+                if candle_type is None and body_ratio < 0.15 and full_range > atr_4h * 0.5:
+                    candle_type = 'belan'
+
+                if candle_type is None:
+                    continue
+
+                # Impulse check
+                impulse_up = next_bar['Close'] > h
+                impulse_down = next_bar['Close'] < l
+
+                zone = {
+                    'low': l, 'high': h, 'mid': (l + h) / 2,
+                    'candle_type': candle_type, 'vol_mult': vol_mult,
+                    'timeframe': '4H',
+                    'created_at': df_4h.index[j],
+                }
+
+                if (bias == 'bullish' or candle_type == 'belan') and impulse_up:
+                    demand_zones.append(zone)
+                if (bias == 'bearish' or candle_type == 'belan') and impulse_down:
+                    supply_zones.append(zone)
+
+            # Keep most recent zones (max 5)
+            demand_zones = demand_zones[-5:]
+            supply_zones = supply_zones[-5:]
+
+            logger.info(f"GTZ 4H zones for {symbol}: {len(demand_zones)} demand, "
+                        f"{len(supply_zones)} supply (from {len(df_4h)} 4H blocks)")
+
+            # Cache
+            self._zone_cache[cache_key] = (now, demand_zones, supply_zones)
+            return demand_zones, supply_zones
+
+        except Exception as e:
+            logger.error(f"4H zone fetch error for {symbol}: {e}")
+            return [], []
+
     def compute_indicators(self, symbol, current_ohlc=None):
         """Compute all indicators needed for strategies."""
         df = self.historical_data.get(symbol)
@@ -1091,13 +1319,87 @@ class StrategyEngine:
         cam_s3 = prev['Close'] - h_range * 1.1 / 4
         cam_s4 = prev['Close'] - h_range * 1.1 / 2
 
-        # Demand/Supply zones
-        recent_lows = df['Low'].tail(10)
-        recent_highs = df['High'].tail(10)
-        demand_zone = recent_lows.min()
-        supply_zone = recent_highs.max()
-        demand_strength = ((recent_lows - demand_zone).abs() < atr * 0.5).sum()
-        supply_strength = ((supply_zone - recent_highs).abs() < atr * 0.5).sum()
+        # Ghost Zones v7: Multi-timeframe zone detection (Manish Maheshwari methodology)
+        # PRIMARY: 4H blocks from 5m candles (true Ghost Trader timeframe)
+        # FALLBACK: Daily bars (when Angel API unavailable)
+        demand_zones, supply_zones = self._fetch_4h_ghost_zones(symbol)
+
+        # Fallback to daily bar zone detection if 4H fetch failed
+        if not demand_zones and not supply_zones:
+            lookback_df = df.tail(40)
+            avg_vol_20 = df['Volume'].tail(20).mean()
+            has_volume = avg_vol_20 > 0
+
+            for j in range(1, len(lookback_df) - 2):
+                bar = lookback_df.iloc[j]
+                next_bar = lookback_df.iloc[j + 1]
+
+                o, h, l, c = bar['Open'], bar['High'], bar['Low'], bar['Close']
+                body = abs(c - o)
+                full_range = h - l
+                if full_range <= 0:
+                    continue
+                body_ratio = body / full_range
+                lower_wick = min(o, c) - l
+                upper_wick = h - max(o, c)
+
+                # Father: Volume or Range confirmation
+                if has_volume:
+                    vol = bar['Volume']
+                    vol_mult = vol / max(avg_vol_20, 1)
+                    if vol_mult < 2.5:
+                        continue
+                else:
+                    # No volume: use range > 1.2x ATR as proxy
+                    vol_mult = full_range / max(atr, 1)
+                    if vol_mult < 1.2:
+                        continue
+
+                candle_type = None
+                bias = 'bullish' if c > o else 'bearish'
+
+                # Injection (Pin Bar)
+                if body_ratio < 0.35:
+                    if lower_wick > full_range * 0.55:
+                        candle_type = 'injection'
+                        bias = 'bullish'
+                    elif upper_wick > full_range * 0.55:
+                        candle_type = 'injection'
+                        bias = 'bearish'
+
+                # Bat (Expansion)
+                if candle_type is None and body_ratio > 0.70 and body > atr * 0.8:
+                    candle_type = 'bat'
+
+                # Belan (Doji)
+                if candle_type is None and body_ratio < 0.15 and full_range > atr * 0.5:
+                    candle_type = 'belan'
+
+                if candle_type is None:
+                    continue
+
+                # Impulse check
+                impulse_up = next_bar['Close'] > h
+                impulse_down = next_bar['Close'] < l
+
+                zone = {'low': l, 'high': h, 'mid': (l + h) / 2,
+                        'candle_type': candle_type, 'vol_mult': vol_mult,
+                        'timeframe': 'daily'}
+
+                if (bias == 'bullish' or candle_type == 'belan') and impulse_up:
+                    demand_zones.append(zone)
+                if (bias == 'bearish' or candle_type == 'belan') and impulse_down:
+                    supply_zones.append(zone)
+
+            demand_zones = demand_zones[-5:]
+            supply_zones = supply_zones[-5:]
+
+        demand_zone = demand_zones[-1]['low'] if demand_zones else df['Low'].tail(10).min()
+        demand_zone_high = demand_zones[-1]['high'] if demand_zones else demand_zone + atr
+        supply_zone = supply_zones[-1]['high'] if supply_zones else df['High'].tail(10).max()
+        supply_zone_low = supply_zones[-1]['low'] if supply_zones else supply_zone - atr
+        demand_strength = len(demand_zones)
+        supply_strength = len(supply_zones)
 
         # Support/Resistance for Survivor
         resistance = prev['High']
@@ -1118,9 +1420,13 @@ class StrategyEngine:
             'cam_s3': cam_s3,
             'cam_s4': cam_s4,
             'demand_zone': demand_zone,
+            'demand_zone_high': demand_zone_high,
             'supply_zone': supply_zone,
+            'supply_zone_low': supply_zone_low,
             'demand_strength': demand_strength,
             'supply_strength': supply_strength,
+            'demand_zones': demand_zones,
+            'supply_zones': supply_zones,
             'resistance': resistance,
             'support': support,
             'prev_high': prev['High'],
@@ -1128,6 +1434,55 @@ class StrategyEngine:
             'prev_close': prev['Close'],
             'prev_range': (prev['High'] - prev['Low']) / max(atr, 1),
         }
+
+    def _get_strike_from_chain(self, symbol, spot, opt_type, dte):
+        """v5: Get optimal strike from live option chain with caching.
+
+        Uses Angel option chain API to select strike with best OI/liquidity.
+        Falls back to mathematical derivation if API unavailable.
+        Caches results for 5 minutes to avoid excessive API calls.
+
+        Returns: (strike, real_ltp, real_iv) tuple
+        """
+        cache_key = f"{symbol}_{opt_type}"
+        now = time.time()
+
+        # Check cache (5 min TTL)
+        if hasattr(self, '_strike_cache') and cache_key in self._strike_cache:
+            cached = self._strike_cache[cache_key]
+            if now - cached['time'] < 300:  # 5 min
+                return cached['strike'], cached['ltp'], cached['iv']
+
+        if not hasattr(self, '_strike_cache'):
+            self._strike_cache = {}
+
+        strike_interval = STRIKE_INTERVALS.get(symbol, 50)
+        fallback_strike = round(spot / strike_interval) * strike_interval
+
+        # Try option chain
+        if self.angel and self.angel._connected:
+            try:
+                expiry = self._get_nearest_expiry(symbol)
+                if expiry:
+                    result = self.angel.select_optimal_strike(
+                        symbol, spot, opt_type, expiry_date=expiry
+                    )
+                    if result and result.get('strike', 0) > 0:
+                        self._strike_cache[cache_key] = {
+                            'strike': result['strike'],
+                            'ltp': result.get('ltp', 0),
+                            'iv': result.get('iv', 0),
+                            'time': now,
+                        }
+                        return result['strike'], result.get('ltp', 0), result.get('iv', 0)
+            except Exception as e:
+                logger.debug(f"Option chain strike lookup failed for {symbol}: {e}")
+
+        # Fallback
+        self._strike_cache[cache_key] = {
+            'strike': fallback_strike, 'ltp': 0, 'iv': 0, 'time': now
+        }
+        return fallback_strike, 0, 0
 
     def check_cpr_signals(self, symbol, spot, ohlc, indicators, dow, dte):
         """CPR Strategy - Gomathi Shankar."""
@@ -1139,33 +1494,37 @@ class StrategyEngine:
         # NARROW CPR (< 0.3%) = BREAKOUT expected
         if ind['cpr_width'] < 0.3:
             if spot > ind['tc']:
-                # Bullish breakout
-                ce_strike = round(spot / strike_interval) * strike_interval
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-                if g['price'] > MIN_PREMIUM_BUY:
+                ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_CE_CPR',
                         'strike': ce_strike,
-                        'premium': g['price'],
+                        'premium': premium,
                         'greeks': g,
-                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bullish breakout above TC={ind['tc']:.0f}",
-                        'target': g['price'] * 2.5 if ohlc['high'] > ind['cam_r3'] else g['price'] * 1.8,
-                        'sl': g['price'] * 0.4,
+                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * 2.5 if ohlc['high'] > ind['cam_r3'] else premium * 1.8,
+                        'sl': premium * 0.4,
                     })
 
             elif spot < ind['bc']:
-                # Bearish breakout
-                pe_strike = round(spot / strike_interval) * strike_interval
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-                if g['price'] > MIN_PREMIUM_BUY:
+                pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_PE_CPR',
                         'strike': pe_strike,
-                        'premium': g['price'],
+                        'premium': premium,
                         'greeks': g,
-                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bearish breakout below BC={ind['bc']:.0f}",
-                        'target': g['price'] * 2.5 if ohlc['low'] < ind['cam_s3'] else g['price'] * 1.8,
-                        'sl': g['price'] * 0.4,
+                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * 2.5 if ohlc['low'] < ind['cam_s3'] else premium * 1.8,
+                        'sl': premium * 0.4,
                     })
 
         # WIDE CPR (> 0.5%) = MEAN REVERSION (sell)
@@ -1240,47 +1599,206 @@ class StrategyEngine:
         if day_range < 0.3:
             return signals
 
-        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         day_label = "EXPIRY" if is_expiry_day else f"{days_to_expiry}DTE"
 
         if abs(body) > atr * 0.15:
             if body > 0:  # Up breakout
-                ce_strike = round(spot / strike_interval) * strike_interval
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'] * iv_mult, 'CE')
-                if g['price'] > MIN_PREMIUM_BUY:
+                ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_CE_GAMMA',
                         'strike': ce_strike,
-                        'premium': g['price'],
+                        'premium': premium,
                         'greeks': g,
                         'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
-                                  f"ATR={atr:.0f} range={day_range:.2f}x",
-                        'target': g['price'] * target_mult,
-                        'sl': g['price'] * sl_mult,
+                                  f"ATR={atr:.0f} range={day_range:.2f}x"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * target_mult,
+                        'sl': premium * sl_mult,
                     })
             else:  # Down breakout
-                pe_strike = round(spot / strike_interval) * strike_interval
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'] * iv_mult, 'PE')
-                if g['price'] > MIN_PREMIUM_BUY:
+                pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
                     signals.append({
                         'type': 'BUY_PE_GAMMA',
                         'strike': pe_strike,
-                        'premium': g['price'],
+                        'premium': premium,
                         'greeks': g,
                         'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
-                                  f"ATR={atr:.0f} range={day_range:.2f}x",
-                        'target': g['price'] * target_mult,
-                        'sl': g['price'] * sl_mult,
+                                  f"ATR={atr:.0f} range={day_range:.2f}x"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * target_mult,
+                        'sl': premium * sl_mult,
                     })
 
         return signals
 
     def check_ghost_zone_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Ghost Zone - demand/supply zone trading.
-        v2.5: DISABLED — 23% WR equity, -Rs 12,276 combined on Feb 27 backtest.
-        Zone detection too weak (10-candle lookback, 2-touch threshold).
+        """Ghost Trade Zone (GTZ) v7 - Manish Maheshwari Methodology.
+
+        Based on the Ghost Trader's Free F&O Masterclass:
+        - Grandfather (Candlesticks): Institutional footprint candles
+        - Father (Volume): 3x+ volume spike = institutional money injection
+        - Mother (OI): Angel API OI validates the zone
+
+        Phase 1: Identify Ghost Zone from institutional candles + volume
+        Phase 2: Check exhaustion rule (300pt NIFTY / 1000pt BANKNIFTY)
+        Phase 3: Entry at 50% of zone on retest, SL below zone
         """
-        return []  # v2.5: Disabled pending redesign with stronger zone logic
+        signals = []
+        ind = indicators
+        T = dte / 365
+        atr = ind['atr']
+
+        if atr <= 0:
+            return signals
+
+        # ---- EXHAUSTION RULE ----
+        # Ghost Zone setups are MOST profitable after trend exhaustion
+        exhaustion_pts = {'NIFTY': 300, 'BANKNIFTY': 1000, 'SENSEX': 1000}.get(symbol, 300)
+        trend_distance = abs(spot - ind.get('prev_close', spot))  # Simplified for real-time
+
+        # ---- OI-Based Zone Validation (The Mother) ----
+        oi_data = {}  # strike → {put_oi, call_oi}
+        if self.angel and self.angel._connected:
+            try:
+                expiry = self._get_nearest_expiry(symbol)
+                if expiry:
+                    self.angel._throttle()
+                    data = self.angel.obj.optionGreek({
+                        "name": symbol,
+                        "expirydate": expiry
+                    })
+                    if data and data.get('data'):
+                        for sd in data['data']:
+                            sd_strike = float(sd.get('strikePrice', 0) or 0)
+                            sd_type = sd.get('optionType', '')
+                            sd_oi = float(sd.get('opnInterest', 0) or 0)
+                            if sd_strike not in oi_data:
+                                oi_data[sd_strike] = {'put_oi': 0, 'call_oi': 0}
+                            if sd_type == 'PE':
+                                oi_data[sd_strike]['put_oi'] = sd_oi
+                            elif sd_type == 'CE':
+                                oi_data[sd_strike]['call_oi'] = sd_oi
+            except Exception as e:
+                logger.debug(f"GTZ OI fetch error: {e}")
+
+        # ---- Find OI-confirmed demand/supply levels ----
+        strike_interval = STRIKE_INTERVALS.get(symbol, 50)
+
+        # High PUT OI = institutional support (demand zone)
+        # High CALL OI = institutional resistance (supply zone)
+        oi_demand_strike = 0
+        oi_supply_strike = 0
+        max_put_oi = 0
+        max_call_oi = 0
+
+        for stk, oi_info in oi_data.items():
+            # Only consider strikes near spot (within 5 intervals)
+            if abs(stk - spot) > strike_interval * 5:
+                continue
+            if stk < spot and oi_info['put_oi'] > max_put_oi:
+                max_put_oi = oi_info['put_oi']
+                oi_demand_strike = stk
+            if stk > spot and oi_info['call_oi'] > max_call_oi:
+                max_call_oi = oi_info['call_oi']
+                oi_supply_strike = stk
+
+        # ---- Combine Price-Action Zones with OI Zones ----
+        demand_zones = ind.get('demand_zones', [])
+        supply_zones = ind.get('supply_zones', [])
+
+        # ---- DEMAND ZONE RETEST: BUY CE ----
+        for dz in demand_zones:
+            zone_low = dz['low']
+            zone_high = dz['high']
+            zone_mid = (zone_low + zone_high) / 2
+
+            # Price dips INTO the zone and bounces (close above zone)
+            if ohlc['low'] <= zone_high and ohlc['low'] >= zone_low * 0.998 and spot > zone_high:
+
+                # OI validation (The Mother): check if PUT OI exists near this zone
+                oi_label = ""
+                oi_score = 0
+                if oi_demand_strike > 0 and abs(oi_demand_strike - zone_low) <= strike_interval:
+                    oi_score = max_put_oi
+                    oi_label = f" [PUT OI={max_put_oi:,.0f}@{oi_demand_strike}]"
+
+                # Exhaustion boost: signal is stronger if trend is exhausted
+                exhaustion_label = ""
+                if ind.get('demand_strength', 0) >= 2 or oi_score > 10000:
+                    pass  # Strong zone — take it
+                elif oi_score == 0:
+                    continue  # No OI backing AND weak price zone — skip
+
+                # Entry at 50% of zone (institutional limit order level)
+                entry_at_mid = zone_mid
+                ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+
+                if premium > MIN_PREMIUM_BUY:
+                    signals.append({
+                        'type': 'BUY_CE_GTZ',
+                        'strike': ce_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"GTZ v7 Demand: zone={zone_low:.0f}-{zone_high:.0f} "
+                                  f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
+                                  f"{oi_label}{exhaustion_label}"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * 2.5,  # 2.5:1 RR minimum
+                        'sl': premium * 0.35,      # SL below zone
+                    })
+                    break
+
+        # ---- SUPPLY ZONE RETEST: BUY PE ----
+        for sz in supply_zones:
+            zone_low = sz['low']
+            zone_high = sz['high']
+            zone_mid = (zone_low + zone_high) / 2
+
+            if ohlc['high'] >= zone_low and ohlc['high'] <= zone_high * 1.002 and spot < zone_low:
+
+                oi_label = ""
+                oi_score = 0
+                if oi_supply_strike > 0 and abs(oi_supply_strike - zone_high) <= strike_interval:
+                    oi_score = max_call_oi
+                    oi_label = f" [CALL OI={max_call_oi:,.0f}@{oi_supply_strike}]"
+
+                if ind.get('supply_strength', 0) >= 2 or oi_score > 10000:
+                    pass
+                elif oi_score == 0:
+                    continue
+
+                pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+
+                if premium > MIN_PREMIUM_BUY:
+                    signals.append({
+                        'type': 'BUY_PE_GTZ',
+                        'strike': pe_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"GTZ v7 Supply: zone={zone_low:.0f}-{zone_high:.0f} "
+                                  f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
+                                  f"{oi_label}"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * 2.5,
+                        'sl': premium * 0.35,
+                    })
+                    break
+
+        return signals
 
     def check_pcr_vwap_signals(self, symbol, spot, ohlc, indicators, dow, dte):
         """PCR+VWAP Strategy - CA Nitin Muraka.
@@ -1301,32 +1819,38 @@ class StrategyEngine:
 
         # BUY CE: PCR > 1.05 (bullish), near VWAP
         if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot >= vwap * 0.995:
-            ce_strike = round(spot / strike_interval) * strike_interval
-            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
+            ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
                 signals.append({
                     'type': 'BUY_CE',
                     'strike': ce_strike,
-                    'premium': g['price'],
+                    'premium': premium,
                     'greeks': g,
-                    'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.5,
-                    'sl': g['price'] * 0.4,
+                    'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
+                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                    'target': premium * 2.5,
+                    'sl': premium * 0.4,
                 })
 
         # BUY PE: PCR < 0.95 (bearish), near VWAP
         elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot <= vwap * 1.005:
-            pe_strike = round(spot / strike_interval) * strike_interval
-            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
+            pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
                 signals.append({
                     'type': 'BUY_PE',
                     'strike': pe_strike,
-                    'premium': g['price'],
+                    'premium': premium,
                     'greeks': g,
-                    'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.5,
-                    'sl': g['price'] * 0.4,
+                    'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
+                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                    'target': premium * 2.5,
+                    'sl': premium * 0.4,
                 })
 
         return signals

@@ -14,7 +14,7 @@ Backtested on daily OHLC by simulating intraday range oscillations.
 
 import pandas as pd
 import numpy as np
-from backtest_engine import BacktestEngine, Trade, TradeType, BacktestResult
+from backtest_engine import BacktestEngine, Trade, TradeType, BacktestResult, estimate_iv_from_atr
 
 
 class WaveStrategy:
@@ -90,32 +90,30 @@ class WaveStrategy:
             daily_range = high - low
             trades_today = 0
 
+            iv = estimate_iv_from_atr(atr, open_price)
+
             # Simulate oscillations within the day
-            # Estimate number of oscillations from daily range vs gap
             if daily_range > 0 and df.iloc[i]['is_ranging']:
-                # In ranging market: capture oscillations
                 up_moves = max(0, (high - open_price) / up_gap)
                 down_moves = max(0, (open_price - low) / down_gap)
 
-                # Sell CE when price goes up
                 ce_trades = min(int(up_moves), self.max_trades_per_day // 2)
                 for _ in range(ce_trades):
                     if trades_today >= self.max_trades_per_day:
                         break
-                    # In range, price comes back - profitable for CE seller
-                    # Approximate: entry at high area, exit at close (mean reversion)
-                    pnl = engine.simulate_option_pnl_from_spot(
-                        open_price + up_gap, close, TradeType.SELL_CE, lots=1
+                    entry_spot = open_price + up_gap
+                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
+                        entry_spot, close, TradeType.SELL_CE, symbol,
+                        lots=1, iv=iv, atr=atr, trade_date=date
                     )
-                    # Range-bound bonus: options lose time value
-                    theta_bonus = atr * 0.05 * engine.lot_size
-                    pnl += theta_bonus
 
                     trade = Trade(
                         entry_date=date, exit_date=date,
                         trade_type=TradeType.SELL_CE,
-                        entry_price=open_price + up_gap,
-                        exit_price=close,
+                        entry_price=entry_spot, exit_price=close,
+                        option_entry_premium=entry_prem,
+                        option_exit_premium=exit_prem,
+                        strike=strike,
                         quantity=engine.lot_size,
                         pnl=pnl, status="CLOSED"
                     )
@@ -123,22 +121,23 @@ class WaveStrategy:
                     net_position += 1
                     trades_today += 1
 
-                # Sell PE when price goes down
                 pe_trades = min(int(down_moves), self.max_trades_per_day // 2)
                 for _ in range(pe_trades):
                     if trades_today >= self.max_trades_per_day:
                         break
-                    pnl = engine.simulate_option_pnl_from_spot(
-                        open_price - down_gap, close, TradeType.SELL_PE, lots=1
+                    entry_spot = open_price - down_gap
+                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
+                        entry_spot, close, TradeType.SELL_PE, symbol,
+                        lots=1, iv=iv, atr=atr, trade_date=date
                     )
-                    theta_bonus = atr * 0.05 * engine.lot_size
-                    pnl += theta_bonus
 
                     trade = Trade(
                         entry_date=date, exit_date=date,
                         trade_type=TradeType.SELL_PE,
-                        entry_price=open_price - down_gap,
-                        exit_price=close,
+                        entry_price=entry_spot, exit_price=close,
+                        option_entry_premium=entry_prem,
+                        option_exit_premium=exit_prem,
+                        strike=strike,
                         quantity=engine.lot_size,
                         pnl=pnl, status="CLOSED"
                     )
@@ -148,22 +147,19 @@ class WaveStrategy:
 
             else:
                 # Trending day - Wave strategy struggles
-                # Might take 1-2 wrong trades
                 if daily_range > atr * 1.5:
-                    # Strong trend day - take loss
-                    if close > open_price:
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            open_price, close, TradeType.SELL_CE, lots=1
-                        )
-                    else:
-                        pnl = engine.simulate_option_pnl_from_spot(
-                            open_price, close, TradeType.SELL_PE, lots=1
-                        )
+                    tt = TradeType.SELL_CE if close > open_price else TradeType.SELL_PE
+                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
+                        open_price, close, tt, symbol,
+                        lots=1, iv=iv, atr=atr, trade_date=date
+                    )
                     trade = Trade(
                         entry_date=date, exit_date=date,
-                        trade_type=TradeType.SELL_CE if close > open_price else TradeType.SELL_PE,
-                        entry_price=open_price,
-                        exit_price=close,
+                        trade_type=tt,
+                        entry_price=open_price, exit_price=close,
+                        option_entry_premium=entry_prem,
+                        option_exit_premium=exit_prem,
+                        strike=strike,
                         quantity=engine.lot_size,
                         pnl=pnl, status="CLOSED"
                     )

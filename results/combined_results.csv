@@ -1,22 +1,31 @@
 Market,Strategy,Symbol,Trades,Win Rate %,Total PnL,Sharpe
-Equity,Survivor (Raahi Bhushan),NIFTY50,640,79.8,"6,477,691",2.28
-Equity,Wave Extractor (Raahi Bhushan),NIFTY50,1968,43.7,"-1,100,133",-0.32
+Equity,Survivor (Raahi Bhushan),NIFTY50,642,85.7,"1,986,754",2.41
+Equity,Wave Extractor (Raahi Bhushan),NIFTY50,1968,48.5,"-1,778,010",-0.82
 Equity,PCR+VWAP (CA Nitin Muraka),NIFTY50,0,0.0,0,0.00
-Equity,Ghost Trade Zone (GTZ),NIFTY50,0,0.0,0,0.00
-Equity,CPR (Gomathi Shankar),NIFTY50,589,71.5,"353,758",2.34
-Equity,Gamma Blast (All Days),NIFTY50,784,91.3,"3,335,102",4.83
-Equity,Survivor (Raahi Bhushan),BANKNIFTY,1875,92.1,"47,741,604",2.70
-Equity,Wave Extractor (Raahi Bhushan),BANKNIFTY,2064,47.3,"-670,111",-0.09
+Equity,Ghost Trade Zone (GTZ),NIFTY50,22,100.0,"182,738",0.99
+Equity,CPR (Gomathi Shankar),NIFTY50,434,65.9,"-32,410",0.07
+Equity,Gamma Blast (All Days),NIFTY50,784,91.3,"3,335,841",4.14
+Equity,ORB Breakout,NIFTY50,0,0.0,0,0.00
+Equity,Supertrend,NIFTY50,35,40.0,"105,603",0.55
+Equity,MACD Momentum,NIFTY50,61,36.1,"-35,705",0.39
+Equity,Survivor (Raahi Bhushan),BANKNIFTY,1976,94.0,"11,061,532",1.36
+Equity,Wave Extractor (Raahi Bhushan),BANKNIFTY,2064,51.7,"-1,512,127",0.34
 Equity,PCR+VWAP (CA Nitin Muraka),BANKNIFTY,0,0.0,0,0.00
-Equity,Ghost Trade Zone (GTZ),BANKNIFTY,0,0.0,0,0.00
-Equity,CPR (Gomathi Shankar),BANKNIFTY,560,67.1,"386,630",1.33
-Equity,Gamma Blast (All Days),BANKNIFTY,763,89.9,"4,702,853",3.74
-Equity,Survivor (Raahi Bhushan),SENSEX,2025,94.3,"55,419,471",3.55
-Equity,Wave Extractor (Raahi Bhushan),SENSEX,2026,44.0,"-1,053,450",0.44
+Equity,Ghost Trade Zone (GTZ),BANKNIFTY,24,100.0,"298,673",1.26
+Equity,CPR (Gomathi Shankar),BANKNIFTY,81,56.8,"-33,547",-0.45
+Equity,Gamma Blast (All Days),BANKNIFTY,763,89.9,"4,702,853",3.25
+Equity,ORB Breakout,BANKNIFTY,0,0.0,0,0.00
+Equity,Supertrend,BANKNIFTY,32,31.2,"-12,753",-0.42
+Equity,MACD Momentum,BANKNIFTY,61,39.3,"143,083",-0.55
+Equity,Survivor (Raahi Bhushan),SENSEX,1978,96.1,"14,492,791",2.32
+Equity,Wave Extractor (Raahi Bhushan),SENSEX,2026,48.2,"-1,893,272",-1.45
 Equity,PCR+VWAP (CA Nitin Muraka),SENSEX,0,0.0,0,0.00
-Equity,Ghost Trade Zone (GTZ),SENSEX,0,0.0,0,0.00
-Equity,CPR (Gomathi Shankar),SENSEX,551,72.2,"395,124",2.35
-Equity,Gamma Blast (All Days),SENSEX,783,92.3,"4,152,046",4.68
+Equity,Ghost Trade Zone (GTZ),SENSEX,21,100.0,"157,554",1.53
+Equity,CPR (Gomathi Shankar),SENSEX,125,60.8,"-33,969",-0.38
+Equity,Gamma Blast (All Days),SENSEX,783,92.3,"4,152,296",4.00
+Equity,ORB Breakout,SENSEX,0,0.0,0,0.00
+Equity,Supertrend,SENSEX,35,48.6,"106,749",0.60
+Equity,MACD Momentum,SENSEX,61,41.0,"2,074",-0.44
 Commodity,CPR (GOLD),-,1135,94.6%,"Rs 49,378,294",3.47
 Commodity,Gamma Blast (GOLD),-,651,92.2%,"Rs 19,724,592",3.22
 Commodity,Ghost Zone (GOLD),-,228,82.0%,"Rs 4,128,881",3.01
