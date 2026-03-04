@@ -110,24 +110,18 @@ MAX_POSITIONS_PER_COMMODITY = 3                         # Prevent cascade (e.g.,
 MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 30,000 (10% daily loss limit)
 
 # ====================================================================
-# PER-STRATEGY CAPITAL ALLOCATION FOR COMMODITIES (v7.1)
+# PER-STRATEGY TRACKING FOR COMMODITIES (v7.2) — MONITORING ONLY, NO HARD CAPS
 # ====================================================================
-# 3 active commodity strategies: CPR, Gamma Blast, Ghost Zone
-# Based on commodity backtest: CPR has best Sharpe (8.91 GOLDM, 6.2 SILVERM),
-# Gamma Blast second (6.28 GOLDM, 5.61 NATGAS), Ghost Zone third (3.85 GOLDM).
+# Rs 3L is a SHARED POOL across all commodity strategies.
+# Strategies compete for the same capital — no per-strategy hard limits.
 MCX_STRATEGY_ALLOCATION = {
-    'CPR':          0.45,    # 45% = Rs 1,35,000 — best Sharpe on commodities
-    'Gamma Blast':  0.35,    # 35% = Rs 1,05,000 — solid across all commodities
-    'Ghost Zone':   0.20,    # 20% = Rs 60,000 — good WR but lower Sharpe
+    'CPR':          0.45,    # 45% target — best Sharpe on commodities
+    'Gamma Blast':  0.35,    # 35% target — solid across all commodities
+    'Ghost Zone':   0.20,    # 20% target — good WR but lower Sharpe
 }
 
-def get_mcx_strategy_capital_limit(strategy_name):
-    """Get maximum capital allowed for a commodity strategy."""
-    pct = MCX_STRATEGY_ALLOCATION.get(strategy_name, 0.10)
-    return COMMODITY_CAPITAL * pct
-
 def get_mcx_strategy_used_capital(positions, strategy_name, commodities_spec=None):
-    """Calculate capital currently used by a specific commodity strategy."""
+    """Calculate capital currently used by a specific commodity strategy (for logging only)."""
     used = 0
     for p in positions:
         if p.get('strategy', '') != strategy_name:
@@ -1862,29 +1856,12 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
-            # ---- v7.1: Per-strategy capital allocation check ----
+            # ---- v7.2: Per-strategy capital usage LOGGING (shared pool, no hard caps) ----
             strat_name = sig.get('strategy', 'Unknown')
-            strat_limit = get_mcx_strategy_capital_limit(strat_name)
             strat_used = get_mcx_strategy_used_capital(self.portfolio.positions, strat_name)
-            strat_available = strat_limit - strat_used
-            if strat_available <= 0:
-                logger.info(f"  SKIP_STRAT_CAP: {strat_name} used Rs {strat_used:,.0f} / "
-                           f"Rs {strat_limit:,.0f} ({MCX_STRATEGY_ALLOCATION.get(strat_name, 0.10)*100:.0f}%). "
-                           f"No allocation left.")
-                skipped += 1
-                continue
-            # Estimate trade cost for this signal
-            spec = COMMODITIES.get(sig['commodity'], {})
-            is_sell_est = 'SELL' in sig['type']
-            if is_sell_est:
-                est_cost = spec.get('margin', 15000)
-            else:
-                est_cost = sig['premium'] * spec.get('lot_size', 1) * spec.get('multiplier', 1)
-            if est_cost > strat_available:
-                logger.info(f"  SKIP_STRAT_CAP: {strat_name} needs Rs {est_cost:,.0f} but only "
-                           f"Rs {strat_available:,.0f} of Rs {strat_limit:,.0f} available.")
-                skipped += 1
-                continue
+            strat_target_pct = MCX_STRATEGY_ALLOCATION.get(strat_name, 0.10) * 100
+            logger.info(f"  STRAT_USAGE: {strat_name} using Rs {strat_used:,.0f} "
+                       f"(target {strat_target_pct:.0f}% of Rs {COMMODITY_CAPITAL:,.0f} pool)")
 
             # ---- v2.3: Re-entry cooldown check ----
             now = datetime.now()
@@ -2365,18 +2342,65 @@ class CommodityPaperTrader:
         self.check_exits()
         self.portfolio.print_status()
 
-        # Save signals log
+        # Save signals log with full data for future backtests (v7.2)
         if signals:
             today = datetime.now().strftime('%Y%m%d')
             log_file = os.path.join(PAPER_DIR, f'commodity_signals_{today}.csv')
-            rows = [{'timestamp': datetime.now().isoformat(), 'strategy': s['strategy'],
-                     'commodity': s['commodity'], 'type': s['type'], 'strike': s['strike'],
-                     'premium': s['premium'], 'spot': s.get('spot'), 'reason': s['reason']}
-                    for s in signals]
+
+            # Build executed signal keys for status tracking
+            executed_keys = set()
+            for p in self.portfolio.positions:
+                key = f"{p.get('strategy', '')}_{p.get('commodity', '')}_{p.get('strike', 0)}"
+                executed_keys.add(key)
+
+            rows = []
+            for s in signals:
+                greeks = s.get('greeks', {})
+                sig_key = f"{s.get('strategy', '')}_{s.get('commodity', '')}_{s.get('strike', 0)}"
+
+                # Fetch volume from OHLC if available
+                ohlc = self.get_intraday_ohlc(s.get('commodity', ''))
+                volume = ohlc.get('volume', 0) if ohlc else 0
+
+                # Get IV from indicators
+                indicators = self.engine.compute_indicators(
+                    s.get('commodity', ''),
+                    ohlc or {'open': s.get('spot', 0), 'high': s.get('spot', 0),
+                             'low': s.get('spot', 0), 'close': s.get('spot', 0), 'volume': 0}
+                )
+                iv = indicators.get('iv', 0) if indicators else 0
+
+                rows.append({
+                    'timestamp': datetime.now().isoformat(),
+                    'strategy': s.get('strategy', ''),
+                    'commodity': s.get('commodity', ''),
+                    'type': s['type'],
+                    'strike': s['strike'],
+                    'premium': s['premium'],
+                    'spot': s.get('spot', 0),
+                    'dte': s.get('dte', 0),
+                    # Greeks
+                    'delta': greeks.get('delta', 0),
+                    'gamma': greeks.get('gamma', 0),
+                    'theta': greeks.get('theta', 0),
+                    'vega': greeks.get('vega', 0),
+                    'iv': greeks.get('iv', iv),
+                    # Market data
+                    'volume': volume,
+                    'oi': s.get('oi', 0),
+                    # Trade params
+                    'target': s.get('target', 0),
+                    'sl': s.get('sl', 0),
+                    'quality_score': s.get('quality_score', 0),
+                    'reason': s.get('reason', ''),
+                    # Execution status
+                    'executed': sig_key in executed_keys,
+                })
             df = pd.DataFrame(rows)
             if os.path.exists(log_file):
                 df = pd.concat([pd.read_csv(log_file), df], ignore_index=True)
             df.to_csv(log_file, index=False)
+            logger.info(f"  Signals logged ({len(rows)} rows): {log_file}")
 
     def run_continuous(self, interval=5):
         self._running = True

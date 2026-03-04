@@ -246,8 +246,38 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
                     logger.error(f"[EquityThread] Scan error: {e}")
                     import traceback
                     traceback.print_exc()
+                    # v7.2: Send Telegram notification for scan failure
+                    try:
+                        from trade_notifier import notify_scan_failure
+                        notify_scan_failure('EQUITY', str(e), 'EquityThread')
+                    except Exception:
+                        pass
             elif current_time > EQUITY_CLOSE and is_weekday:
                 logger.info("[EquityThread] Equity market closed for today.")
+                # v7.2: Send equity EOD summary at market close (3:30 PM)
+                try:
+                    eq_trader = _trader_refs.get('equity')
+                    if eq_trader:
+                        eq_summary = eq_trader.get_eod_summary()
+                        eq_wins = sum(1 for t in eq_trader.portfolio.closed_trades if t.get('pnl', 0) > 0)
+                        eq_closed = eq_summary.get('closed_trades', 0)
+                        eq_wr = (eq_wins / eq_closed * 100) if eq_closed > 0 else 0
+                        from trade_notifier import send_message
+                        msg = (
+                            f"<b>📊 EQUITY SESSION CLOSED (3:30 PM)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"<b>Capital:</b> Rs {eq_trader.portfolio.capital:,.0f}\n"
+                            f"<b>PnL:</b> Rs {eq_summary.get('actual_pnl', 0):,.0f}\n"
+                            f"<b>Open:</b> {eq_summary.get('open_positions', 0)} | "
+                            f"<b>Closed:</b> {eq_closed}\n"
+                            f"<b>Win Rate:</b> {eq_wr:.0f}%\n"
+                            f"<b>Signals:</b> {eq_summary.get('total_signals', 0)}\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"Commodity session continues until 11:30 PM"
+                        )
+                        send_message(msg)
+                except Exception as eod_err:
+                    logger.error(f"[EquityThread] EOD summary error: {eod_err}")
                 break
             elif not is_weekday:
                 logger.info("[EquityThread] Weekend - equity market closed. Waiting...")
@@ -258,6 +288,12 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
         logger.error(f"[EquityThread] Fatal error: {e}")
         import traceback
         traceback.print_exc()
+        # v7.2: Notify fatal error
+        try:
+            from trade_notifier import notify_scan_failure
+            notify_scan_failure('EQUITY', f'FATAL: {str(e)}', 'EquityThread')
+        except Exception:
+            pass
 
     logger.info(f"[EquityThread] Exited after {scan_count if 'scan_count' in dir() else 0} scans")
 
@@ -303,6 +339,12 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                     logger.error(f"[CommodityThread] Scan error: {e}")
                     import traceback
                     traceback.print_exc()
+                    # v7.2: Send Telegram notification for scan failure
+                    try:
+                        from trade_notifier import notify_scan_failure
+                        notify_scan_failure('COMMODITY', str(e), 'CommodityThread')
+                    except Exception:
+                        pass
             elif mcx_open and not commodity_trade_ok:
                 logger.info(f"[CommodityThread] MCX open but trades blocked until {COMMODITY_TRADE_START}")
             elif current_time > MCX_CLOSE and is_weekday:
@@ -317,6 +359,12 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
         logger.error(f"[CommodityThread] Fatal error: {e}")
         import traceback
         traceback.print_exc()
+        # v7.2: Notify fatal error
+        try:
+            from trade_notifier import notify_scan_failure
+            notify_scan_failure('COMMODITY', f'FATAL: {str(e)}', 'CommodityThread')
+        except Exception:
+            pass
 
     logger.info(f"[CommodityThread] Exited after {scan_count if 'scan_count' in dir() else 0} scans")
 
@@ -456,11 +504,19 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
             logger.warning(f"[MAIN] WebSocket setup failed: {e} — using REST API fallback")
             ws_feed = None
 
-    # Send Telegram startup notification with instance ID
+    # v7.2: Detect auto-restart (if lock file existed, this is a restart, not first start)
     instance_label = get_instance_label(instance_id)
+    is_restart = os.path.exists(os.path.join(LOCK_DIR, 'last_shutdown.flag'))
     try:
-        from trade_notifier import notify_scanner_start
-        notify_scanner_start(instance_id=instance_id)
+        if is_restart:
+            from trade_notifier import notify_service_restart
+            notify_service_restart(instance_id=instance_id, reason='Auto-restart by systemd')
+            logger.info("[MAIN] Detected auto-restart — Telegram notified")
+            # Clean up flag
+            os.remove(os.path.join(LOCK_DIR, 'last_shutdown.flag'))
+        else:
+            from trade_notifier import notify_scanner_start
+            notify_scanner_start(instance_id=instance_id)
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
 
@@ -592,8 +648,15 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
     if ws_feed:
         ws_feed.stop()
 
-    # Release PID lock
+    # Release PID lock and set restart detection flag
     release_lock()
+    # v7.2: Create flag so next startup knows it's a restart
+    try:
+        os.makedirs(LOCK_DIR, exist_ok=True)
+        with open(os.path.join(LOCK_DIR, 'last_shutdown.flag'), 'w') as f:
+            f.write(datetime.now().isoformat())
+    except Exception:
+        pass
 
     show_combined_status()
     logger.info("Paper trading system shut down cleanly.")

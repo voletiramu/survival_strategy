@@ -69,27 +69,21 @@ MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
 MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
 
 # ====================================================================
-# PER-STRATEGY CAPITAL ALLOCATION (v7.1)
+# PER-STRATEGY TRACKING (v7.2) — MONITORING ONLY, NO HARD CAPS
 # ====================================================================
-# With Survivor HALTED, redistribute Rs 3L equity among 4 active strategies.
-# Based on Angel backtest results: Gamma Blast (Sharpe 4.42, best risk-adjusted),
-# CPR (70% WR, consistent), Ghost Zone v7 (100% WR on daily, 22-24 trades),
-# PCR+VWAP (needs intraday OI — lower allocation until proven live).
+# Rs 3L is a SHARED POOL across all equity strategies.
+# Strategies compete for the same capital — no per-strategy hard limits.
+# Allocation percentages are for MONITORING/LOGGING only.
 STRATEGY_ALLOCATION = {
-    'Gamma Blast': 0.40,    # 40% = Rs 1,20,000 — best risk-adjusted (Sharpe 4.42)
-    'CPR':         0.30,    # 30% = Rs 90,000 — solid 70% WR, consistent
-    'Ghost Zone':  0.20,    # 20% = Rs 60,000 — v7 institutional methodology
-    'PCR+VWAP':    0.10,    # 10% = Rs 30,000 — needs live OI data to prove
+    'Gamma Blast': 0.40,    # 40% target — best risk-adjusted (Sharpe 4.42)
+    'CPR':         0.30,    # 30% target — solid 70% WR, consistent
+    'Ghost Zone':  0.20,    # 20% target — v7 institutional methodology
+    'PCR+VWAP':    0.10,    # 10% target — needs live OI data to prove
     # 'Survivor':  0.00,    # HALTED — needs Rs 1L+ per symbol
 }
 
-def get_strategy_capital_limit(strategy_name):
-    """Get maximum capital allowed for a strategy."""
-    pct = STRATEGY_ALLOCATION.get(strategy_name, 0.10)  # Default 10% if unknown
-    return EQUITY_CAPITAL * pct
-
 def get_strategy_used_capital(positions, strategy_name):
-    """Calculate capital currently used by a specific strategy."""
+    """Calculate capital currently used by a specific strategy (for logging only)."""
     used = 0
     for p in positions:
         if p.get('strategy', '') != strategy_name:
@@ -2381,28 +2375,12 @@ class PaperTrader:
                 skipped += 1
                 continue
 
-            # ---- v7.1: Per-strategy capital allocation check ----
+            # ---- v7.2: Per-strategy capital usage LOGGING (shared pool, no hard caps) ----
             strat_name = sig.get('strategy', 'Unknown')
-            strat_limit = get_strategy_capital_limit(strat_name)
             strat_used = get_strategy_used_capital(self.portfolio.positions, strat_name)
-            strat_available = strat_limit - strat_used
-            if strat_available <= 0:
-                logger.info(f"  SKIP_STRAT_CAP: {strat_name} used Rs {strat_used:,.0f} / "
-                           f"Rs {strat_limit:,.0f} ({STRATEGY_ALLOCATION.get(strat_name, 0.10)*100:.0f}%). "
-                           f"No allocation left.")
-                skipped += 1
-                continue
-            # Estimate trade cost for this signal
-            is_sell_est = 'SELL' in sig['type']
-            if is_sell_est:
-                est_cost = MARGIN_PER_LOT.get(sig['symbol'], 120000)
-            else:
-                est_cost = sig['premium'] * LOT_SIZES.get(sig['symbol'], 50)
-            if est_cost > strat_available:
-                logger.info(f"  SKIP_STRAT_CAP: {strat_name} needs Rs {est_cost:,.0f} but only "
-                           f"Rs {strat_available:,.0f} of Rs {strat_limit:,.0f} available.")
-                skipped += 1
-                continue
+            strat_target_pct = STRATEGY_ALLOCATION.get(strat_name, 0.10) * 100
+            logger.info(f"  STRAT_USAGE: {strat_name} using Rs {strat_used:,.0f} "
+                       f"(target {strat_target_pct:.0f}% of Rs {EQUITY_CAPITAL:,.0f} pool)")
 
             # ---- v2.3: Re-entry cooldown check ----
             now = datetime.now()
@@ -3412,35 +3390,74 @@ class PaperTrader:
         self.save_signals_log(signals)
 
     def save_signals_log(self, signals):
-        """Save signals to CSV."""
+        """Save ALL signals to CSV with full data for future backtests.
+        v7.2: Added volume, IV, OI, vega, quality_score, pcr, vwap, executed status.
+        """
         if not signals:
             return
         today = datetime.now().strftime('%Y%m%d')
         log_file = os.path.join(PAPER_DIR, f'signals_{today}.csv')
+
+        # Build list of executed signal IDs for status tracking
+        executed_ids = set()
+        for p in self.portfolio.positions:
+            # Match by strategy+symbol+strike to mark executed
+            key = f"{p.get('strategy', '')}_{p.get('symbol', '')}_{p.get('strike', 0)}"
+            executed_ids.add(key)
+
         rows = []
         for sig in signals:
+            greeks = sig.get('greeks', {})
+            sig_key = f"{sig.get('strategy', '')}_{sig.get('symbol', '')}_{sig.get('strike', 0)}"
+
+            # Fetch volume from intraday OHLC if available
+            ohlc = self.get_intraday_ohlc(sig.get('symbol', ''))
+            volume = ohlc.get('volume', 0) if ohlc else 0
+
+            # Get IV from computed indicators
+            indicators = self.engine.compute_indicators(
+                sig.get('symbol', ''),
+                ohlc or {'open': sig.get('spot', 0), 'high': sig.get('spot', 0),
+                         'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
+            )
+            iv = indicators.get('iv', 0) if indicators else 0
+            pcr = indicators.get('pcr', 0) if indicators else 0
+            vwap = indicators.get('vwap', 0) if indicators else 0
+
             rows.append({
                 'timestamp': datetime.now().isoformat(),
-                'strategy': sig['strategy'],
-                'symbol': sig['symbol'],
+                'strategy': sig.get('strategy', ''),
+                'symbol': sig.get('symbol', ''),
                 'type': sig['type'],
                 'strike': sig['strike'],
                 'premium': sig['premium'],
-                'delta': sig['greeks']['delta'],
-                'gamma': sig['greeks']['gamma'],
-                'theta': sig['greeks']['theta'],
-                'spot': sig.get('spot'),
-                'dte': sig.get('dte'),
-                'reason': sig['reason'],
-                'target': sig.get('target'),
-                'sl': sig.get('sl'),
+                'spot': sig.get('spot', 0),
+                'dte': sig.get('dte', 0),
+                # Greeks
+                'delta': greeks.get('delta', 0),
+                'gamma': greeks.get('gamma', 0),
+                'theta': greeks.get('theta', 0),
+                'vega': greeks.get('vega', 0),
+                'iv': greeks.get('iv', iv),
+                # Market data
+                'volume': volume,
+                'oi': sig.get('oi', 0),
+                'pcr': pcr,
+                'vwap': vwap,
+                # Trade params
+                'target': sig.get('target', 0),
+                'sl': sig.get('sl', 0),
+                'quality_score': sig.get('quality_score', 0),
+                'reason': sig.get('reason', ''),
+                # Execution status
+                'executed': sig_key in executed_ids,
             })
         df = pd.DataFrame(rows)
         if os.path.exists(log_file):
             existing = pd.read_csv(log_file)
             df = pd.concat([existing, df], ignore_index=True)
         df.to_csv(log_file, index=False)
-        logger.info(f"  Signals logged: {log_file}")
+        logger.info(f"  Signals logged ({len(rows)} rows): {log_file}")
 
     def run_continuous(self, interval_minutes=5):
         """Run continuous scanning during market hours."""

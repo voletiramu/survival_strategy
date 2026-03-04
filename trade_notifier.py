@@ -353,6 +353,35 @@ def notify_reversal(market, original_type, reverse_type, symbol, strike, premium
     return send_message(msg)
 
 
+def notify_scan_failure(market, error_msg, thread_name=''):
+    """v7.2: Notify when a scan cycle throws an exception."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"<b>🔴 SCAN FAILURE</b>\n"
+        f"<b>Market:</b> {market}\n"
+        f"<b>Thread:</b> {thread_name}\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Error:</b> <code>{str(error_msg)[:500]}</code>\n"
+        f"\nBot will retry next scan cycle."
+    )
+    return send_message(msg)
+
+
+def notify_service_restart(instance_id='vultr', reason=''):
+    """v7.2: Notify when the service starts/restarts (including auto-restart)."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    label = '☁️ Vultr VPS' if instance_id == 'vultr' else '🖥️ Local'
+    msg = (
+        f"<b>🔄 SERVICE RESTART</b>\n"
+        f"<b>Instance:</b> {label}\n"
+        f"<b>Time:</b> {now}\n"
+    )
+    if reason:
+        msg += f"<b>Reason:</b> {reason}\n"
+    msg += f"Paper trading system restarting..."
+    return send_message(msg)
+
+
 if __name__ == "__main__":
     # Test: send a test message
     print("Testing Telegram Bot connection...")
