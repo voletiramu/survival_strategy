@@ -127,9 +127,11 @@ class TestSimulateOptionPnl:
     def test_buy_ce_profit_on_up_move(self):
         e = BacktestEngine(lot_size=25, brokerage_per_order=20, slippage_points=2)
         pnl = e.simulate_option_pnl_from_spot(20000, 20200, TradeType.BUY_CE, lots=1)
-        expected_raw = 200 * 0.5 * 25
-        costs = 20 * 2 + 2 * 25
-        assert pnl == pytest.approx(expected_raw - costs)
+        # raw = 200 * 0.5 * 25 = 2500, BUY profit *= 0.75 → 1875
+        # slippage_mult = 1 + min(200/20000*10, 1) = 1.1
+        # costs = 20*2 + 2*25*1.1 = 40 + 55 = 95
+        expected = 200 * 0.5 * 25 * 0.75 - (20 * 2 + 2 * 25 * 1.1)
+        assert pnl == pytest.approx(expected)
 
     def test_buy_ce_loss_on_down_move(self):
         e = BacktestEngine(lot_size=25, brokerage_per_order=20, slippage_points=2)
@@ -139,40 +141,44 @@ class TestSimulateOptionPnl:
     def test_buy_pe_profit_on_down_move(self):
         e = BacktestEngine(lot_size=25, brokerage_per_order=20, slippage_points=2)
         pnl = e.simulate_option_pnl_from_spot(20000, 19800, TradeType.BUY_PE, lots=1)
-        expected_raw = 200 * 0.5 * 25
-        costs = 20 * 2 + 2 * 25
-        assert pnl == pytest.approx(expected_raw - costs)
+        # raw = 200 * 0.5 * 25 = 2500, BUY profit *= 0.75 → 1875
+        # slippage_mult = 1.1, costs = 40 + 55 = 95
+        expected = 200 * 0.5 * 25 * 0.75 - (20 * 2 + 2 * 25 * 1.1)
+        assert pnl == pytest.approx(expected)
 
     def test_sell_ce_profit_on_down_move(self):
         e = BacktestEngine(lot_size=25, brokerage_per_order=20, slippage_points=2)
         pnl = e.simulate_option_pnl_from_spot(20000, 19800, TradeType.SELL_CE, lots=1)
-        expected_raw = 200 * 0.5 * 25
-        costs = 20 * 2 + 2 * 25
-        assert pnl == pytest.approx(expected_raw - costs)
+        # raw = 200 * 0.5 * 25 = 2500 (no 0.75 for SELL, capped at premium*qty=7500)
+        # slippage_mult = 1.1, costs = 40 + 55 = 95
+        expected = 200 * 0.5 * 25 - (20 * 2 + 2 * 25 * 1.1)
+        assert pnl == pytest.approx(expected)
 
     def test_sell_pe_profit_on_up_move(self):
         e = BacktestEngine(lot_size=25, brokerage_per_order=20, slippage_points=2)
         pnl = e.simulate_option_pnl_from_spot(20000, 20200, TradeType.SELL_PE, lots=1)
-        expected_raw = 200 * 0.5 * 25
-        costs = 20 * 2 + 2 * 25
-        assert pnl == pytest.approx(expected_raw - costs)
+        # raw = 200 * 0.5 * 25 = 2500 (no 0.75 for SELL, capped at premium*qty=7500)
+        # slippage_mult = 1.1, costs = 40 + 55 = 95
+        expected = 200 * 0.5 * 25 - (20 * 2 + 2 * 25 * 1.1)
+        assert pnl == pytest.approx(expected)
 
     def test_flat_move_only_costs(self):
         e = BacktestEngine(lot_size=25, brokerage_per_order=20, slippage_points=2)
         pnl = e.simulate_option_pnl_from_spot(20000, 20000, TradeType.BUY_CE, lots=1)
-        costs = 20 * 2 + 2 * 25
+        # pnl = 0 (no profit, no 0.75 multiplier), slippage_mult = 1.0
+        costs = 20 * 2 + 2 * 25 * 1.0
         assert pnl == pytest.approx(-costs)
 
     def test_multiple_lots(self):
         e = BacktestEngine(lot_size=25, brokerage_per_order=20, slippage_points=2)
         pnl_1 = e.simulate_option_pnl_from_spot(20000, 20200, TradeType.BUY_CE, lots=1)
         pnl_3 = e.simulate_option_pnl_from_spot(20000, 20200, TradeType.BUY_CE, lots=3)
-        expected_raw_1 = 200 * 0.5 * 25
-        expected_raw_3 = 200 * 0.5 * 75
-        costs_1 = 20 * 2 + 2 * 25
-        costs_3 = 20 * 2 + 2 * 75
-        assert pnl_1 == pytest.approx(expected_raw_1 - costs_1)
-        assert pnl_3 == pytest.approx(expected_raw_3 - costs_3)
+        # lots=1: raw=2500*0.75=1875, slippage_mult=1.1, costs=40+55=95 → 1780
+        expected_1 = 200 * 0.5 * 25 * 0.75 - (20 * 2 + 2 * 25 * 1.1)
+        # lots=3: raw=7500*0.75=5625, slippage_mult=1.1, costs=40+165=205 → 5420
+        expected_3 = 200 * 0.5 * 75 * 0.75 - (20 * 2 + 2 * 75 * 1.1)
+        assert pnl_1 == pytest.approx(expected_1)
+        assert pnl_3 == pytest.approx(expected_3)
 
 
 # ── Trade Recording & Capital Tests ──────────────────────────────────────────

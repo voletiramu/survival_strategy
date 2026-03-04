@@ -190,12 +190,12 @@ class TestPCRVWAPStrategy:
         pcr = s._compute_simulated_pcr(df, 2)
         assert pcr == 1.0
 
-    def test_compute_daily_vwap(self):
+    def test_compute_simulated_pcr_valid_index(self):
         s = self._get_strat()
-        row = pd.Series({"High": 20100, "Low": 19900, "Close": 20050})
-        vwap = s._compute_daily_vwap(row)
-        expected = (20100 + 19900 + 20050) / 3
-        assert vwap == pytest.approx(expected)
+        df = make_ohlcv(n=20, seed=42)
+        pcr = s._compute_simulated_pcr(df, 10)
+        assert isinstance(pcr, (int, float))
+        assert pcr > 0
 
     def test_buys_only_ce_or_pe(self):
         s = self._get_strat()
@@ -213,13 +213,13 @@ class TestPCRVWAPStrategy:
 class TestGhostZoneStrategy:
     def _get_strat(self):
         from strategies.ghost_zone_strategy import GhostZoneStrategy
-        return GhostZoneStrategy(zone_lookback=20, volume_threshold=1.2,
-                                 min_impulse_atr_mult=0.8, target_rr=2.0)
+        return GhostZoneStrategy(volume_spike_mult=1.2, max_zone_age=80,
+                                 max_zones=8, min_target_rr=2.0)
 
     def test_init_params(self):
         s = self._get_strat()
-        assert s.zone_lookback == 20
-        assert s.target_rr == 2.0
+        assert s.volume_spike_mult == 1.2
+        assert s.min_target_rr == 2.0
 
     def test_backtest_runs_without_error(self):
         s = self._get_strat()
@@ -228,7 +228,7 @@ class TestGhostZoneStrategy:
         result = s.backtest(df, engine, "NIFTY50")
         assert isinstance(result, BacktestResult)
 
-    def test_find_zones_returns_lists(self):
+    def test_scan_for_zones_returns_lists(self):
         s = self._get_strat()
         df = make_ohlcv(n=100, seed=42)
         df['TR'] = np.maximum(
@@ -236,8 +236,10 @@ class TestGhostZoneStrategy:
             np.maximum(abs(df['High'] - df['Close'].shift(1)),
                        abs(df['Low'] - df['Close'].shift(1))))
         df['ATR'] = df['TR'].rolling(14).mean()
+        df['AvgVol'] = df['Volume'].rolling(20).mean()
         atr = df['ATR'].iloc[50]
-        demand, supply = s._find_zones(df, 50, atr)
+        avg_vol = df['AvgVol'].iloc[50]
+        demand, supply = s._scan_for_zones(df, 50, atr, avg_vol, has_volume=True)
         assert isinstance(demand, list)
         assert isinstance(supply, list)
 

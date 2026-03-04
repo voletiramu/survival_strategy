@@ -2181,10 +2181,20 @@ class PaperTrader:
         return None
 
     def is_market_open(self):
-        """Check if equity market is currently open (9:15 AM - 3:30 PM IST, Mon-Fri)."""
+        """Check if equity market is currently open (9:15 AM - 3:30 PM IST, Mon-Fri, non-holidays)."""
         now = datetime.now()
         if now.weekday() > 4:  # Saturday/Sunday
             return False
+
+        # Check NSE/BSE holiday calendar
+        from market_holidays import is_nse_holiday
+        is_holiday, holiday_name = is_nse_holiday(now.date())
+        if is_holiday:
+            if not hasattr(self, '_holiday_logged') or self._holiday_logged != now.date():
+                logger.warning(f"  NSE HOLIDAY: {holiday_name} — no equity trading today")
+                self._holiday_logged = now.date()
+            return False
+
         current_time = now.time()
         return MARKET_OPEN <= current_time <= MARKET_CLOSE
 

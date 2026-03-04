@@ -68,7 +68,7 @@ class TestFullPipeline:
 
     def test_ghost_zone_full_pipeline(self):
         from strategies.ghost_zone_strategy import GhostZoneStrategy
-        strat = GhostZoneStrategy(zone_lookback=20, volume_threshold=1.2)
+        strat = GhostZoneStrategy(volume_spike_mult=1.2, max_zone_age=80)
         df = make_ohlcv(n=200, seed=4)
         engine = make_engine(lot_size=65)
         result = strat.backtest(df, engine, "NIFTY50")

@@ -51,28 +51,44 @@ def _normalize_angel_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_angel_cached(symbol_key: str) -> pd.DataFrame:
-    """Load Angel One data from local cache if fresh enough for backtesting."""
+    """Load Angel One data from local cache for backtesting.
+
+    Priority:
+      1. Fresh Angel cache (angel_cache/ dir, <7 days old) — latest API data
+      2. Historical Angel files (data/options/*_2000d.csv) — any age (static backtest data)
+      3. Historical Angel files (data/options/*_1825d.csv) — any age (5yr variant)
+    """
     import time
     os.makedirs(ANGEL_CACHE_DIR, exist_ok=True)
     angel_name = ANGEL_SYMBOL_MAP.get(symbol_key, symbol_key)
 
-    # Check locations in priority order
-    cache_paths = [
-        os.path.join(ANGEL_CACHE_DIR, f"{angel_name}_spot_daily.csv"),
+    # Check fresh cache first (recently fetched from Angel API)
+    fresh_cache = os.path.join(ANGEL_CACHE_DIR, f"{angel_name}_spot_daily.csv")
+    if os.path.exists(fresh_cache):
+        age_hours = (time.time() - os.path.getmtime(fresh_cache)) / 3600
+        if age_hours < 168:  # 7 days
+            df = pd.read_csv(fresh_cache, index_col=0, parse_dates=True)
+            df = _normalize_angel_df(df)
+            print(f"Loaded {symbol_key} from Angel cache: {len(df)} rows "
+                  f"({df.index[0].date()} to {df.index[-1].date()}) "
+                  f"[fresh cache {age_hours:.1f}h old]", flush=True)
+            return df
+
+    # Historical Angel data files — no age restriction (these are static backtest datasets)
+    historical_paths = [
         os.path.join(DATA_DIR, "options", f"{angel_name}_spot_one_day_2000d.csv"),
+        os.path.join(DATA_DIR, "options", f"{angel_name}_spot_one_day_1825d.csv"),
     ]
 
-    for cache_file in cache_paths:
-        if os.path.exists(cache_file):
-            age_hours = (time.time() - os.path.getmtime(cache_file)) / 3600
-            # For backtesting, daily data up to 7 days old is fine
-            if age_hours < 168:  # 7 days
-                df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-                df = _normalize_angel_df(df)
-                print(f"Loaded {symbol_key} from Angel cache: {len(df)} rows "
-                      f"({df.index[0].date()} to {df.index[-1].date()}) "
-                      f"[cache {age_hours:.1f}h old]", flush=True)
-                return df
+    for hist_file in historical_paths:
+        if os.path.exists(hist_file):
+            df = pd.read_csv(hist_file, index_col=0, parse_dates=True)
+            df = _normalize_angel_df(df)
+            print(f"Loaded {symbol_key} from Angel historical: {len(df)} rows "
+                  f"({df.index[0].date()} to {df.index[-1].date()}) "
+                  f"[source: {os.path.basename(hist_file)}]", flush=True)
+            return df
+
     return None
 
 
@@ -149,20 +165,21 @@ def load_or_fetch(symbol_key: str, period: str = "5y", interval: str = "1d",
 
         print(f"Angel One fetch failed for {symbol_key}, falling back to CSV...", flush=True)
 
-    # Fallback: load from pre-downloaded CSV (legacy Yahoo data)
+    # Fallback: load from pre-downloaded CSV (legacy Yahoo data — DEPRECATED)
     filename = f"{symbol_key}_{interval}_{period}.csv"
     filepath = os.path.join(DATA_DIR, filename)
 
     if os.path.exists(filepath):
         df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-        print(f"Loaded {symbol_key} from CSV: {len(df)} rows "
-              f"({df.index[0].date()} to {df.index[-1].date()}) [legacy Yahoo]", flush=True)
+        print(f"WARNING: Loaded {symbol_key} from Yahoo CSV: {len(df)} rows "
+              f"({df.index[0].date()} to {df.index[-1].date()}) "
+              f"[DEPRECATED — prefer Angel data]", flush=True)
         return df
 
     raise FileNotFoundError(
         f"No data available for {symbol_key}.\n"
-        f"Angel One fetch failed and CSV not found at: {filepath}\n"
-        f"Run 'python download_data.py' or check Angel One credentials."
+        f"Angel One data not found in data/options/ and CSV not found at: {filepath}\n"
+        f"Run 'python data_fetcher.py --source angel --force' to fetch from Angel One."
     )
 
 

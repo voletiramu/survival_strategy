@@ -51,6 +51,9 @@ MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)
 COMMODITY_TRADE_START = dtime(9, 15)  # Commodity trades from 9:15 AM (no time barrier)
 
+# Holiday calendar
+from market_holidays import is_nse_holiday, is_mcx_holiday
+
 # Default scan intervals (seconds)
 # With WebSocket real-time LTP, we can scan faster (no REST API call for spot prices)
 DEFAULT_EQUITY_INTERVAL = 15    # 15 seconds — was 45s before WebSocket
@@ -231,10 +234,22 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
 
         scan_count = 0
 
+        _nse_holiday_logged = None  # Prevent log spam on holidays
+
         while not stop_event.is_set():
             now = datetime.now()
             current_time = now.time()
             is_weekday = now.weekday() <= 4
+
+            # Check NSE holiday calendar
+            nse_holiday, holiday_name = is_nse_holiday(now.date())
+            if nse_holiday and is_weekday:
+                if _nse_holiday_logged != now.date():
+                    logger.info(f"[EquityThread] NSE HOLIDAY: {holiday_name} — skipping equity trading")
+                    _nse_holiday_logged = now.date()
+                stop_event.wait(300)  # Sleep 5 min on holidays
+                continue
+
             equity_open = EQUITY_OPEN <= current_time <= EQUITY_CLOSE and is_weekday
 
             if equity_open:
@@ -323,10 +338,22 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
 
         scan_count = 0
 
+        _mcx_holiday_logged = None  # Prevent log spam on holidays
+
         while not stop_event.is_set():
             now = datetime.now()
             current_time = now.time()
             is_weekday = now.weekday() <= 4
+
+            # Check MCX holiday calendar (supports partial holidays)
+            mcx_closed, mcx_reason = is_mcx_holiday(now.date(), current_time)
+            if mcx_closed and is_weekday:
+                if _mcx_holiday_logged != (now.date(), current_time.hour):
+                    logger.info(f"[CommodityThread] MCX CLOSED: {mcx_reason}")
+                    _mcx_holiday_logged = (now.date(), current_time.hour)
+                stop_event.wait(300)  # Sleep 5 min on holidays
+                continue
+
             mcx_open = MCX_OPEN <= current_time <= MCX_CLOSE and is_weekday
             commodity_trade_ok = current_time >= COMMODITY_TRADE_START
 
