@@ -1365,10 +1365,10 @@ class CommodityPaperTrader:
         if not option_token:
             return None
 
-        # Check cache (15-second TTL)
+        # Check cache (5-second TTL — v7.6.2: reduced from 15s to minimize price lag)
         cache_key = f"MCX_{option_token}"
         cached = self._option_ltp_cache.get(cache_key)
-        if cached and (datetime.now() - cached['time']).total_seconds() < 15:
+        if cached and (datetime.now() - cached['time']).total_seconds() < 5:
             return cached['ltp']
 
         try:
