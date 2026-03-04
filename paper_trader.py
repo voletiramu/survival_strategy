@@ -2499,17 +2499,16 @@ class PaperTrader:
                 logger.info(f"  OI/LTP fetch at entry failed for {sig['symbol']}: {e}")
 
             # Replace BS premium with real market LTP + compute real Greeks
+            # v7.3: Always use LIVE market price — no BS-derived pricing in live trading
             bs_premium = sig['premium']
             if real_ltp and real_ltp > 0:
-                # v3.1: Reject trades with extreme BS vs real premium mismatch (>100% gap)
+                # Log BS vs Market gap for monitoring (info only, never reject)
                 if bs_premium > 0:
                     premium_gap_pct = abs(real_ltp - bs_premium) / bs_premium * 100
-                    if premium_gap_pct > 100:
-                        logger.warning(f"  SKIP_PREMIUM_GAP: {sig['symbol']} {sig['type']} "
-                                      f"BS={bs_premium:.2f} vs Market={real_ltp:.2f} ({premium_gap_pct:.0f}% gap). "
-                                      f"Premium estimation unreliable.")
-                        skipped += 1
-                        continue
+                    if premium_gap_pct > 50:
+                        logger.info(f"  PREMIUM_NOTE: {sig['symbol']} {sig['type']} "
+                                   f"BS={bs_premium:.2f} vs Market={real_ltp:.2f} ({premium_gap_pct:.0f}% gap) "
+                                   f"— using LIVE market price")
 
                 # Preserve target/SL ratios from strategy, apply to real premium
                 if bs_premium > 0:
