@@ -171,6 +171,7 @@ MCX_STRATEGY_EXIT_MULT = {
 MCX_MIN_PREMIUM_BUY = 5         # Min Rs 5 premium for commodity BUY trades
 MCX_MIN_PREMIUM_SELL = 10       # Min Rs 10 premium for commodity SELL trades
 MCX_MIN_SIGNAL_SCORE = 50       # v2.5: Quality score 0-100, reject below 50 (was 40)
+MCX_DIRECTION_FLIP_MIN_SCORE = 70  # v7.6.2: Higher bar for DIRECTION_FLIP (closing existing to flip)
 MCX_MIN_PROFIT_TO_COST_RATIO = 2.0  # Expected profit must be >= 2x total cost
 
 # Cooldowns & Limits (commodity)
@@ -1845,7 +1846,7 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
-            # v7.6: If opposite direction from SAME strategy, close losing position first
+            # v7.6.2: If opposite direction from SAME strategy, check quality score first, then flip
             opposite_dir = [p for p in self.portfolio.positions
                            if p['commodity'] == sig['commodity']
                            and p['strategy'] == sig['strategy']
@@ -1854,10 +1855,31 @@ class CommodityPaperTrader:
                 opp = opposite_dir[0]
                 opp_pnl = opp.get('unrealized_pnl', 0)
                 opp_prem = opp.get('current_premium', opp.get('entry_premium', 0))
+
+                # v7.6.2: Compute quality score for the NEW signal BEFORE deciding to flip
+                flip_score = sig.get('quality_score', 0)
+                if not flip_score:
+                    try:
+                        indicators = self.engine.compute_indicators(sig['commodity'],
+                            {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'],
+                             'close': sig['spot'], 'volume': 0})
+                        if indicators:
+                            flip_score = mcx_compute_signal_score(sig, sig['spot'], indicators)
+                            sig['quality_score'] = flip_score
+                    except Exception:
+                        flip_score = 0
+
+                # Reject flip if new signal quality is below DIRECTION_FLIP threshold
+                if flip_score < MCX_DIRECTION_FLIP_MIN_SCORE:
+                    logger.info(f"  SKIP_FLIP_QUALITY: {sig['strategy']} {sig['commodity']} {sig['type']} "
+                               f"score={flip_score} < {MCX_DIRECTION_FLIP_MIN_SCORE} — not strong enough to flip")
+                    skipped += 1
+                    continue
+
                 # Close the opposite position if it's losing or at breakeven
                 if opp_pnl <= 0 or opp.get('breakeven_locked', False):
                     logger.info(f"  DIRECTION_FLIP: Closing {opp['id']} (PnL Rs {opp_pnl:.0f}) "
-                               f"to flip to {sig['type']}")
+                               f"to flip to {sig['type']} (score={flip_score})")
                     self.portfolio.close_position(opp['id'], opp_prem, 'DIRECTION_FLIP')
                     self._track_exit(opp, 'DIRECTION_FLIP')
                     self._notify_commodity_exit(opp, sig['commodity'], opp_prem, 'DIRECTION_FLIP')

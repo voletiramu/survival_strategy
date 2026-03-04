@@ -127,6 +127,7 @@ STRATEGY_EXIT_MULT = {
 MIN_PREMIUM_BUY = 15             # Min Rs 15 premium for BUY trades (was Rs 3)
 MIN_PREMIUM_SELL = 20            # Min Rs 20 premium for SELL trades (was Rs 5)
 MIN_SIGNAL_SCORE = 50            # v2.5: Quality score 0-100, reject below 50 (was 40)
+DIRECTION_FLIP_MIN_SCORE = 70    # v7.6.2: Higher bar for DIRECTION_FLIP (closing existing to flip)
 MIN_PROFIT_TO_COST_RATIO = 2.0   # Expected profit must be >= 2x total brokerage cost
 
 # VIX-Adaptive Trading
@@ -2454,12 +2455,33 @@ class PaperTrader:
                 skipped += 1
                 continue
 
-            # v7.6: DIRECTION_FLIP — Close losing/breakeven positions, flip to new direction
-            # If opposite direction signal comes in, close stale position instead of blocking
+            # v7.6.2: DIRECTION_FLIP — Close losing/breakeven positions, flip to new direction
+            # Quality score must meet higher bar before closing an existing position
             all_opposite = [p for p in self.portfolio.positions
                            if p['symbol'] == sig['symbol']
                            and (('CE' in p['signal_type']) != (opt_type == 'CE'))]
             if all_opposite:
+                # v7.6.2: Compute quality score for new signal BEFORE deciding to flip
+                flip_score = sig.get('quality_score', 0)
+                if not flip_score:
+                    try:
+                        flip_indicators = self.engine.compute_indicators(sig['symbol'],
+                            self.get_intraday_ohlc(sig['symbol']) or
+                            {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'],
+                             'close': sig['spot'], 'volume': 0})
+                        if flip_indicators:
+                            flip_score = compute_signal_score(sig, sig['spot'], flip_indicators, self.current_vix)
+                            sig['quality_score'] = flip_score
+                    except Exception:
+                        flip_score = 0
+
+                # Reject flip if new signal quality is below DIRECTION_FLIP threshold
+                if flip_score < DIRECTION_FLIP_MIN_SCORE:
+                    logger.info(f"  SKIP_FLIP_QUALITY: {sig['strategy']} {sig['symbol']} {sig['type']} "
+                               f"score={flip_score} < {DIRECTION_FLIP_MIN_SCORE} — not strong enough to flip")
+                    skipped += 1
+                    continue
+
                 flip_blocked = False
                 for opp in all_opposite:
                     opp_pnl = opp.get('unrealized_pnl', 0)
@@ -2470,7 +2492,7 @@ class PaperTrader:
                         logger.info(f"  DIRECTION_FLIP: Closing {opp['id']} ({opp['strategy']} "
                                    f"{opp['signal_type']}) PnL Rs {opp_pnl:.0f} "
                                    f"{'(breakeven-locked)' if opp_breakeven else '(losing)'} "
-                                   f"to flip to {sig['type']}")
+                                   f"to flip to {sig['type']} (score={flip_score})")
                         self.portfolio.close_position(opp['id'], opp_current, 'DIRECTION_FLIP')
                         self._track_exit(opp, 'DIRECTION_FLIP')
                         try:
