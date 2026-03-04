@@ -2,8 +2,20 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
     <title>Algo Trading Dashboard</title>
+    <!-- PWA Meta Tags -->
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#1a2332">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="AlgoTrader">
+    <link rel="apple-touch-icon" href="/static/icon-192.svg">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="application-name" content="AlgoTrader">
+    <!-- Windows Pin -->
+    <meta name="msapplication-TileColor" content="#0f1923">
+    <meta name="msapplication-config" content="none">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -133,6 +145,17 @@
             display: none;
         }
 
+        /* Z Fold 6 Unfolded (inner display ~906px wide in landscape) — show tables */
+        @media (min-width: 769px) and (max-width: 1024px) {
+            .stats-grid {
+                grid-template-columns: repeat(4, 1fr);
+                gap: 8px;
+            }
+            table { font-size: 12px; }
+            th, td { padding: 6px 8px; }
+        }
+
+        /* Mobile + Z Fold 6 Cover Display (~412px wide) */
         @media (max-width: 768px) {
             .stats-grid {
                 grid-template-columns: repeat(2, 1fr);
@@ -168,6 +191,20 @@
             }
         }
 
+        /* Safe area padding for notch/punch-hole displays */
+        @supports (padding: env(safe-area-inset-top)) {
+            .header { padding-top: calc(12px + env(safe-area-inset-top)); }
+            body { padding-bottom: env(safe-area-inset-bottom); }
+        }
+
+        /* PWA standalone mode — hide browser chrome, add status bar padding */
+        @media (display-mode: standalone) {
+            .header {
+                padding-top: calc(12px + env(safe-area-inset-top, 0px));
+            }
+            .install-btn { display: none !important; }
+        }
+
         .refresh-btn, .export-btn {
             background: #2a3a4a;
             border: none;
@@ -193,6 +230,7 @@
     <div class="header">
         <h1>Algo Trading Dashboard</h1>
         <div>
+            <button class="refresh-btn install-btn" id="installBtn" onclick="installPWA()" style="display:none;background:#1a3a2a;color:#66bb6a">Install App</button>
             <button class="refresh-btn" onclick="refreshAll()">Refresh</button>
             <button class="export-btn" onclick="exportTrades()">Export Trades</button>
             <button class="export-btn" onclick="exportPositions()">Export Positions</button>
@@ -262,6 +300,7 @@
                             <th>Entry</th>
                             <th>Current</th>
                             <th>PnL</th>
+                            <th>PnL %</th>
                             <th>Entry At</th>
                             <th>Duration</th>
                             <th>TSL</th>
@@ -271,7 +310,7 @@
                         </tr>
                     </thead>
                     <tbody id="openTableBody">
-                        <tr><td colspan="15" class="loading">Loading...</td></tr>
+                        <tr><td colspan="16" class="loading">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -298,6 +337,7 @@
                             <th>Entry</th>
                             <th>Exit</th>
                             <th>PnL</th>
+                            <th>PnL %</th>
                             <th>Cap After</th>
                             <th>Entry At</th>
                             <th>Exit At</th>
@@ -306,7 +346,7 @@
                         </tr>
                     </thead>
                     <tbody id="closedTableBody">
-                        <tr><td colspan="13" class="loading">Loading...</td></tr>
+                        <tr><td colspan="14" class="loading">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -378,7 +418,7 @@
             document.getElementById('openBadge').textContent = positions.length;
 
             if (positions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:#8899aa">No open positions</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="16" style="text-align:center;color:#8899aa">No open positions</td></tr>';
                 cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No open positions</div>';
                 return;
             }
@@ -397,6 +437,7 @@
                     <td>${fmt(p.entry_price)}</td>
                     <td>${fmt(p.current_price)}</td>
                     <td class="${pnlClass(p.pnl)}"><b>${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</b></td>
+                    <td class="${pnlClass(p.pnl)}" style="font-size:12px"><b>${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct}%</b></td>
                     <td style="font-size:11px">${fmtTime(p.entry_time)}</td>
                     <td>${p.duration}</td>
                     <td>${p.tsl ? fmt(p.tsl) : '--'}</td>
@@ -410,7 +451,7 @@
                 <div class="position-card">
                     <div class="row">
                         <span class="primary">${p.symbol} ${typeTag(p.type)}</span>
-                        <span class="primary ${pnlClass(p.pnl)}">${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)}</span>
+                        <span class="primary ${pnlClass(p.pnl)}">${p.pnl >= 0 ? '+' : ''}${fmt(p.pnl)} (${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct}%)</span>
                     </div>
                     <div class="row">
                         <span class="secondary">${p.strategy} | ${lotsStr(p)} lot | ${fmtK(p.capital_invested)}</span>
@@ -434,7 +475,7 @@
             document.getElementById('closedBadge').textContent = trades.length;
 
             if (trades.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#8899aa">No closed trades today</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="14" style="text-align:center;color:#8899aa">No closed trades today</td></tr>';
                 cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No closed trades today</div>';
                 return;
             }
@@ -452,6 +493,7 @@
                     <td>${fmt(t.entry_price)}</td>
                     <td>${fmt(t.exit_price)}</td>
                     <td class="${pnlClass(t.pnl)}"><b>${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</b></td>
+                    <td class="${pnlClass(t.pnl)}" style="font-size:12px"><b>${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct}%</b></td>
                     <td>${fmtK(t.capital_after)}</td>
                     <td style="font-size:11px">${fmtTime(t.entry_time)}</td>
                     <td style="font-size:11px">${fmtTime(t.exit_time)}</td>
@@ -464,7 +506,7 @@
                 <div class="position-card">
                     <div class="row">
                         <span class="primary">${t.symbol} ${typeTag(t.type)}</span>
-                        <span class="primary ${pnlClass(t.pnl)}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</span>
+                        <span class="primary ${pnlClass(t.pnl)}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)} (${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct}%)</span>
                     </div>
                     <div class="row">
                         <span class="secondary">${t.strategy} | ${t.num_lots || 1} lot | ${t.hold_duration}</span>
@@ -484,7 +526,7 @@
         function renderSummary(s) {
             const el = (id) => document.getElementById(id);
 
-            el('totalPnl').textContent = (s.total_pnl >= 0 ? '+' : '') + fmt(s.total_pnl);
+            el('totalPnl').textContent = (s.total_pnl >= 0 ? '+' : '') + fmt(s.total_pnl) + ` (${s.total_pnl_pct >= 0 ? '+' : ''}${s.total_pnl_pct}%)`;
             el('totalPnl').className = 'value ' + pnlClass(s.total_pnl);
             el('pnlBreakdown').textContent = `Open: ${fmt(s.open_pnl)} | Closed: ${fmt(s.closed_pnl)}`;
 
@@ -501,11 +543,11 @@
             el('closedPnl').className = 'sub ' + pnlClass(s.closed_pnl);
 
             el('eqCapital').textContent = fmt(s.equity_capital);
-            el('eqDaily').textContent = 'Daily: ' + (s.equity_daily_pnl >= 0 ? '+' : '') + fmt(s.equity_daily_pnl);
+            el('eqDaily').textContent = 'Daily: ' + (s.equity_daily_pnl >= 0 ? '+' : '') + fmt(s.equity_daily_pnl) + ` (${s.equity_daily_pnl_pct || 0}%)`;
             el('eqDaily').className = 'sub ' + pnlClass(s.equity_daily_pnl);
 
             el('cmCapital').textContent = fmt(s.commodity_capital);
-            el('cmDaily').textContent = 'Daily: ' + (s.commodity_daily_pnl >= 0 ? '+' : '') + fmt(s.commodity_daily_pnl);
+            el('cmDaily').textContent = 'Daily: ' + (s.commodity_daily_pnl >= 0 ? '+' : '') + fmt(s.commodity_daily_pnl) + ` (${s.commodity_daily_pnl_pct || 0}%)`;
             el('cmDaily').className = 'sub ' + pnlClass(s.commodity_daily_pnl);
 
             // v2.4: Capital available
@@ -554,6 +596,37 @@
         refreshAll();
         // Auto-refresh every 30 seconds
         setInterval(refreshAll, 30000);
+
+        // ---- PWA: Service Worker & Install ----
+        let deferredPrompt = null;
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/static/sw.js')
+                .then(reg => console.log('SW registered:', reg.scope))
+                .catch(err => console.log('SW failed:', err));
+        }
+
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            deferredPrompt = e;
+            document.getElementById('installBtn').style.display = 'inline-block';
+        });
+
+        function installPWA() {
+            if (!deferredPrompt) return;
+            deferredPrompt.prompt();
+            deferredPrompt.userChoice.then((choice) => {
+                if (choice.outcome === 'accepted') {
+                    document.getElementById('installBtn').style.display = 'none';
+                }
+                deferredPrompt = null;
+            });
+        }
+
+        window.addEventListener('appinstalled', () => {
+            document.getElementById('installBtn').style.display = 'none';
+            deferredPrompt = null;
+        });
     </script>
 </body>
 </html>

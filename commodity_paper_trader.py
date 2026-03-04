@@ -139,12 +139,12 @@ MCX_LOT_TIER_ELITE = 80     # Score >= 80: allocate 30% of available capital
 MCX_LOT_TIER_STRONG = 60    # Score >= 60: allocate 20% of available capital
 MCX_LOT_TIER_STANDARD = 50  # Score >= 50: allocate 10% of available capital
 
-# Trailing Stop Loss Parameters (multi-phase for max profit capture)
-TSL_BREAKEVEN_TRIGGER_PCT = 30   # Phase 1: Lock breakeven when 30% of target reached
-TSL_TRAIL_TRIGGER_PCT = 50       # Phase 2: Start trailing when 50% of target reached
-TSL_TRAIL_DISTANCE_PCT = 25      # Phase 2 trail: 25% below peak
-TSL_TIGHT_TRIGGER_PCT = 100      # Phase 3: Tighter trail once past target
-TSL_TIGHT_DISTANCE_PCT = 15      # Phase 3 trail: 15% below peak (capture max profit)
+# v7.6: TSL based on PREMIUM GAIN % (not target distance %) — matches equity v7.5
+TSL_BREAKEVEN_GAIN_PCT = 15      # Phase 1: Lock breakeven when premium gains 15%
+TSL_TRAIL_GAIN_PCT = 25          # Phase 2: Start trailing when premium gains 25%
+TSL_TRAIL_DISTANCE_PCT = 30      # Phase 2 trail: 30% below peak profit
+TSL_TIGHT_GAIN_PCT = 40          # Phase 3: Tight trail at 40%+ gain
+TSL_TIGHT_DISTANCE_PCT = 20      # Phase 3 trail: 20% below peak profit
 
 # Commodity OI/IV Exit Thresholds (wider than equity due to lower liquidity)
 MCX_OI_SURGE_PCT = 40           # Exit if OI changes >40% from entry (was 20%)
@@ -174,7 +174,7 @@ MCX_MIN_SIGNAL_SCORE = 50       # v2.5: Quality score 0-100, reject below 50 (wa
 MCX_MIN_PROFIT_TO_COST_RATIO = 2.0  # Expected profit must be >= 2x total cost
 
 # Cooldowns & Limits (commodity)
-MCX_GRACE_PERIOD_SECONDS = 600     # v2.5: 10 min minimum hold (was 15 min / 900s)
+MCX_GRACE_PERIOD_SECONDS = 180     # v7.6: 3 min (was 10 min — missed fast spikes)
 MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
 MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
 MCX_MAX_TRADES_PER_DAY = 12           # Hard cap on daily commodity trades
@@ -814,7 +814,7 @@ class CommodityStrategyEngine:
                         'type': 'BUY_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bullish breakout",
-                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.4
                     })
             elif spot < ind['bc']:
                 pe_strike = round(spot / strike_int) * strike_int
@@ -824,7 +824,7 @@ class CommodityStrategyEngine:
                         'type': 'BUY_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bearish breakout",
-                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.4
                     })
 
         elif ind['cpr_width'] > 0.6:
@@ -876,7 +876,7 @@ class CommodityStrategyEngine:
                         'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Gamma Blast: Up breakout body={body:.1f}",
-                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.3,
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.3
                     })
             else:
                 pe_strike = round(spot / strike_int) * strike_int
@@ -886,7 +886,7 @@ class CommodityStrategyEngine:
                         'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Gamma Blast: Down breakout body={body:.1f}",
-                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.3,
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.3
                     })
         return signals
 
@@ -1523,19 +1523,19 @@ class CommodityPaperTrader:
         strat_mult = MCX_STRATEGY_EXIT_MULT.get(strat_name, {'oi': 1.0, 'iv': 1.0})
         oi_threshold *= strat_mult['oi']
 
-        # v2.4: If position is profitable AND moving toward target, hold despite OI/IV
+        # v7.6: Only hold through OI/IV noise if premium gain is significant (>25%)
+        # Previously held ANY profitable position — caused stuck positions with old 2.5x targets
         details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
-        target = details.get('target', 0)
-        if target > 0 and pos.get('entry_premium', 0) > 0:
+        entry_prem = pos.get('entry_premium', 0)
+        if entry_prem > 0:
             is_sell = pos.get('is_sell', False)
             if is_sell:
-                moving_toward_target = current_premium < pos['entry_premium']
+                prem_gain_pct = ((entry_prem - current_premium) / entry_prem * 100)
             else:
-                moving_toward_target = current_premium > pos['entry_premium']
-            pnl = pos.get('unrealized_pnl', 0)
-            if moving_toward_target and pnl > 0:
-                logger.info(f"  MCX_OI_TREND_HOLD: {pos['id']} ({strat_name}) profitable Rs {pnl:.0f} "
-                           f"& moving toward target. Holding despite OI={oi_change:.1f}%/IV={iv_change:.1f}%.")
+                prem_gain_pct = ((current_premium - entry_prem) / entry_prem * 100)
+            if prem_gain_pct >= TSL_TRAIL_GAIN_PCT:  # Only hold if 25%+ premium gain
+                logger.info(f"  MCX_OI_TREND_HOLD: {pos['id']} ({strat_name}) gain {prem_gain_pct:.1f}% "
+                           f"(>{TSL_TRAIL_GAIN_PCT}%). Holding despite OI={oi_change:.1f}%/IV={iv_change:.1f}%.")
                 return None, False
 
         # v2.5.2: Get unrealized PnL for loss-only exits
@@ -1673,8 +1673,8 @@ class CommodityPaperTrader:
                 rev_target = round(reversal_premium * 0.1, 2)
                 rev_sl = round(reversal_premium * 1.5, 2)
             else:
-                rev_target = round(reversal_premium * 2.5, 2)
-                rev_sl = round(reversal_premium * 0.4, 2)
+                rev_target = round(reversal_premium * 1.5, 2)  # v7.6: Was 2.5
+                rev_sl = round(reversal_premium * 0.5, 2)  # v7.6: Was 0.4
 
             reverse_pos = self.portfolio.add_signal(
                 strategy=strategy + ' (Reversal)',
@@ -1845,16 +1845,28 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
-            # v2.5.2: Block opposite direction from SAME strategy on same commodity
+            # v7.6: If opposite direction from SAME strategy, close losing position first
             opposite_dir = [p for p in self.portfolio.positions
                            if p['commodity'] == sig['commodity']
                            and p['strategy'] == sig['strategy']
                            and (('CE' in p['signal_type']) != (opt_type == 'CE'))]
             if opposite_dir:
-                logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['commodity']} {sig['type']} "
-                           f"— already holding {opposite_dir[0]['signal_type']} from same strategy")
-                skipped += 1
-                continue
+                opp = opposite_dir[0]
+                opp_pnl = opp.get('unrealized_pnl', 0)
+                opp_prem = opp.get('current_premium', opp.get('entry_premium', 0))
+                # Close the opposite position if it's losing or at breakeven
+                if opp_pnl <= 0 or opp.get('breakeven_locked', False):
+                    logger.info(f"  DIRECTION_FLIP: Closing {opp['id']} (PnL Rs {opp_pnl:.0f}) "
+                               f"to flip to {sig['type']}")
+                    self.portfolio.close_position(opp['id'], opp_prem, 'DIRECTION_FLIP')
+                    self._track_exit(opp, 'DIRECTION_FLIP')
+                    self._notify_commodity_exit(opp, sig['commodity'], opp_prem, 'DIRECTION_FLIP')
+                else:
+                    # Position is profitable and NOT breakeven-locked — let it run
+                    logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['commodity']} {sig['type']} "
+                               f"— already holding {opp['signal_type']} (PnL Rs {opp_pnl:.0f}, let it run)")
+                    skipped += 1
+                    continue
 
             # ---- v7.2: Per-strategy capital usage LOGGING (shared pool, no hard caps) ----
             strat_name = sig.get('strategy', 'Unknown')
@@ -2129,42 +2141,45 @@ class CommodityPaperTrader:
                     continue
 
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
-            target = details.get('target', pos['entry_premium'] * 2)
-            sl = details.get('sl', pos['entry_premium'] * 0.3)
+            target = details.get('target', pos['entry_premium'] * 1.5)
+            sl = details.get('sl', pos['entry_premium'] * 0.5)
 
-            # ---- TRAILING STOP LOSS UPDATE ----
+            # ---- v7.6: TSL based on PREMIUM GAIN % (not target distance %) ----
+            entry_prem = pos['entry_premium']
             if not pos['is_sell']:
                 # BUY positions: premium going UP is profit
-                target_distance = target - pos['entry_premium']
-                current_profit_pct = ((current - pos['entry_premium']) / target_distance * 100
-                                      if target_distance > 0 else 0)
-                if current > pos.get('peak_premium', pos['entry_premium']):
+                premium_gain_pct = ((current - entry_prem) / entry_prem * 100) if entry_prem > 0 else 0
+
+                if current > pos.get('peak_premium', entry_prem):
                     pos['peak_premium'] = round(current, 2)
 
-                # Phase 1: Lock breakeven at 30%
-                if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
-                    pos['breakeven_locked'] = True
-                    pos['trailing_sl'] = round(pos['entry_premium'] * 1.01, 2)
-                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} locked SL at Rs {pos['trailing_sl']:.2f}")
+                peak = pos.get('peak_premium', current)
+                peak_gain_pct = ((peak - entry_prem) / entry_prem * 100) if entry_prem > 0 else 0
+                profit_from_entry = peak - entry_prem
 
-                # Phase 3: Tight trail past target (15% from peak)
-                if current_profit_pct >= TSL_TIGHT_TRIGGER_PCT:
-                    peak = pos.get('peak_premium', current)
-                    profit_from_entry = peak - pos['entry_premium']
+                # Phase 1: Lock breakeven at 15% premium gain
+                if peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
+                    pos['breakeven_locked'] = True
+                    pos['trailing_sl'] = round(entry_prem * 1.03, 2)
+                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} gained {peak_gain_pct:.0f}% "
+                               f"→ locked SL at Rs {pos['trailing_sl']:.2f}")
+
+                # Phase 3: Tight trail at 40%+ gain (20% below peak profit)
+                if peak_gain_pct >= TSL_TIGHT_GAIN_PCT:
                     new_tsl = round(peak - (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
                     new_tsl = max(new_tsl, pos.get('trailing_sl') or 0)
                     if new_tsl > (pos.get('trailing_sl') or 0):
                         pos['trailing_sl'] = new_tsl
-                        logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f}, phase3)")
-                # Phase 2: Standard trail at 50% (25% from peak)
-                elif current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
-                    peak = pos.get('peak_premium', current)
-                    profit_from_entry = peak - pos['entry_premium']
+                        logger.info(f"  TSL_TIGHT: {pos['id']} gain {peak_gain_pct:.0f}% "
+                                   f"SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f})")
+                # Phase 2: Trail at 25%+ gain (30% below peak profit)
+                elif peak_gain_pct >= TSL_TRAIL_GAIN_PCT:
                     new_tsl = round(peak - (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
                     new_tsl = max(new_tsl, pos.get('trailing_sl') or 0)
                     if new_tsl > (pos.get('trailing_sl') or 0):
                         pos['trailing_sl'] = new_tsl
-                        logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f})")
+                        logger.info(f"  TSL_TRAIL: {pos['id']} gain {peak_gain_pct:.0f}% "
+                                   f"SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f})")
 
                 if pos.get('trailing_sl') and current <= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} premium {current:.2f} <= TSL {pos['trailing_sl']:.2f}")
@@ -2174,34 +2189,36 @@ class CommodityPaperTrader:
                     continue
             else:
                 # SELL positions: premium going DOWN is profit
-                target_distance = pos['entry_premium'] - target
-                current_profit_pct = ((pos['entry_premium'] - current) / target_distance * 100
-                                      if target_distance > 0 else 0)
-                if current < pos.get('trough_premium', pos['entry_premium']):
+                premium_gain_pct = ((entry_prem - current) / entry_prem * 100) if entry_prem > 0 else 0
+
+                if current < pos.get('trough_premium', entry_prem):
                     pos['trough_premium'] = round(current, 2)
 
-                # Phase 1: Lock breakeven at 30%
-                if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
-                    pos['breakeven_locked'] = True
-                    pos['trailing_sl'] = round(pos['entry_premium'] * 0.99, 2)
-                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL locked SL at Rs {pos['trailing_sl']:.2f}")
+                trough = pos.get('trough_premium', current)
+                trough_gain_pct = ((entry_prem - trough) / entry_prem * 100) if entry_prem > 0 else 0
+                profit_from_entry = entry_prem - trough
 
-                # Phase 3: Tight trail past target (15% above trough)
-                if current_profit_pct >= TSL_TIGHT_TRIGGER_PCT:
-                    trough = pos.get('trough_premium', current)
-                    profit_from_entry = pos['entry_premium'] - trough
+                # Phase 1: Lock breakeven at 15% premium gain
+                if trough_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
+                    pos['breakeven_locked'] = True
+                    pos['trailing_sl'] = round(entry_prem * 0.97, 2)
+                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL gained {trough_gain_pct:.0f}% "
+                               f"→ locked SL at Rs {pos['trailing_sl']:.2f}")
+
+                # Phase 3: Tight trail at 40%+ gain
+                if trough_gain_pct >= TSL_TIGHT_GAIN_PCT:
                     new_tsl = round(trough + (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
                     if pos.get('trailing_sl') is None or new_tsl < pos['trailing_sl']:
                         pos['trailing_sl'] = new_tsl
-                        logger.info(f"  TSL_TIGHT: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f}, phase3)")
-                # Phase 2: Standard trail at 50% (25% above trough)
-                elif current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
-                    trough = pos.get('trough_premium', current)
-                    profit_from_entry = pos['entry_premium'] - trough
+                        logger.info(f"  TSL_TIGHT: {pos['id']} SELL gain {trough_gain_pct:.0f}% "
+                                   f"SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f})")
+                # Phase 2: Trail at 25%+ gain
+                elif trough_gain_pct >= TSL_TRAIL_GAIN_PCT:
                     new_tsl = round(trough + (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
                     if pos.get('trailing_sl') is None or new_tsl < pos['trailing_sl']:
                         pos['trailing_sl'] = new_tsl
-                        logger.info(f"  TSL_TRAIL: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f})")
+                        logger.info(f"  TSL_TRAIL: {pos['id']} SELL gain {trough_gain_pct:.0f}% "
+                                   f"SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f})")
 
                 if pos.get('trailing_sl') and current >= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} SELL premium {current:.2f} >= TSL {pos['trailing_sl']:.2f}")

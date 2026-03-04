@@ -10,7 +10,7 @@ import io
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template, Response, request
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', static_url_path='/static')
 
 # Portfolio state file paths (auto-detect Vultr vs local)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +68,9 @@ def parse_positions(data, market='equity'):
         else:
             cap_invested = pos.get('entry_premium', 0) * lot_size * multiplier
 
+        # v7.6: PnL percentage
+        pnl_pct = round(pnl / cap_invested * 100, 1) if cap_invested > 0 else 0
+
         positions.append({
             'id': pos.get('id', ''),
             'symbol': symbol,
@@ -77,6 +80,7 @@ def parse_positions(data, market='equity'):
             'entry_price': pos.get('entry_premium', 0),
             'current_price': pos.get('current_premium', 0),
             'pnl': round(pnl, 2),
+            'pnl_pct': pnl_pct,
             'entry_time': entry_time,
             'duration': duration_str,
             'delta': pos.get('delta', 0),
@@ -121,6 +125,17 @@ def parse_closed_trades(data, market='equity'):
         except Exception:
             hold_str = 'N/A'
 
+        # v7.6: PnL percentage
+        entry_prem = t.get('entry_premium', 0)
+        t_lot_size = t.get('lot_size', 0)
+        t_mult = t.get('multiplier', 1)
+        t_is_sell = t.get('is_sell', False)
+        if t_is_sell:
+            t_cap = MARGIN_PER_LOT.get(t.get('symbol', t.get('commodity', '')), 100000) * t.get('num_lots', 1) if market == 'equity' else MCX_MARGINS.get(t.get('symbol', t.get('commodity', '')), 15000) * t.get('num_lots', 1)
+        else:
+            t_cap = entry_prem * t_lot_size * t_mult
+        t_pnl_pct = round(pnl / t_cap * 100, 1) if t_cap > 0 else 0
+
         trades.append({
             'id': t.get('id', ''),
             'symbol': t.get('symbol', t.get('commodity', '')),
@@ -130,6 +145,7 @@ def parse_closed_trades(data, market='equity'):
             'entry_price': t.get('entry_premium', 0),
             'exit_price': t.get('exit_premium', t.get('exit_price', 0)),
             'pnl': round(pnl, 2),
+            'pnl_pct': t_pnl_pct,
             'exit_reason': t.get('exit_reason', ''),
             'hold_duration': hold_str,
             'entry_time': ts,
@@ -231,12 +247,21 @@ def api_summary():
     eq_daily = eq_data.get('daily_pnl', {}).get(today, 0) if eq_data else 0
     cm_daily = cm_data.get('daily_pnl', {}).get(today, 0) if cm_data else 0
 
+    total_pnl = total_open_pnl + total_closed_pnl
+    total_capital = eq_capital + cm_capital
+    total_pnl_pct = round(total_pnl / total_capital * 100, 2) if total_capital > 0 else 0
+    eq_pnl_pct = round(eq_daily / eq_capital * 100, 2) if eq_capital > 0 else 0
+    cm_pnl_pct = round(cm_daily / cm_capital * 100, 2) if cm_capital > 0 else 0
+
     return jsonify({
-        'total_pnl': round(total_open_pnl + total_closed_pnl, 2),
+        'total_pnl': round(total_pnl, 2),
+        'total_pnl_pct': total_pnl_pct,
         'open_pnl': round(total_open_pnl, 2),
         'closed_pnl': round(total_closed_pnl, 2),
         'equity_daily_pnl': round(eq_daily, 2),
+        'equity_daily_pnl_pct': eq_pnl_pct,
         'commodity_daily_pnl': round(cm_daily, 2),
+        'commodity_daily_pnl_pct': cm_pnl_pct,
         'open_positions': len(eq_positions) + len(cm_positions),
         'closed_today': len(all_closed),
         'win_rate': win_rate,
@@ -447,6 +472,18 @@ def save_daily_report():
         'trades_saved': len(trades),
         'path': trades_path,
     })
+
+
+@app.route('/static/sw.js')
+def service_worker():
+    """Serve service worker with correct scope header."""
+    sw_path = os.path.join(BASE_DIR, 'static', 'sw.js')
+    with open(sw_path, 'r') as f:
+        content = f.read()
+    resp = Response(content, mimetype='application/javascript')
+    resp.headers['Service-Worker-Allowed'] = '/'
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
 
 
 if __name__ == '__main__':

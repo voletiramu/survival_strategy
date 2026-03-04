@@ -1,5 +1,5 @@
 """
-PAPER TRADING SYSTEM - 4 ACTIVE STRATEGIES (v7.1)
+PAPER TRADING SYSTEM - 4 ACTIVE STRATEGIES (v7.6)
 ===================================================
 Live paper trading with Angel One SmartAPI
 Active: Gamma Blast (40%), CPR (30%), Ghost Zone v7 (20%), PCR+VWAP (10%)
@@ -2454,29 +2454,46 @@ class PaperTrader:
                 skipped += 1
                 continue
 
-            # v2.5.2: Block opposite direction from SAME strategy on same symbol
-            # e.g., Gamma Blast BUY_CE + Gamma Blast BUY_PE on NIFTY = hedged loss
-            opposite_dir = [p for p in self.portfolio.positions
+            # v7.6: DIRECTION_FLIP — Close losing/breakeven positions, flip to new direction
+            # If opposite direction signal comes in, close stale position instead of blocking
+            all_opposite = [p for p in self.portfolio.positions
                            if p['symbol'] == sig['symbol']
-                           and p['strategy'] == sig['strategy']
-                           and (('CE' in p['signal_type']) != (opt_type == 'CE'))]  # opposite CE/PE
-            if opposite_dir:
-                logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['symbol']} {sig['type']} "
-                           f"— already holding {opposite_dir[0]['signal_type']} from same strategy")
-                skipped += 1
-                continue
-
-            # v3.1: Block opposite direction from ANY strategy on same symbol
-            # e.g., CPR BUY_PE + Gamma Blast BUY_CE on NIFTY = accidental hedge, guaranteed loss
-            cross_strategy_opposite = [p for p in self.portfolio.positions
-                                       if p['symbol'] == sig['symbol']
-                                       and (('CE' in p['signal_type']) != (opt_type == 'CE'))]
-            if cross_strategy_opposite:
-                logger.info(f"  SKIP_CROSS_HEDGE: {sig['strategy']} {sig['symbol']} {sig['type']} "
-                           f"— would hedge {cross_strategy_opposite[0]['strategy']} "
-                           f"{cross_strategy_opposite[0]['signal_type']} on same symbol")
-                skipped += 1
-                continue
+                           and (('CE' in p['signal_type']) != (opt_type == 'CE'))]
+            if all_opposite:
+                flip_blocked = False
+                for opp in all_opposite:
+                    opp_pnl = opp.get('unrealized_pnl', 0)
+                    opp_breakeven = opp.get('breakeven_locked', False)
+                    opp_current = opp.get('current_premium', opp['entry_premium'])
+                    # Close the opposite position if it's losing or at breakeven-locked
+                    if opp_pnl <= 0 or opp_breakeven:
+                        logger.info(f"  DIRECTION_FLIP: Closing {opp['id']} ({opp['strategy']} "
+                                   f"{opp['signal_type']}) PnL Rs {opp_pnl:.0f} "
+                                   f"{'(breakeven-locked)' if opp_breakeven else '(losing)'} "
+                                   f"to flip to {sig['type']}")
+                        self.portfolio.close_position(opp['id'], opp_current, 'DIRECTION_FLIP')
+                        self._track_exit(opp, 'DIRECTION_FLIP')
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = LOT_SIZES.get(opp['symbol'], 50)
+                            cap = MARGIN_PER_LOT.get(opp['symbol'], 120000) if opp['is_sell'] else opp['entry_premium'] * lot_size
+                            notify_trade_exit(market="EQUITY", strategy=opp['strategy'],
+                                symbol=opp['symbol'], signal_type=opp['signal_type'],
+                                strike=opp['strike'], entry_price=opp['entry_premium'],
+                                exit_price=opp_current, entry_time=opp['timestamp'],
+                                pnl=opp_pnl, capital_used=cap,
+                                exit_reason='DIRECTION_FLIP')
+                        except Exception:
+                            pass
+                    else:
+                        # Position is profitable and NOT breakeven-locked — let it run
+                        logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['symbol']} {sig['type']} "
+                                   f"— {opp['strategy']} {opp['signal_type']} is profitable "
+                                   f"Rs {opp_pnl:.0f} (let it run)")
+                        flip_blocked = True
+                if flip_blocked:
+                    skipped += 1
+                    continue
 
             # ---- v7.2: Per-strategy capital usage LOGGING (shared pool, no hard caps) ----
             strat_name = sig.get('strategy', 'Unknown')
