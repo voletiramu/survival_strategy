@@ -219,6 +219,73 @@
         .export-btn { background: #1a3a2a; color: #66bb6a; }
         .export-btn:hover { background: #2a4a3a; color: #81c784; }
 
+        .close-btn {
+            background: #4a1111;
+            border: 1px solid #ff1744;
+            color: #ff8a80;
+            padding: 3px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .close-btn:hover { background: #ff1744; color: #fff; }
+        .close-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .close-all-btn {
+            background: #4a1111;
+            border: 1px solid #ff1744;
+            color: #ff8a80;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            margin-left: 4px;
+        }
+        .close-all-btn:hover { background: #ff1744; color: #fff; }
+
+        /* Confirmation modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: #1a2332;
+            border: 1px solid #2a3a4a;
+            border-radius: 12px;
+            padding: 20px;
+            max-width: 400px;
+            width: 90%;
+            text-align: center;
+        }
+        .modal h3 { margin-bottom: 12px; font-size: 16px; }
+        .modal p { color: #8899aa; font-size: 13px; margin-bottom: 16px; }
+        .modal .pnl-preview { font-size: 20px; font-weight: 700; margin: 8px 0; }
+        .modal-actions { display: flex; gap: 10px; justify-content: center; }
+        .modal-actions button {
+            padding: 8px 20px;
+            border-radius: 6px;
+            border: none;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .btn-cancel { background: #2a3a4a; color: #8899aa; }
+        .btn-cancel:hover { background: #3a4a5a; color: #fff; }
+        .btn-confirm-close { background: #ff1744; color: #fff; }
+        .btn-confirm-close:hover { background: #d50000; }
+
+        .freshness { font-size: 10px; color: #556677; margin-left: 8px; }
+        .freshness.stale { color: #ff9800; }
+
         .loading {
             text-align: center;
             padding: 40px;
@@ -231,11 +298,13 @@
         <h1>Algo Trading Dashboard</h1>
         <div>
             <button class="refresh-btn install-btn" id="installBtn" onclick="installPWA()" style="display:none;background:#1a3a2a;color:#66bb6a">Install App</button>
+            <button class="close-all-btn" id="closeAllBtn" onclick="confirmCloseAll()" style="display:none">Close All</button>
             <button class="refresh-btn" onclick="refreshAll()">Refresh</button>
             <button class="export-btn" onclick="exportTrades()">Export Trades</button>
             <button class="export-btn" onclick="exportPositions()">Export Positions</button>
             <button class="export-btn" onclick="exportSummary()">Save Report</button>
             <span class="status" id="lastUpdate">Loading...</span>
+            <span class="freshness" id="dataFreshness"></span>
         </div>
     </div>
 
@@ -307,10 +376,11 @@
                             <th>Target</th>
                             <th>SL</th>
                             <th>Available</th>
+                            <th>Action</th>
                         </tr>
                     </thead>
                     <tbody id="openTableBody">
-                        <tr><td colspan="16" class="loading">Loading...</td></tr>
+                        <tr><td colspan="17" class="loading">Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -353,6 +423,20 @@
         </div>
         <div class="mobile-card" id="closedCards">
             <div class="loading">Loading...</div>
+        </div>
+    </div>
+
+    <!-- Close Confirmation Modal -->
+    <div class="modal-overlay" id="closeModal">
+        <div class="modal">
+            <h3>Close Position?</h3>
+            <p id="closeSymbol">--</p>
+            <div class="pnl-preview" id="closePnl">--</div>
+            <p>This will close at the last known premium.</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="cancelClose()">Cancel</button>
+                <button class="btn-confirm-close" id="confirmCloseBtn" onclick="executeClose()">Yes, Close</button>
+            </div>
         </div>
     </div>
 
@@ -417,8 +501,11 @@
             const cards = document.getElementById('openCards');
             document.getElementById('openBadge').textContent = positions.length;
 
+            // Show/hide Close All button
+            document.getElementById('closeAllBtn').style.display = positions.length > 0 ? 'inline-block' : 'none';
+
             if (positions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="16" style="text-align:center;color:#8899aa">No open positions</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="17" style="text-align:center;color:#8899aa">No open positions</td></tr>';
                 cards.innerHTML = '<div style="text-align:center;color:#8899aa;padding:20px">No open positions</div>';
                 return;
             }
@@ -444,6 +531,7 @@
                     <td>${fmt(p.target)}</td>
                     <td>${fmt(p.sl)}</td>
                     <td>${fmtK(p.capital_available)}</td>
+                    <td><button class="close-btn" onclick="confirmClose('${p.id}','${p.market}','${p.symbol}','${p.type}',${p.pnl},${p.pnl_pct})">Close</button></td>
                 </tr>
             `).join('');
 
@@ -462,8 +550,8 @@
                         <span class="secondary">TSL: ${p.tsl ? fmt(p.tsl) : '--'}</span>
                     </div>
                     <div class="row">
-                        <span class="secondary">Avail: ${fmtK(p.capital_available)}</span>
-                        <span class="secondary">Strike: ${fmt(p.strike)}</span>
+                        <span class="secondary">Avail: ${fmtK(p.capital_available)} | Strike: ${fmt(p.strike)}</span>
+                        <button class="close-btn" onclick="confirmClose('${p.id}','${p.market}','${p.symbol}','${p.type}',${p.pnl},${p.pnl_pct})">Close</button>
                     </div>
                 </div>
             `).join('');
@@ -592,10 +680,100 @@
             window.location.href = '/api/export/summary';
         }
 
+        // ---- CLOSE POSITION: Confirmation + API ----
+        let pendingClose = null;
+
+        function confirmClose(id, market, symbol, type, pnl, pnlPct) {
+            pendingClose = { id, market };
+            const modal = document.getElementById('closeModal');
+            document.getElementById('closeSymbol').textContent = `${symbol} ${type}`;
+            const pnlEl = document.getElementById('closePnl');
+            pnlEl.textContent = `${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${pnlPct >= 0 ? '+' : ''}${pnlPct}%)`;
+            pnlEl.className = 'pnl-preview ' + pnlClass(pnl);
+            modal.classList.add('active');
+        }
+
+        function confirmCloseAll() {
+            pendingClose = { closeAll: true };
+            const modal = document.getElementById('closeModal');
+            const openCount = document.getElementById('openBadge').textContent;
+            document.getElementById('closeSymbol').textContent = `ALL ${openCount} POSITIONS`;
+            document.getElementById('closePnl').textContent = 'All open positions will be closed';
+            document.getElementById('closePnl').className = 'pnl-preview negative';
+            modal.classList.add('active');
+        }
+
+        function cancelClose() {
+            pendingClose = null;
+            document.getElementById('closeModal').classList.remove('active');
+        }
+
+        async function executeClose() {
+            if (!pendingClose) return;
+            const modal = document.getElementById('closeModal');
+            const btn = document.getElementById('confirmCloseBtn');
+            btn.disabled = true;
+            btn.textContent = 'Closing...';
+
+            try {
+                let url = pendingClose.closeAll ? '/api/close_all' : '/api/close';
+                let body = pendingClose.closeAll ? {} : { id: pendingClose.id, market: pendingClose.market };
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    modal.classList.remove('active');
+                    refreshAll();
+                } else {
+                    alert('Close failed: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Close failed: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Yes, Close';
+                pendingClose = null;
+            }
+        }
+
+        // ---- DATA FRESHNESS ----
+        async function updateFreshness() {
+            try {
+                const res = await fetch('/api/freshness');
+                const data = await res.json();
+                const el = document.getElementById('dataFreshness');
+                let latest = null;
+                for (const [k, v] of Object.entries(data)) {
+                    if (v) {
+                        const t = new Date(v);
+                        if (!latest || t > latest) latest = t;
+                    }
+                }
+                if (latest) {
+                    const ageSec = Math.round((Date.now() - latest.getTime()) / 1000);
+                    if (ageSec < 60) {
+                        el.textContent = `Data: ${ageSec}s ago`;
+                        el.className = 'freshness';
+                    } else if (ageSec < 3600) {
+                        el.textContent = `Data: ${Math.round(ageSec/60)}m ago`;
+                        el.className = 'freshness' + (ageSec > 120 ? ' stale' : '');
+                    } else {
+                        el.textContent = `Data: ${Math.round(ageSec/3600)}h ago`;
+                        el.className = 'freshness stale';
+                    }
+                }
+            } catch(e) {}
+        }
+
         // Initial load
         refreshAll();
-        // Auto-refresh every 30 seconds
-        setInterval(refreshAll, 30000);
+        updateFreshness();
+        // Auto-refresh every 10 seconds (matches scan interval)
+        setInterval(refreshAll, 10000);
+        setInterval(updateFreshness, 10000);
 
         // ---- PWA: Service Worker & Install ----
         let deferredPrompt = null;

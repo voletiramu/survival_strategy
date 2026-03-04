@@ -486,5 +486,171 @@ def service_worker():
     return resp
 
 
+# ====================================================================
+# MANUAL CLOSE ENDPOINT — Close positions from dashboard
+# ====================================================================
+@app.route('/api/close', methods=['POST'])
+def manual_close_position():
+    """Close an open position manually from the dashboard."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No JSON body'}), 400
+
+    pos_id = data.get('id', '')
+    market = data.get('market', 'equity')
+
+    if not pos_id:
+        return jsonify({'error': 'Missing position id'}), 400
+
+    state_file = EQUITY_STATE if market == 'equity' else COMMODITY_STATE
+
+    try:
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+    except Exception as e:
+        return jsonify({'error': f'Cannot read state: {e}'}), 500
+
+    # Find position
+    pos_idx = None
+    for i, p in enumerate(state.get('positions', [])):
+        if p.get('id') == pos_id:
+            pos_idx = i
+            break
+
+    if pos_idx is None:
+        return jsonify({'error': f'Position {pos_id} not found'}), 404
+
+    pos = state['positions'].pop(pos_idx)
+
+    # Calculate PnL using last known premium
+    exit_premium = pos.get('current_premium', pos.get('entry_premium', 0))
+    entry_premium = pos.get('entry_premium', 0)
+    lot_size = pos.get('lot_size', 1)
+    multiplier = pos.get('multiplier', 1)
+    is_sell = pos.get('is_sell', False)
+
+    if is_sell:
+        pnl = (entry_premium - exit_premium) * lot_size * multiplier
+    else:
+        pnl = (exit_premium - entry_premium) * lot_size * multiplier
+
+    # Subtract approximate costs (entry + exit)
+    entry_cost = pos.get('entry_cost', 0)
+    exit_cost = entry_cost  # approximate
+    pnl -= (entry_cost + exit_cost)
+
+    # Create closed trade record
+    trade = {**pos}
+    trade['exit_premium'] = round(exit_premium, 2)
+    trade['exit_cost'] = round(exit_cost, 2)
+    trade['pnl'] = round(pnl, 2)
+    trade['exit_reason'] = 'MANUAL_CLOSE'
+    trade['exit_time'] = datetime.now().isoformat()
+    trade['status'] = 'CLOSED'
+
+    state.setdefault('closed_trades', []).append(trade)
+
+    # Update capital
+    state['capital'] = round(state.get('capital', 0) + pnl, 2)
+    trade['capital_after'] = state['capital']
+
+    # Update daily PnL
+    today = datetime.now().strftime('%Y-%m-%d')
+    daily = state.get('daily_pnl', {})
+    daily[today] = round(daily.get(today, 0) + pnl, 2)
+    state['daily_pnl'] = daily
+
+    # Write back
+    try:
+        with open(state_file, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+    except Exception as e:
+        return jsonify({'error': f'Write failed: {e}'}), 500
+
+    symbol = pos.get('symbol', pos.get('commodity', ''))
+    return jsonify({
+        'status': 'ok',
+        'message': f'Closed {symbol} {pos.get("signal_type", "")}',
+        'pnl': round(pnl, 2),
+        'capital': state['capital'],
+    })
+
+
+@app.route('/api/close_all', methods=['POST'])
+def manual_close_all():
+    """Close ALL open positions manually."""
+    results = []
+    for market, state_file in [('equity', EQUITY_STATE), ('commodity', COMMODITY_STATE)]:
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+        except Exception:
+            continue
+
+        positions = list(state.get('positions', []))
+        if not positions:
+            continue
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        daily = state.get('daily_pnl', {})
+
+        for pos in positions:
+            exit_premium = pos.get('current_premium', pos.get('entry_premium', 0))
+            entry_premium = pos.get('entry_premium', 0)
+            lot_size = pos.get('lot_size', 1)
+            multiplier = pos.get('multiplier', 1)
+
+            if pos.get('is_sell', False):
+                pnl = (entry_premium - exit_premium) * lot_size * multiplier
+            else:
+                pnl = (exit_premium - entry_premium) * lot_size * multiplier
+
+            entry_cost = pos.get('entry_cost', 0)
+            pnl -= (entry_cost * 2)
+
+            trade = {**pos}
+            trade['exit_premium'] = round(exit_premium, 2)
+            trade['pnl'] = round(pnl, 2)
+            trade['exit_reason'] = 'MANUAL_CLOSE'
+            trade['exit_time'] = datetime.now().isoformat()
+            trade['status'] = 'CLOSED'
+
+            state.setdefault('closed_trades', []).append(trade)
+            state['capital'] = round(state.get('capital', 0) + pnl, 2)
+            trade['capital_after'] = state['capital']
+            daily[today] = round(daily.get(today, 0) + pnl, 2)
+
+            symbol = pos.get('symbol', pos.get('commodity', ''))
+            results.append({'symbol': symbol, 'pnl': round(pnl, 2)})
+
+        state['positions'] = []
+        state['daily_pnl'] = daily
+
+        with open(state_file, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+
+    return jsonify({
+        'status': 'ok',
+        'closed': len(results),
+        'trades': results,
+    })
+
+
+# ====================================================================
+# DATA FRESHNESS — Check when state files were last modified
+# ====================================================================
+@app.route('/api/freshness')
+def data_freshness():
+    """Return last-modified timestamps of state files."""
+    result = {}
+    for name, path in [('equity', EQUITY_STATE), ('commodity', COMMODITY_STATE)]:
+        try:
+            mtime = os.path.getmtime(path)
+            result[name] = datetime.fromtimestamp(mtime).isoformat()
+        except Exception:
+            result[name] = None
+    return jsonify(result)
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
