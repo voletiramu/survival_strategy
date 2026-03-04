@@ -136,19 +136,21 @@ VIX_LOW_MULTIPLIER = 1.5         # Multiply thresholds by 1.5 in low VIX
 VIX_HIGH_MULTIPLIER = 0.8        # Multiply thresholds by 0.8 in high VIX
 
 # Cooldowns & Limits
-GRACE_PERIOD_SECONDS = 600       # v2.5: 10 min minimum hold (was 15 min / 900s)
+GRACE_PERIOD_SECONDS = 180       # v7.5: 3 min (was 10 min — missed fast spikes)
 GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry same direction
 REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
 MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
 MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x brokerage)
 
-# Trailing Stop Loss Parameters (multi-phase for max profit capture)
-TSL_BREAKEVEN_TRIGGER_PCT = 30   # Phase 1: Lock breakeven when 30% of target reached
-TSL_TRAIL_TRIGGER_PCT = 50       # Phase 2: Start trailing when 50% of target reached
-TSL_TRAIL_DISTANCE_PCT = 25      # Phase 2 trail: 25% below peak
-TSL_MIN_PROFIT_LOCK_PCT = 10     # Never let trailing SL go below entry+10% of move
-TSL_TIGHT_TRIGGER_PCT = 100      # Phase 3: Tighter trail once past target
-TSL_TIGHT_DISTANCE_PCT = 15      # Phase 3 trail: 15% below peak (capture max profit)
+# v7.5: Trailing Stop Loss — based on PREMIUM GAIN % (not target distance %)
+# Old system: TSL thresholds tied to target distance. With 2.5x targets,
+# needed 45% premium gain just to lock breakeven → never triggered.
+# New system: TSL triggers on actual premium gain from entry.
+TSL_BREAKEVEN_GAIN_PCT = 15      # Phase 1: Lock breakeven when premium gains 15%
+TSL_TRAIL_GAIN_PCT = 25          # Phase 2: Start trailing when premium gains 25%
+TSL_TRAIL_DISTANCE_PCT = 30      # Phase 2 trail: 30% below peak profit
+TSL_TIGHT_GAIN_PCT = 40          # Phase 3: Tight trail when premium gains 40%+
+TSL_TIGHT_DISTANCE_PCT = 20      # Phase 3 trail: 20% below peak profit
 
 # v3.1: Strategy weights from Angel One backtest (PnL + risk-adjusted)
 # Survivor highest PnL (Rs 36.5M avg, 257% annual), Gamma Blast best risk-adjusted (Sharpe 4.42)
@@ -1570,24 +1572,28 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         cpr_w = ind['cpr_width']
 
-        # ---- CPR-width-adjusted targets/SL ----
-        # Narrow CPR (< 0.3%): strong breakout → aggressive targets
+        # ---- v7.5: Realistic intraday option targets ----
+        # Old targets (2.5x) required 150% option gain — almost never hit intraday.
+        # New targets based on realistic option delta/gamma math:
+        #   ATM option with Δ=-0.5: 200pt NIFTY drop → ~Rs 120 gain on Rs 300 premium = 40%
+        #   With gamma boost on strong day: 50-80% gain is achievable
+        # Narrow CPR (< 0.3%): strong breakout → moderate targets
         # Moderate CPR (0.3-0.6%): directional trade → standard targets
         # Wide CPR (> 0.6%): breakout less likely → conservative targets
         if cpr_w < 0.3:
             cpr_label = "Narrow"
-            target_hit_mult = 2.5   # Target = 2.5x premium
-            target_base_mult = 1.8  # Fallback target = 1.8x
-            sl_mult = 0.4           # SL = 40% of premium
+            target_hit_mult = 1.5   # Target = 1.5x premium (50% gain)
+            target_base_mult = 1.3  # Fallback target = 1.3x (30% gain)
+            sl_mult = 0.5           # SL = 50% of premium
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
-            target_hit_mult = 2.0
-            target_base_mult = 1.5
-            sl_mult = 0.45
+            target_hit_mult = 1.4   # 40% gain
+            target_base_mult = 1.25 # 25% gain
+            sl_mult = 0.5
         else:
             cpr_label = "Wide"
-            target_hit_mult = 1.6
-            target_base_mult = 1.3
+            target_hit_mult = 1.3   # 30% gain
+            target_base_mult = 1.2  # 20% gain
             sl_mult = 0.5
 
         # ---- BUY BREAKOUT: All CPR widths ----
@@ -1684,13 +1690,14 @@ class StrategyEngine:
         # IV multiplier: higher on expiry day (gamma spike), lower further out
         iv_mult = 1.3 if is_expiry_day else max(1.0, 1.3 - days_to_expiry * 0.08)
 
-        # Target/SL adjustment: more conservative on non-expiry (less gamma boost)
+        # v7.5: Realistic intraday option targets
+        # Expiry day gamma spike can give 50-80% gains, but 150%+ is rare
         if is_expiry_day:
-            target_mult = 2.5
-            sl_mult = 0.3
+            target_mult = 1.6   # v7.5: Was 2.5 — too aggressive, rarely hit
+            sl_mult = 0.4       # v7.5: Was 0.3 — slightly wider SL for gamma moves
         else:
-            target_mult = max(2.0, 2.5 - days_to_expiry * 0.10)  # 2.0x-2.5x
-            sl_mult = min(0.4, 0.3 + days_to_expiry * 0.02)      # 30%-40% SL
+            target_mult = max(1.3, 1.5 - days_to_expiry * 0.05)  # v7.5: 1.3x-1.5x (was 2.0-2.5)
+            sl_mult = 0.5       # v7.5: 50% SL
 
         # v7.4: Coiled spring filter — relaxed for high-value indices
         # SENSEX/BANKNIFTY naturally have higher daily ranges
@@ -1868,7 +1875,7 @@ class StrategyEngine:
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
                                   f"{oi_label}{exhaustion_label}"
                                   f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                        'target': premium * 2.5,  # 2.5:1 RR minimum
+                        'target': premium * 1.5,  # v7.5: realistic intraday target (was 2.5x)
                         'sl': premium * 0.35,      # SL below zone
                     })
                     break
@@ -1909,7 +1916,7 @@ class StrategyEngine:
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
                                   f"{oi_label}"
                                   f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                        'target': premium * 2.5,
+                        'target': premium * 1.5,  # v7.5: realistic intraday target
                         'sl': premium * 0.35,
                     })
                     break
@@ -1950,7 +1957,7 @@ class StrategyEngine:
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
                               f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                    'target': premium * 2.5,
+                    'target': premium * 1.5,  # v7.5: realistic intraday target
                     'sl': premium * 0.4,
                 })
 
@@ -1968,7 +1975,7 @@ class StrategyEngine:
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
                               f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                    'target': premium * 2.5,
+                    'target': premium * 1.5,  # v7.5: realistic intraday target
                     'sl': premium * 0.4,
                 })
 
@@ -3192,46 +3199,51 @@ class PaperTrader:
                         pass
                     continue
 
-            # ---- TRAILING STOP LOSS UPDATE ----
+            # ---- v7.5: TRAILING STOP LOSS — Premium Gain % Based ----
+            # Old: TSL thresholds tied to target distance → with 2.5x targets, never triggered
+            # New: TSL triggers on actual premium gain % from entry
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
-            target = details.get('target', pos['entry_premium'] * 2)
-            sl = details.get('sl', pos['entry_premium'] * 0.3)
+            target = details.get('target', pos['entry_premium'] * 1.5)
+            sl = details.get('sl', pos['entry_premium'] * 0.5)
 
             if not pos['is_sell']:
                 # BUY positions: premium going UP is profit
-                target_distance = target - pos['entry_premium']
-                current_profit_pct = ((current_premium - pos['entry_premium']) / target_distance * 100
-                                      if target_distance > 0 else 0)
+                entry_prem = pos['entry_premium']
+                premium_gain_pct = ((current_premium - entry_prem) / entry_prem * 100
+                                    if entry_prem > 0 else 0)
 
                 # Update peak premium
-                if current_premium > pos.get('peak_premium', pos['entry_premium']):
+                if current_premium > pos.get('peak_premium', entry_prem):
                     pos['peak_premium'] = round(current_premium, 2)
 
-                # Phase 1: Lock breakeven at 30% of target reached
-                # v3.1: Increased buffer from 1% to 5% — prevents intraday wick exits
-                if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
-                    pos['breakeven_locked'] = True
-                    pos['trailing_sl'] = round(pos['entry_premium'] * 1.05, 2)  # entry + 5% buffer
-                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} locked SL at Rs {pos['trailing_sl']:.2f}")
+                peak = pos.get('peak_premium', current_premium)
+                peak_gain_pct = ((peak - entry_prem) / entry_prem * 100
+                                 if entry_prem > 0 else 0)
+                profit_from_entry = peak - entry_prem
 
-                # Phase 3: Tight trail past target (15% from peak — capture max profit)
-                if current_profit_pct >= TSL_TIGHT_TRIGGER_PCT:
-                    peak = pos.get('peak_premium', current_premium)
-                    profit_from_entry = peak - pos['entry_premium']
+                # Phase 1: Lock breakeven when premium gains 15%+
+                if peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
+                    pos['breakeven_locked'] = True
+                    pos['trailing_sl'] = round(entry_prem * 1.03, 2)  # entry + 3% buffer
+                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} gained {peak_gain_pct:.0f}% → locked SL at Rs {pos['trailing_sl']:.2f}")
+
+                # Phase 3: Tight trail when premium gained 40%+ (20% below peak profit)
+                if peak_gain_pct >= TSL_TIGHT_GAIN_PCT:
                     new_trailing_sl = round(peak - (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
                     new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
                     if new_trailing_sl > (pos.get('trailing_sl') or 0):
                         pos['trailing_sl'] = new_trailing_sl
-                        logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f}, phase3)")
-                # Phase 2: Trail at 50%+ of target reached (25% from peak)
-                elif current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
-                    peak = pos.get('peak_premium', current_premium)
-                    profit_from_entry = peak - pos['entry_premium']
+                        logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
+                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%, phase3)")
+
+                # Phase 2: Trail when premium gained 25%+ (30% below peak profit)
+                elif peak_gain_pct >= TSL_TRAIL_GAIN_PCT:
                     new_trailing_sl = round(peak - (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
                     new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
                     if new_trailing_sl > (pos.get('trailing_sl') or 0):
                         pos['trailing_sl'] = new_trailing_sl
-                        logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f})")
+                        logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
+                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%)")
 
                 # Check trailing SL hit (BUY: premium drops below trailing SL)
                 if pos.get('trailing_sl') and current_premium <= pos['trailing_sl']:
@@ -3241,12 +3253,12 @@ class PaperTrader:
                     try:
                         from trade_notifier import notify_trade_exit
                         lot_size = LOT_SIZES.get(symbol, 50)
-                        cap = pos['entry_premium'] * lot_size
+                        cap = entry_prem * lot_size
                         pnl = pos.get('unrealized_pnl', 0)
                         notify_trade_exit(
                             market="EQUITY", strategy=pos['strategy'],
                             symbol=symbol, signal_type=pos['signal_type'],
-                            strike=pos['strike'], entry_price=pos['entry_premium'],
+                            strike=pos['strike'], entry_price=entry_prem,
                             exit_price=current_premium, entry_time=pos['timestamp'],
                             pnl=pnl, capital_used=cap, exit_reason='TRAILING_SL_HIT',
                         )
@@ -3256,37 +3268,39 @@ class PaperTrader:
 
             else:
                 # SELL positions: premium going DOWN is profit
-                target_distance = pos['entry_premium'] - target
-                current_profit_pct = ((pos['entry_premium'] - current_premium) / target_distance * 100
-                                      if target_distance > 0 else 0)
+                entry_prem = pos['entry_premium']
+                premium_gain_pct = ((entry_prem - current_premium) / entry_prem * 100
+                                    if entry_prem > 0 else 0)
 
                 # Update trough premium (lowest seen)
-                if current_premium < pos.get('trough_premium', pos['entry_premium']):
+                if current_premium < pos.get('trough_premium', entry_prem):
                     pos['trough_premium'] = round(current_premium, 2)
 
-                # Phase 1: Lock breakeven at 30% of target reached
-                # v3.1: Increased buffer from 1% to 5% — prevents intraday wick exits
-                if current_profit_pct >= TSL_BREAKEVEN_TRIGGER_PCT and not pos.get('breakeven_locked'):
-                    pos['breakeven_locked'] = True
-                    pos['trailing_sl'] = round(pos['entry_premium'] * 0.95, 2)  # entry - 5% buffer
-                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL locked SL at Rs {pos['trailing_sl']:.2f}")
+                trough = pos.get('trough_premium', current_premium)
+                trough_gain_pct = ((entry_prem - trough) / entry_prem * 100
+                                   if entry_prem > 0 else 0)
+                profit_from_entry = entry_prem - trough
 
-                # Phase 3: Tight trail past target (15% above trough — capture max profit)
-                if current_profit_pct >= TSL_TIGHT_TRIGGER_PCT:
-                    trough = pos.get('trough_premium', current_premium)
-                    profit_from_entry = pos['entry_premium'] - trough
+                # Phase 1: Lock breakeven when premium drops 15%+ from entry (SELL profit)
+                if trough_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
+                    pos['breakeven_locked'] = True
+                    pos['trailing_sl'] = round(entry_prem * 0.97, 2)  # entry - 3% buffer
+                    logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL gained {trough_gain_pct:.0f}% → locked SL at Rs {pos['trailing_sl']:.2f}")
+
+                # Phase 3: Tight trail when premium dropped 40%+ (20% above trough profit)
+                if trough_gain_pct >= TSL_TIGHT_GAIN_PCT:
                     new_trailing_sl = round(trough + (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
                     if pos.get('trailing_sl') is None or new_trailing_sl < pos['trailing_sl']:
                         pos['trailing_sl'] = new_trailing_sl
-                        logger.info(f"  TSL_TIGHT: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f}, phase3)")
-                # Phase 2: Trail at 50%+ of target reached (25% above trough)
-                elif current_profit_pct >= TSL_TRAIL_TRIGGER_PCT:
-                    trough = pos.get('trough_premium', current_premium)
-                    profit_from_entry = pos['entry_premium'] - trough
+                        logger.info(f"  TSL_TIGHT: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} "
+                                   f"(trough={trough:.2f} -{trough_gain_pct:.0f}%, phase3)")
+                # Phase 2: Trail when premium dropped 25%+ (30% above trough profit)
+                elif trough_gain_pct >= TSL_TRAIL_GAIN_PCT:
                     new_trailing_sl = round(trough + (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
                     if pos.get('trailing_sl') is None or new_trailing_sl < pos['trailing_sl']:
                         pos['trailing_sl'] = new_trailing_sl
-                        logger.info(f"  TSL_TRAIL: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f})")
+                        logger.info(f"  TSL_TRAIL: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} "
+                                   f"(trough={trough:.2f} -{trough_gain_pct:.0f}%)")
 
                 # Check trailing SL hit (SELL: premium rises above trailing SL)
                 if pos.get('trailing_sl') and current_premium >= pos['trailing_sl']:
