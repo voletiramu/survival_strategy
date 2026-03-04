@@ -730,6 +730,46 @@ class AngelConnection:
         except Exception as e:
             logger.error(f"Option chain strike selection error for {name}: {e}")
 
+        # v7.4: BFO/SENSEX fallback — optionGreek API doesn't support BFO
+        # Use find_option_tokens + get_market_data per strike to get real LTP
+        if name == 'SENSEX' or best is None:
+            try:
+                expiry = self._get_nearest_expiry(name) if not expiry_date else expiry_date
+                if expiry:
+                    best_ltp = 0
+                    best_strike_info = None
+                    for cand_strike in candidates:
+                        token_info = self.find_option_tokens(name, None, cand_strike, opt_type)
+                        if token_info:
+                            exchange = 'BFO' if name == 'SENSEX' else 'NFO'
+                            self._throttle()
+                            mkt = self.get_market_data(exchange, str(token_info.get('token', '')))
+                            if mkt:
+                                ltp = float(mkt.get('ltp', 0) or 0)
+                                oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
+                                if ltp > 0:
+                                    distance = abs(cand_strike - atm_strike) / strike_interval
+                                    proximity_score = max(0, 1 - distance * 0.3)
+                                    score = (oi * 0.6) + (proximity_score * 1000 * 0.4)
+                                    if score > best_ltp or best_strike_info is None:
+                                        best_ltp = score
+                                        best_strike_info = {
+                                            'strike': cand_strike,
+                                            'ltp': ltp,
+                                            'oi': oi,
+                                            'iv': 0,
+                                            'volume': 0,
+                                            'token': str(token_info.get('token', '')),
+                                            'symbol': token_info.get('symbol', ''),
+                                        }
+                    if best_strike_info and best_strike_info['ltp'] > 0:
+                        logger.info(f"  BFO_FALLBACK_STRIKE: {name} {opt_type} ATM={atm_strike} "
+                                   f"Selected={best_strike_info['strike']} OI={best_strike_info['oi']:,.0f} "
+                                   f"LTP={best_strike_info['ltp']:.2f}")
+                        return best_strike_info
+            except Exception as e:
+                logger.error(f"BFO fallback strike selection error for {name}: {e}")
+
         # Fallback: mathematical derivation
         logger.info(f"  FALLBACK_STRIKE: {name} {opt_type} using ATM={atm_strike} (option chain unavailable)")
         return {'strike': atm_strike, 'ltp': 0, 'oi': 0, 'iv': 0, 'volume': 0}
@@ -1518,50 +1558,77 @@ class StrategyEngine:
         return fallback_strike, 0, 0
 
     def check_cpr_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """CPR Strategy - Gomathi Shankar."""
+        """CPR Strategy - Gomathi Shankar.
+
+        v7.4: Removed CPR dead zone (0.3-0.5%) that blocked SENSEX signals.
+        BUY breakout signals generated for ALL CPR widths — target/SL scaled by CPR width.
+        SELL mean reversion only for very wide CPR (> 0.6%) with margin.
+        """
         signals = []
         ind = indicators
         T = dte / 365
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
+        cpr_w = ind['cpr_width']
 
-        # NARROW CPR (< 0.3%) = BREAKOUT expected
-        if ind['cpr_width'] < 0.3:
-            if spot > ind['tc']:
-                ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
-                if premium > MIN_PREMIUM_BUY:
-                    signals.append({
-                        'type': 'BUY_CE_CPR',
-                        'strike': ce_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                        'target': premium * 2.5 if ohlc['high'] > ind['cam_r3'] else premium * 1.8,
-                        'sl': premium * 0.4,
-                    })
+        # ---- CPR-width-adjusted targets/SL ----
+        # Narrow CPR (< 0.3%): strong breakout → aggressive targets
+        # Moderate CPR (0.3-0.6%): directional trade → standard targets
+        # Wide CPR (> 0.6%): breakout less likely → conservative targets
+        if cpr_w < 0.3:
+            cpr_label = "Narrow"
+            target_hit_mult = 2.5   # Target = 2.5x premium
+            target_base_mult = 1.8  # Fallback target = 1.8x
+            sl_mult = 0.4           # SL = 40% of premium
+        elif cpr_w <= 0.6:
+            cpr_label = "Moderate"
+            target_hit_mult = 2.0
+            target_base_mult = 1.5
+            sl_mult = 0.45
+        else:
+            cpr_label = "Wide"
+            target_hit_mult = 1.6
+            target_base_mult = 1.3
+            sl_mult = 0.5
 
-            elif spot < ind['bc']:
-                pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
-                if premium > MIN_PREMIUM_BUY:
-                    signals.append({
-                        'type': 'BUY_PE_CPR',
-                        'strike': pe_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                        'target': premium * 2.5 if ohlc['low'] < ind['cam_s3'] else premium * 1.8,
-                        'sl': premium * 0.4,
-                    })
+        # ---- BUY BREAKOUT: All CPR widths ----
+        # Spot above TC → Bullish breakout → Buy CE
+        if spot > ind['tc']:
+            ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY:
+                signals.append({
+                    'type': 'BUY_CE_CPR',
+                    'strike': ce_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
+                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                    'target': premium * target_hit_mult if ohlc['high'] > ind['cam_r3'] else premium * target_base_mult,
+                    'sl': premium * sl_mult,
+                })
 
-        # WIDE CPR (> 0.5%) = MEAN REVERSION (sell)
-        elif ind['cpr_width'] > 0.5:
+        # Spot below BC → Bearish breakdown → Buy PE
+        elif spot < ind['bc']:
+            pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY:
+                signals.append({
+                    'type': 'BUY_PE_CPR',
+                    'strike': pe_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
+                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                    'target': premium * target_hit_mult if ohlc['low'] < ind['cam_s3'] else premium * target_base_mult,
+                    'sl': premium * sl_mult,
+                })
+
+        # ---- SELL MEAN REVERSION: Only for very wide CPR (> 0.6%) with margin ----
+        if cpr_w > 0.6:
             margin_ok = self.portfolio.capital >= MARGIN_PER_LOT.get(symbol, 120000)
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_interval) * strike_interval
@@ -1572,9 +1639,9 @@ class StrategyEngine:
                         'strike': ce_strike,
                         'premium': g['price'],
                         'greeks': g,
-                        'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at R3={ind['cam_r3']:.0f}",
-                        'target': g['price'] * 0.3,   # v2.5: Was 0.15 (too aggressive)
-                        'sl': g['price'] * 1.2,       # v2.5: Was 1.8 (too wide)
+                        'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at R3={ind['cam_r3']:.0f}",
+                        'target': g['price'] * 0.3,
+                        'sl': g['price'] * 1.2,
                     })
 
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
@@ -1586,15 +1653,19 @@ class StrategyEngine:
                         'strike': pe_strike,
                         'premium': g['price'],
                         'greeks': g,
-                        'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at S3={ind['cam_s3']:.0f}",
-                        'target': g['price'] * 0.3,   # v2.5: Was 0.15 (too aggressive)
-                        'sl': g['price'] * 1.2,       # v2.5: Was 1.8 (too wide)
+                        'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at S3={ind['cam_s3']:.0f}",
+                        'target': g['price'] * 0.3,
+                        'sl': g['price'] * 1.2,
                     })
 
         return signals
 
     def check_gamma_blast_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Gamma Blast - all days mode (paper trading test)."""
+        """Gamma Blast - all days mode (paper trading test).
+
+        v7.4: Relaxed coiled spring filter from 1.5 to 2.0 for high-value indices
+        (SENSEX/BANKNIFTY). Added logging for filter rejections.
+        """
         signals = []
         ind = indicators
 
@@ -1621,8 +1692,11 @@ class StrategyEngine:
             target_mult = max(2.0, 2.5 - days_to_expiry * 0.10)  # 2.0x-2.5x
             sl_mult = min(0.4, 0.3 + days_to_expiry * 0.02)      # 30%-40% SL
 
-        # Need coiled spring
-        if ind['prev_range'] > 1.5:
+        # v7.4: Coiled spring filter — relaxed for high-value indices
+        # SENSEX/BANKNIFTY naturally have higher daily ranges
+        coiled_threshold = 2.0 if symbol in ('SENSEX', 'BANKNIFTY') else 1.5
+        if ind['prev_range'] > coiled_threshold:
+            logger.info(f"  GAMMA_SKIP: {symbol} prev_range={ind['prev_range']:.2f} > {coiled_threshold} (coiled spring)")
             return signals
 
         atr = ind['atr']
@@ -1699,6 +1773,7 @@ class StrategyEngine:
 
         # ---- OI-Based Zone Validation (The Mother) ----
         oi_data = {}  # strike → {put_oi, call_oi}
+        oi_available = False  # v7.4: Track if OI data was fetched successfully
         if self.angel and self.angel._connected:
             try:
                 expiry = self._get_nearest_expiry(symbol)
@@ -1709,6 +1784,7 @@ class StrategyEngine:
                         "expirydate": expiry
                     })
                     if data and data.get('data'):
+                        oi_available = True
                         for sd in data['data']:
                             sd_strike = float(sd.get('strikePrice', 0) or 0)
                             sd_type = sd.get('optionType', '')
@@ -1719,6 +1795,9 @@ class StrategyEngine:
                                 oi_data[sd_strike]['put_oi'] = sd_oi
                             elif sd_type == 'CE':
                                 oi_data[sd_strike]['call_oi'] = sd_oi
+                    else:
+                        logger.info(f"  GTZ: No OI data from optionGreek for {symbol} "
+                                   f"(BFO/SENSEX not supported) — using price-action zones only")
             except Exception as e:
                 logger.debug(f"GTZ OI fetch error: {e}")
 
@@ -1767,8 +1846,10 @@ class StrategyEngine:
                 exhaustion_label = ""
                 if ind.get('demand_strength', 0) >= 2 or oi_score > 10000:
                     pass  # Strong zone — take it
-                elif oi_score == 0:
-                    continue  # No OI backing AND weak price zone — skip
+                elif oi_score == 0 and oi_available:
+                    continue  # OI data available but no OI backing — skip
+                elif oi_score == 0 and not oi_available and ind.get('demand_strength', 0) < 1:
+                    continue  # No OI data AND no price-action strength — skip
 
                 # Entry at 50% of zone (institutional limit order level)
                 entry_at_mid = zone_mid
@@ -1808,8 +1889,10 @@ class StrategyEngine:
 
                 if ind.get('supply_strength', 0) >= 2 or oi_score > 10000:
                     pass
-                elif oi_score == 0:
-                    continue
+                elif oi_score == 0 and oi_available:
+                    continue  # OI data available but no OI backing — skip
+                elif oi_score == 0 and not oi_available and ind.get('supply_strength', 0) < 1:
+                    continue  # No OI data AND no price-action strength — skip
 
                 pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
                 use_iv = chain_iv if chain_iv > 0 else ind['iv']
@@ -1837,13 +1920,16 @@ class StrategyEngine:
         """PCR+VWAP Strategy - CA Nitin Muraka.
         v2.5.2: RE-ENABLED — now using real option chain PCR from OI data.
         Previously disabled because proxy PCR (from price changes) never exceeded 1.05/0.95.
+        v7.4: Relaxed IV cap from 40% to 50%. Added logging for filter rejections.
         """
         signals = []
         ind = indicators
         T = dte / 365
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
 
-        if ind['iv'] > 0.40:
+        # v7.4: Relaxed IV cap — high IV days often have strong directional PCR signals
+        if ind['iv'] > 0.50:
+            logger.info(f"  PCR_SKIP: {symbol} IV={ind['iv']*100:.1f}% > 50% cap")
             return signals
 
         tolerance = max(ind['atr'] * 0.1, spot * 0.003)
