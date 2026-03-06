@@ -172,6 +172,11 @@ MCX_MIN_PREMIUM_BUY = 5         # Min Rs 5 premium for commodity BUY trades
 MCX_MIN_PREMIUM_SELL = 10       # Min Rs 10 premium for commodity SELL trades
 MCX_MIN_SIGNAL_SCORE = 50       # v2.5: Quality score 0-100, reject below 50 (was 40)
 MCX_DIRECTION_FLIP_MIN_SCORE = 70  # v7.6.2: Higher bar for DIRECTION_FLIP (closing existing to flip)
+
+# v7.7: Signal-Based Hold Score — controls exits
+MCX_HOLD_SCORE_STRONG = 60        # >= 60: Raise TSL aggressively, override TIME_EXIT/OI_SURGE
+MCX_HOLD_SCORE_WEAK = 40          # < 40: Allow early exit on losing positions
+MCX_HOLD_SCORE_MIN_HOLD_MINS = 30 # Minimum hold time before computing hold score
 MCX_MIN_PROFIT_TO_COST_RATIO = 2.0  # Expected profit must be >= 2x total cost
 
 # Cooldowns & Limits (commodity)
@@ -191,6 +196,7 @@ MCX_GST = 0.18
 MCX_OPEN = dtime(9, 0)
 MCX_CLOSE = dtime(23, 30)  # 11:30 PM
 COMMODITY_TRADE_START = dtime(9, 15)  # Commodity trades from 9:15 AM (no time barrier)
+MCX_FIRST_TRADE_TIME = dtime(9, 30)  # v8.0: No trades before 09:30 — first 30 min OI spikes/wide spreads
 MCX_LAST_ENTRY_TIME = dtime(22, 30)  # v2.5.2: No new entries after 10:30 PM (60 min before close)
 
 ANGEL_CRED_FILE = os.environ.get('ANGEL_CRED_FILE', r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt")
@@ -376,6 +382,91 @@ def mcx_compute_signal_score(signal, spot, indicators, vix=None):
             score += 8
 
     return min(score, 100)
+
+
+def mcx_compute_hold_score(pos, spot, indicators, current_oi=None, current_iv=None):
+    """v7.7: Score 0-100 — how strongly signals support STAYING in this commodity trade.
+
+    Factors:
+      Signal alignment (0-30): Is spot still on our side of CPR pivot?
+      Spot momentum    (0-25): Is spot moving in our trade's direction?
+      Premium health   (0-20): Is premium growing or stable?
+      OI trend         (0-15): Is OI accumulating (increasing)?
+      IV stability     (0-10): Is IV stable (not spiking against us)?
+
+    Thresholds:
+      >= MCX_HOLD_SCORE_STRONG (60): Raise TSL, override TIME_EXIT/OI_SURGE
+      40-59: Moderate hold, normal TSL behaviour
+      < MCX_HOLD_SCORE_WEAK (40): Allow early exit on losers
+    """
+    score = 0
+    is_bullish = 'CE' in pos.get('signal_type', '')
+
+    # 1. Signal alignment (0-30): Is spot on our side of pivot?
+    if indicators:
+        pivot = indicators.get('pivot', spot)
+        bc = indicators.get('bc', pivot)
+        tc = indicators.get('tc', pivot)
+        if is_bullish:
+            if spot > pivot:
+                score += 30
+            elif spot > bc:
+                score += 15
+        else:
+            if spot < pivot:
+                score += 30
+            elif spot < tc:
+                score += 15
+
+    # 2. Spot momentum (0-25): Is spot moving in our direction?
+    entry_spot = pos.get('entry_spot', spot)
+    atr = indicators.get('atr', 100) if indicators else 100
+    spot_move = spot - entry_spot
+    if atr > 0:
+        normalized = abs(spot_move) / atr
+        if (is_bullish and spot_move > 0) or (not is_bullish and spot_move < 0):
+            score += min(25, int(normalized * 25))
+
+    # 3. Premium health (0-20)
+    entry_prem = pos.get('entry_premium', 0)
+    current_prem = pos.get('current_premium', entry_prem)
+    if entry_prem > 0:
+        if pos.get('is_sell'):
+            gain_pct = (entry_prem - current_prem) / entry_prem * 100
+        else:
+            gain_pct = (current_prem - entry_prem) / entry_prem * 100
+        if gain_pct > 20:
+            score += 20
+        elif gain_pct > 10:
+            score += 15
+        elif gain_pct > 0:
+            score += 10
+        elif gain_pct > -5:
+            score += 5
+
+    # 4. OI trend (0-15)
+    entry_oi = pos.get('entry_oi', 0)
+    oi = current_oi if current_oi is not None else pos.get('current_oi', entry_oi)
+    if entry_oi and entry_oi > 0 and oi and oi > 0:
+        oi_change = (oi - entry_oi) / entry_oi
+        if oi_change > 0.10:
+            score += 15
+        elif oi_change > 0:
+            score += 10
+        elif oi_change > -0.10:
+            score += 5
+
+    # 5. IV stability (0-10)
+    entry_iv_val = pos.get('entry_iv', 0)
+    iv_val = current_iv if current_iv is not None else pos.get('current_iv', entry_iv_val)
+    if entry_iv_val and entry_iv_val > 0 and iv_val and iv_val > 0:
+        iv_change = abs(iv_val - entry_iv_val) / entry_iv_val
+        if iv_change < 0.10:
+            score += 10
+        elif iv_change < 0.20:
+            score += 5
+
+    return max(0, min(100, score))
 
 
 # ====================================================================
@@ -1069,14 +1160,31 @@ class AngelMCXConnection:
         # MCX futures tokens for spot proxy
         self._futures_tokens = {}
         self._last_api_call = 0  # Timestamp of last REST API call
-        self._api_min_interval = 0.5  # Minimum 500ms between REST calls
+        self._api_min_interval = 1.0  # v7.7: Minimum 1s between REST calls (was 0.5s, caused AB1004)
+        self._backoff_until = 0  # v7.7: Exponential backoff timestamp
 
     def _throttle(self):
         """Enforce minimum interval between REST API calls to avoid rate limiting."""
+        now = time.time()
+        if now < self._backoff_until:
+            wait = self._backoff_until - now
+            logger.debug(f"MCX API backoff: waiting {wait:.1f}s")
+            time.sleep(wait)
         elapsed = time.time() - self._last_api_call
         if elapsed < self._api_min_interval:
             time.sleep(self._api_min_interval - elapsed)
         self._last_api_call = time.time()
+
+    def _handle_rate_limit(self, error_msg=''):
+        """v7.7: Exponential backoff on rate limit (AB1004/TooManyRequests)."""
+        backoff = min(30, max(2, (self._backoff_until - time.time()) * 2 + 2))
+        self._backoff_until = time.time() + backoff
+        logger.warning(f"MCX API RATE_LIMIT: backing off {backoff:.0f}s — {error_msg}")
+        try:
+            from trade_notifier import notify_api_rate_limit
+            notify_api_rate_limit('COMMODITY', 'REST API', error_msg)
+        except Exception:
+            pass
 
     def connect(self):
         try:
@@ -1161,8 +1269,14 @@ class AngelMCXConnection:
             data = self.obj.getCandleData(params)
             if data and data.get('data'):
                 return data['data']
+            if data and 'AB1004' in str(data.get('errorcode', '')):
+                self._handle_rate_limit(str(data.get('message', '')))
         except Exception as e:
-            logger.error(f"MCX Historical error: {e}")
+            err_str = str(e)
+            if 'TooMany' in err_str or 'rate' in err_str.lower() or 'AB1004' in err_str:
+                self._handle_rate_limit(err_str)
+            else:
+                logger.error(f"MCX Historical error: {e}")
         return None
 
     def get_ltp(self, commodity):
@@ -1542,39 +1656,48 @@ class CommodityPaperTrader:
         # v2.5.2: Get unrealized PnL for loss-only exits
         unrealized_pnl = pos.get('unrealized_pnl', 0)
 
-        # Rule 1: OI surge (time-adaptive) — v2.5.2: only exit when trade is LOSING
+        # v8.0: OI/IV signals TIGHTEN SL instead of forcing exit
+        # Rule 1: OI surge (time-adaptive) — v8.0: tighten SL, never force exit
         if oi_change > oi_threshold:
             if unrealized_pnl >= -200:
                 logger.info(f"  MCX_OI_HOLD: {pos['id']} OI={oi_change:.1f}% > {oi_threshold:.0f}% "
                            f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
             else:
-                should_reverse = oi_change > MCX_OI_REVERSE_PCT
-                logger.info(f"  MCX_OI_SURGE: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
+                logger.info(f"  MCX_OI_SL_TIGHTEN: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
                            f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
-                           f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')})")
-                return 'OI_SURGE_EXIT', should_reverse
+                           f"(entry={entry_oi}, current={current_oi}, time={now_time.strftime('%H:%M')}). Tightening SL.")
+                return 'OI_SL_TIGHTEN', False
 
-        # Rule 2: IV spike (v2.4: strategy-adjusted) — v2.5.2: skip on low-premium trades
+        # Rule 2: IV change — v8.0: direction-aware, tighten SL instead of forced exit
+        # IV direction: IV DROP hurts BUY positions, IV RISE hurts SELL positions
+        is_sell = pos.get('is_sell', False)
+        iv_raw_change = ((current_iv - entry_iv) / entry_iv * 100) if entry_iv > 0 else 0
+        iv_hurts_position = (iv_raw_change < 0 and not is_sell) or (iv_raw_change > 0 and is_sell)
+
         iv_threshold = MCX_IV_SPIKE_PCT * strat_mult['iv']
         if iv_change > iv_threshold:
             entry_premium = pos.get('entry_premium', 0)
             if entry_premium < 30:
                 logger.info(f"  MCX_IV_HOLD_LOW_PREM: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
                            f"but entry premium Rs {entry_premium:.2f} < 30. Holding.")
+            elif not iv_hurts_position:
+                # v8.0: IV moving in our FAVOR — no need to tighten
+                logger.info(f"  MCX_IV_FAVORABLE: {pos['id']} IV changed {iv_raw_change:+.1f}% "
+                           f"({'DROP' if iv_raw_change < 0 else 'RISE'}) — favorable for "
+                           f"{'SELL' if is_sell else 'BUY'} position. Holding.")
             elif unrealized_pnl >= -200:
                 logger.info(f"  MCX_IV_HOLD: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
                            f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
             else:
-                should_reverse = iv_change > MCX_IV_REVERSE_PCT
-                logger.info(f"  MCX_IV_SPIKE: {pos['id']} IV changed {iv_change:.1f}% > {iv_threshold:.0f}% "
-                           f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
-                           f"(entry={entry_iv}%, current={current_iv}%)")
-                return 'IV_SPIKE_EXIT', should_reverse
+                logger.info(f"  MCX_IV_SL_TIGHTEN: {pos['id']} IV changed {iv_raw_change:+.1f}% > {iv_threshold:.0f}% "
+                           f"PnL Rs {unrealized_pnl:.0f} — hurting {'SELL' if is_sell else 'BUY'} position. "
+                           f"(entry={entry_iv}%, current={current_iv}%). Tightening SL.")
+                return 'IV_SL_TIGHTEN', False
 
-        # Rule 3: Combined OI+IV
+        # Rule 3: Combined OI+IV — v8.0: tighten SL aggressively (10% tighter)
         if oi_change > MCX_OI_IV_COMBO_OI and iv_change > MCX_OI_IV_COMBO_IV:
-            logger.info(f"  MCX_OI_IV_COMBO: {pos['id']} OI={oi_change:.1f}%, IV={iv_change:.1f}%. REVERSE!")
-            return 'OI_IV_COMBINED_EXIT', True
+            logger.info(f"  MCX_OI_IV_COMBO_TIGHTEN: {pos['id']} OI={oi_change:.1f}%, IV={iv_change:.1f}%. Tightening SL aggressively.")
+            return 'OI_IV_SL_TIGHTEN', False
 
         # Rule 4: Gamma shield for short positions
         if pos.get('is_sell') and abs(pos.get('gamma', 0)) > MCX_GAMMA_SHIELD_THRESHOLD:
@@ -1794,6 +1917,12 @@ class CommodityPaperTrader:
             logger.warning(f"  {len(signals)} signals found but MCX CLOSED - NOT executing")
             return
 
+        # v8.0: No trades before 09:30 — first 30 min inflated premiums, OI spikes, wide spreads
+        if datetime.now().time() < MCX_FIRST_TRADE_TIME:
+            logger.info(f"  MCX_EARLY_MARKET_BLOCK: {len(signals)} signals before "
+                       f"{MCX_FIRST_TRADE_TIME.strftime('%H:%M')} — skipping (market stabilization)")
+            return
+
         # v2.5.2: No new entries after 10:30 PM — trades need 60 min to develop
         if datetime.now().time() > MCX_LAST_ENTRY_TIME:
             logger.warning(f"  MCX_LATE_ENTRY_BLOCK: {len(signals)} signals at {datetime.now().strftime('%H:%M')} "
@@ -1818,19 +1947,28 @@ class CommodityPaperTrader:
                 logger.info(f"  MCX_MAX_TRADES_REACHED: {self.daily_trade_count} trades today. Skipping remaining.")
                 break
 
-            # v2.4: Check for duplicate across ALL strategies — same commodity + NEARBY strike + SAME option type
+            # v7.7: Strategy-aware duplicate check
             strike_tolerance = {'GOLDM': 200, 'SILVERM': 1000, 'CRUDEOILM': 100}
             tol = strike_tolerance.get(sig['commodity'], 100)
             sig_opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
-            existing = [p for p in self.portfolio.positions
-                        if p['commodity'] == sig['commodity']
-                        and abs(p['strike'] - sig['strike']) <= tol
-                        and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)]
-            if existing:
+            same_strat_dup = [p for p in self.portfolio.positions
+                              if p['commodity'] == sig['commodity']
+                              and abs(p['strike'] - sig['strike']) <= tol
+                              and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
+                              and p['strategy'] == sig['strategy']]
+            if same_strat_dup:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['commodity']} "
-                           f"{sig['strike']}{sig_opt_type} — already held by {existing[0]['strategy']} @ {existing[0]['strike']}")
+                           f"{sig['strike']}{sig_opt_type} — already held @ {same_strat_dup[0]['strike']}")
                 skipped += 1
                 continue
+            diff_strat_same_dir = [p for p in self.portfolio.positions
+                                   if p['commodity'] == sig['commodity']
+                                   and abs(p['strike'] - sig['strike']) <= tol
+                                   and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
+                                   and p['strategy'] != sig['strategy']]
+            if diff_strat_same_dir:
+                logger.info(f"  MCX_STRATEGY_CONFIRM: {sig['strategy']} {sig['commodity']} {sig['strike']}{sig_opt_type} "
+                           f"confirms {diff_strat_same_dir[0]['strategy']} @ {diff_strat_same_dir[0]['strike']} — allowing entry")
 
             # Check for CONFLICTING positions: no BUY_CE + SELL_CE on same commodity/strike
             opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
@@ -1876,15 +2014,15 @@ class CommodityPaperTrader:
                     skipped += 1
                     continue
 
-                # Close the opposite position if it's losing or at breakeven
-                if opp_pnl <= 0 or opp.get('breakeven_locked', False):
-                    logger.info(f"  DIRECTION_FLIP: Closing {opp['id']} (PnL Rs {opp_pnl:.0f}) "
+                # v7.7: Only flip LOSING positions. Profitable ones run regardless of breakeven_locked.
+                if opp_pnl <= 0:
+                    logger.info(f"  DIRECTION_FLIP: Closing {opp['id']} (PnL Rs {opp_pnl:.0f} losing) "
                                f"to flip to {sig['type']} (score={flip_score})")
                     self.portfolio.close_position(opp['id'], opp_prem, 'DIRECTION_FLIP')
                     self._track_exit(opp, 'DIRECTION_FLIP')
                     self._notify_commodity_exit(opp, sig['commodity'], opp_prem, 'DIRECTION_FLIP')
                 else:
-                    # Position is profitable and NOT breakeven-locked — let it run
+                    # Position is profitable — let it run (even if breakeven-locked)
                     logger.info(f"  SKIP_DIRECTION: {sig['strategy']} {sig['commodity']} {sig['type']} "
                                f"— already holding {opp['signal_type']} (PnL Rs {opp_pnl:.0f}, let it run)")
                     skipped += 1
@@ -2152,15 +2290,46 @@ class CommodityPaperTrader:
                 pos['unrealized_pnl'] = round(
                     (current - pos['entry_premium']) * lot * mult - pos['entry_cost'], 2)
 
+            # ---- v7.7: COMPUTE HOLD SCORE for signal-based exit decisions ----
+            hold_score = 50  # Default moderate
+            hold_mins = (datetime.now() - entry_time).total_seconds() / 60
+            if hold_mins >= MCX_HOLD_SCORE_MIN_HOLD_MINS:
+                try:
+                    hold_indicators = self.engine.compute_indicators(commodity,
+                        {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0})
+                    hold_score = mcx_compute_hold_score(pos, spot, hold_indicators)
+                except Exception:
+                    hold_score = 50
+            pos['hold_score'] = hold_score
+            hold_label = 'STRONG' if hold_score >= MCX_HOLD_SCORE_STRONG else 'MODERATE' if hold_score >= MCX_HOLD_SCORE_WEAK else 'WEAK'
+
+            # ---- v7.7: SIGNAL WEAK EXIT — early exit for losing commodity positions with weak signals ----
+            if (hold_mins >= MCX_HOLD_SCORE_MIN_HOLD_MINS
+                    and hold_score < MCX_HOLD_SCORE_WEAK
+                    and pos.get('unrealized_pnl', 0) < 0
+                    and hours_held > 1):
+                logger.info(f"  MCX_SIGNAL_WEAK_EXIT: {pos['id']} hold_score={hold_score} ({hold_label}) "
+                           f"PnL Rs {pos.get('unrealized_pnl', 0):.0f} — signals reversed, early exit")
+                self.portfolio.close_position(pos['id'], current, 'SIGNAL_WEAK_EXIT')
+                self._track_exit(pos, 'SIGNAL_WEAK_EXIT')
+                self._notify_commodity_exit(pos, commodity, current, 'SIGNAL_WEAK_EXIT')
+                continue
+
             # ---- TIME-BASED EXIT: Close stale commodity positions (v2.5: >4 hours with <10% profit) ----
             if hours_held > 4:  # v2.5: Reduced from 6 hours
                 profit_pct = (pos['unrealized_pnl'] / max(pos['entry_premium'] * lot * mult, 1)) * 100
                 if abs(profit_pct) < 10:  # v2.5: Raised from 5%
-                    logger.info(f"  MCX_TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only {profit_pct:.1f}% profit")
-                    self.portfolio.close_position(pos['id'], current, 'TIME_EXIT_NO_PROGRESS')
-                    self._track_exit(pos, 'TIME_EXIT_NO_PROGRESS')
-                    self._notify_commodity_exit(pos, commodity, current, 'TIME_EXIT_NO_PROGRESS')
-                    continue
+                    # v7.7: Override TIME_EXIT if hold score is STRONG
+                    if hold_score >= MCX_HOLD_SCORE_STRONG:
+                        logger.info(f"  MCX_SIGNAL_HOLD_OVERRIDE: {pos['id']} hold_score={hold_score} ({hold_label}) "
+                                   f"— overriding TIME_EXIT (signals still valid)")
+                    else:
+                        logger.info(f"  MCX_TIME_EXIT: {pos['id']} held {hours_held:.1f}h with only "
+                                   f"{profit_pct:.1f}% profit (hold_score={hold_score} {hold_label})")
+                        self.portfolio.close_position(pos['id'], current, 'TIME_EXIT_NO_PROGRESS')
+                        self._track_exit(pos, 'TIME_EXIT_NO_PROGRESS')
+                        self._notify_commodity_exit(pos, commodity, current, 'TIME_EXIT_NO_PROGRESS')
+                        continue
 
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
             target = details.get('target', pos['entry_premium'] * 1.5)
@@ -2203,6 +2372,18 @@ class CommodityPaperTrader:
                         logger.info(f"  TSL_TRAIL: {pos['id']} gain {peak_gain_pct:.0f}% "
                                    f"SL→Rs {pos['trailing_sl']:.2f} (peak={peak:.2f})")
 
+                # v7.7: Signal-based TSL ratchet — if signals STRONG, raise TSL aggressively
+                if (hold_score >= MCX_HOLD_SCORE_STRONG
+                        and peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT
+                        and pos.get('trailing_sl')):
+                    ratchet_tsl = round(current * 0.85, 2)
+                    if ratchet_tsl > pos['trailing_sl']:
+                        old_tsl = pos['trailing_sl']
+                        pos['trailing_sl'] = ratchet_tsl
+                        logger.info(f"  MCX_SIGNAL_HOLD_RATCHET: {pos['id']} hold_score={hold_score} "
+                                   f"→ TSL Rs {old_tsl:.2f}→{ratchet_tsl:.2f} "
+                                   f"(85% of current Rs {current:.2f})")
+
                 if pos.get('trailing_sl') and current <= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} premium {current:.2f} <= TSL {pos['trailing_sl']:.2f}")
                     self.portfolio.close_position(pos['id'], current, 'TRAILING_SL_HIT')
@@ -2242,6 +2423,18 @@ class CommodityPaperTrader:
                         logger.info(f"  TSL_TRAIL: {pos['id']} SELL gain {trough_gain_pct:.0f}% "
                                    f"SL→Rs {pos['trailing_sl']:.2f} (trough={trough:.2f})")
 
+                # v7.7: Signal-based TSL ratchet for SELL
+                if (hold_score >= MCX_HOLD_SCORE_STRONG
+                        and trough_gain_pct >= TSL_BREAKEVEN_GAIN_PCT
+                        and pos.get('trailing_sl')):
+                    ratchet_tsl = round(current * 1.15, 2)  # SELL: 15% above current (tighter)
+                    if ratchet_tsl < pos['trailing_sl']:
+                        old_tsl = pos['trailing_sl']
+                        pos['trailing_sl'] = ratchet_tsl
+                        logger.info(f"  MCX_SIGNAL_HOLD_RATCHET: {pos['id']} SELL hold_score={hold_score} "
+                                   f"→ TSL Rs {old_tsl:.2f}→{ratchet_tsl:.2f} "
+                                   f"(115% of current Rs {current:.2f})")
+
                 if pos.get('trailing_sl') and current >= pos['trailing_sl']:
                     logger.info(f"  TRAILING_SL_HIT: {pos['id']} SELL premium {current:.2f} >= TSL {pos['trailing_sl']:.2f}")
                     self.portfolio.close_position(pos['id'], current, 'TRAILING_SL_HIT')
@@ -2259,37 +2452,52 @@ class CommodityPaperTrader:
                 if iv_solved:
                     current_iv_pct = round(iv_solved * 100, 1)
             oi_iv_reason, should_reverse = self.check_oi_iv_exit(pos, current, current_iv_pct)
+            # v7.7: Signal-based override
             if oi_iv_reason:
-                # v2.3.2: PnL guard — don't exit on OI/IV if PnL doesn't cover brokerage
-                pos_lot = pos.get('lot_size', COMMODITIES[commodity]['lot_size'])
-                pos_mult = pos.get('multiplier', COMMODITIES[commodity]['multiplier'])
-                if pos['is_sell']:
-                    pnl_estimate = (pos['entry_premium'] - current) * pos_lot * pos_mult
+                if hold_score >= MCX_HOLD_SCORE_STRONG and pos.get('unrealized_pnl', 0) > 0:
+                    logger.info(f"  MCX_SIGNAL_HOLD_OVERRIDE: {pos['id']} hold_score={hold_score} ({hold_label}) "
+                               f"— overriding {oi_iv_reason} (signals strong + profitable)")
+                    oi_iv_reason = None
+            if oi_iv_reason:
+                # v8.0: OI/IV TIGHTEN SL instead of forcing exit. Only GAMMA_SHIELD forces exit.
+                if 'SL_TIGHTEN' in oi_iv_reason:
+                    # Tighten trailing SL — combo tightens 10%, single tightens 5%
+                    tighten_pct = 0.10 if 'OI_IV_SL_TIGHTEN' == oi_iv_reason else 0.05
+                    if pos['is_sell']:
+                        new_tsl = round(current * (1 + tighten_pct), 2)
+                        if pos.get('trailing_sl') is None or new_tsl < pos['trailing_sl']:
+                            old_tsl = pos.get('trailing_sl', 'None')
+                            pos['trailing_sl'] = new_tsl
+                            logger.info(f"  {oi_iv_reason}: {pos['id']} SELL TSL "
+                                       f"Rs {old_tsl}→{new_tsl:.2f} "
+                                       f"({tighten_pct*100:.0f}% above current {current:.2f})")
+                        else:
+                            logger.info(f"  {oi_iv_reason}: {pos['id']} SELL TSL already tighter "
+                                       f"Rs {pos['trailing_sl']:.2f}. No change.")
+                    else:
+                        new_tsl = round(current * (1 - tighten_pct), 2)
+                        if pos.get('trailing_sl') is None or new_tsl > (pos.get('trailing_sl') or 0):
+                            old_tsl = pos.get('trailing_sl', 'None')
+                            pos['trailing_sl'] = new_tsl
+                            logger.info(f"  {oi_iv_reason}: {pos['id']} BUY TSL "
+                                       f"Rs {old_tsl}→{new_tsl:.2f} "
+                                       f"({tighten_pct*100:.0f}% below current {current:.2f})")
+                        else:
+                            logger.info(f"  {oi_iv_reason}: {pos['id']} BUY TSL already tighter "
+                                       f"Rs {pos.get('trailing_sl'):.2f}. No change.")
+                    # v8.0: Don't close, don't reverse — let TSL handle exit naturally
                 else:
-                    pnl_estimate = (current - pos['entry_premium']) * pos_lot * pos_mult
-                total_cost = calc_mcx_costs(pos['entry_premium'], pos_lot, pos_mult, pos.get('is_sell', False))
-
-                # v2.4: Strategy-aware PnL threshold (Survivor tolerates 3x more)
-                min_oi_pnl = MCX_MIN_OI_EXIT_PNL
-                if 'Survivor' in pos.get('strategy', ''):
-                    min_oi_pnl = MCX_MIN_OI_EXIT_PNL * 3  # Rs 150 for Survivor
-
-                if pnl_estimate < min_oi_pnl and pnl_estimate > -total_cost * 2:
-                    logger.info(f"  OI_EXIT_BLOCKED: {pos['id']} {oi_iv_reason} blocked — "
-                               f"PnL Rs {pnl_estimate:.0f} < Rs {min_oi_pnl} "
-                               f"(need profit to cover brokerage). Letting TSL/target handle exit.")
-                else:
+                    # GAMMA_SHIELD_EXIT — forced exit (real gamma risk)
                     self.portfolio.close_position(pos['id'], current, oi_iv_reason)
                     self._track_exit(pos, oi_iv_reason)
                     self._notify_commodity_exit(pos, commodity, current, oi_iv_reason)
-                    if should_reverse:
-                        self.execute_reversal(pos, oi_iv_reason)
                     continue
 
             # ---- STATIC EXIT CHECK ----
             logger.info(f"  EXIT_CHECK: {pos['id']} | Entry: {pos['entry_premium']:.2f} → Current: {current:.2f} [{premium_source}] | "
                        f"Target: {target:.2f} SL: {sl:.2f} | TSL: {pos.get('trailing_sl', 'N/A')} | "
-                       f"Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f}")
+                       f"Spot: {entry_spot:.0f}→{spot:.0f} Δ={spot_change:+.0f} | "
+                       f"Hold: {hold_score}/{hold_label}")
 
             exit_reason = None
             if pos['is_sell']:
