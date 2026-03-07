@@ -16,6 +16,15 @@ CHAT_ID = int(os.environ.get('TELEGRAM_CHAT_ID', '1722559857') or '1722559857')
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Notification level: 'ERROR' = only errors/failures, 'ALL' = everything
+# Set TELEGRAM_NOTIFY_LEVEL=ALL to get trade entries, exits, summaries
+NOTIFY_LEVEL = os.environ.get('TELEGRAM_NOTIFY_LEVEL', 'ERROR').upper()
+
+
+def _is_info_allowed():
+    """Check if info-level messages (trades, summaries) should be sent."""
+    return NOTIFY_LEVEL != 'ERROR'
+
 
 def _get_chat_id():
     """Auto-discover chat_id from bot updates."""
@@ -34,8 +43,15 @@ def _get_chat_id():
     return None
 
 
+def send_info(text, parse_mode="HTML"):
+    """Send an info-level message (gated by NOTIFY_LEVEL). Use for non-error notifications."""
+    if not _is_info_allowed():
+        return True
+    return send_message(text, parse_mode)
+
+
 def send_message(text, parse_mode="HTML"):
-    """Send a message via Telegram Bot API."""
+    """Send a message via Telegram Bot API. Always sends (use send_info for gated messages)."""
     chat_id = _get_chat_id()
     if not chat_id:
         logger.warning("Telegram chat_id not available. Send a message to @Ramalgotradebot first.")
@@ -62,6 +78,8 @@ def notify_trade_entry(market, strategy, symbol, signal_type, strike, entry_pric
                        spot, lot_size, multiplier, delta, target, sl, capital_used, reason,
                        capital_available=None, instance_id=None, total_invested=None):
     """Send notification when a new trade is entered."""
+    if not _is_info_allowed():
+        return True
     direction = "BUY" if "BUY" in signal_type else "SELL"
     opt_type = "CE" if "CE" in signal_type else "PE"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -105,6 +123,8 @@ def notify_trade_exit(market, strategy, symbol, signal_type, strike,
                       capital_used, exit_reason, capital_available=None,
                       instance_id=None, total_invested=None):
     """Send notification when a trade is exited."""
+    if not _is_info_allowed():
+        return True
     opt_type = "CE" if "CE" in signal_type else "PE"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pnl_emoji = "💰" if pnl > 0 else "📉"
@@ -150,6 +170,8 @@ def notify_daily_summary(equity_capital, equity_pnl, equity_positions, equity_cl
                          commodity_signals=0, commodity_dummy_pnl=0,
                          equity_capital_used=0, commodity_capital_used=0):
     """Send end-of-day portfolio summary with actual + dummy PnL."""
+    if not _is_info_allowed():
+        return True
     total_capital = equity_capital + commodity_capital
     total_pnl = equity_pnl + commodity_pnl
     total_pct = (total_pnl / total_capital * 100) if total_capital > 0 else 0
@@ -186,6 +208,8 @@ def notify_daily_summary(equity_capital, equity_pnl, equity_positions, equity_cl
 
 def notify_scanner_start(instance_id=None):
     """Send notification when scanner starts."""
+    if not _is_info_allowed():
+        return True
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if instance_id:
@@ -206,7 +230,7 @@ def notify_scanner_start(instance_id=None):
         f"<b>Commodity:</b> GOLDM, SILVERM, CRUDEOILM (9:15-23:30) | Every 30s\n"
         f"<b>Crypto:</b> BTC, ETH, SOL (24/7) | Every 5min\n"
         f"<b>Strategies:</b> CPR, Gamma Blast, Ghost Zone, PCR+VWAP, Survivor\n"
-        f"<b>Capital:</b> ₹2,00,000 Equity + ₹1,00,000 Commodity = ₹3,00,000\n"
+        f"<b>Capital:</b> ₹3,00,000 Equity + ₹3,00,000 Commodity = ₹6,00,000\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     return send_message(msg)
@@ -223,8 +247,108 @@ def notify_error(error_msg):
     return send_message(msg)
 
 
+# v7.7: Alert throttling — prevent Telegram spam for repeated errors
+_alert_cooldowns = {}  # key -> last_sent_timestamp
+ALERT_COOLDOWN_SECONDS = 300  # 5 minutes between same alert type
+
+
+def _should_alert(alert_key):
+    """Check if enough time has passed since last alert of this type."""
+    now = datetime.now().timestamp()
+    last = _alert_cooldowns.get(alert_key, 0)
+    if now - last < ALERT_COOLDOWN_SECONDS:
+        return False
+    _alert_cooldowns[alert_key] = now
+    return True
+
+
+def notify_api_rate_limit(market, endpoint, error_msg=''):
+    """v7.7: Alert when API rate limit (AB1004) is hit."""
+    key = f"rate_limit_{market}_{endpoint}"
+    if not _should_alert(key):
+        return False
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"<b>🚫 API RATE LIMIT</b>\n"
+        f"<b>Market:</b> {market}\n"
+        f"<b>Endpoint:</b> {endpoint}\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Detail:</b> <code>{str(error_msg)[:200]}</code>\n"
+        f"Backing off automatically."
+    )
+    return send_message(msg)
+
+
+def notify_api_error(market, endpoint, error_code, error_msg=''):
+    """v7.7: Alert for API errors (AB9019 No Data, AB4006 Invalid Token, etc)."""
+    key = f"api_error_{market}_{error_code}"
+    if not _should_alert(key):
+        return False
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"<b>⚠️ API ERROR</b>\n"
+        f"<b>Market:</b> {market}\n"
+        f"<b>Endpoint:</b> {endpoint}\n"
+        f"<b>Error Code:</b> {error_code}\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Detail:</b> <code>{str(error_msg)[:200]}</code>"
+    )
+    return send_message(msg)
+
+
+def notify_websocket_issue(event, detail=''):
+    """v7.7: Alert for WebSocket disconnect/reconnect events."""
+    key = f"ws_{event}"
+    if not _should_alert(key):
+        return False
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"<b>🔌 WEBSOCKET {event.upper()}</b>\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Detail:</b> {str(detail)[:200]}\n"
+        f"{'Reconnecting...' if event == 'disconnected' else ''}"
+    )
+    return send_message(msg)
+
+
+def notify_signal_gap(market, symbol, minutes_without_signal, last_signal_time=''):
+    """v7.7: Alert when no signals received for a symbol for too long."""
+    key = f"signal_gap_{market}_{symbol}"
+    if not _should_alert(key):
+        return False
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"<b>📡 SIGNAL GAP</b>\n"
+        f"<b>Market:</b> {market}\n"
+        f"<b>Symbol:</b> {symbol}\n"
+        f"<b>No signals for:</b> {minutes_without_signal:.0f} minutes\n"
+        f"<b>Last signal:</b> {last_signal_time}\n"
+        f"<b>Time:</b> {now}\n"
+        f"Check if API data is flowing."
+    )
+    return send_message(msg)
+
+
+def notify_data_issue(market, issue_type, detail=''):
+    """v7.7: Alert for data issues (no ticks, stale prices, missing OI, etc)."""
+    key = f"data_{market}_{issue_type}"
+    if not _should_alert(key):
+        return False
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"<b>📊 DATA ISSUE</b>\n"
+        f"<b>Market:</b> {market}\n"
+        f"<b>Issue:</b> {issue_type}\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Detail:</b> {str(detail)[:300]}"
+    )
+    return send_message(msg)
+
+
 def notify_active_trades():
     """Push all active (open) trades from equity + commodity portfolios to Telegram."""
+    if not _is_info_allowed():
+        return True
     import json, os
     base = os.path.dirname(os.path.abspath(__file__))
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -325,6 +449,8 @@ def notify_active_trades():
 
 def notify_trailing_sl(market, symbol, strike, old_sl, new_sl, current_premium, peak_premium):
     """Notify when trailing stop loss is adjusted."""
+    if not _is_info_allowed():
+        return True
     msg = (f"<b>TRAILING SL ADJUSTED</b>\n"
            f"{market} | {symbol} {strike}\n"
            f"Old SL: Rs {old_sl:.2f} → New SL: Rs {new_sl:.2f}\n"
@@ -344,6 +470,8 @@ def notify_circuit_breaker(market, daily_loss, positions_closed):
 
 def notify_reversal(market, original_type, reverse_type, symbol, strike, premium, reason):
     """Notify when a reversal trade is opened."""
+    if not _is_info_allowed():
+        return True
     msg = (f"<b>REVERSAL TRADE</b>\n"
            f"Market: {market}\n"
            f"Closed: {original_type} {symbol} {strike}\n"
@@ -369,6 +497,8 @@ def notify_scan_failure(market, error_msg, thread_name=''):
 
 def notify_service_restart(instance_id='vultr', reason=''):
     """v7.2: Notify when the service starts/restarts (including auto-restart)."""
+    if not _is_info_allowed():
+        return True
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     label = '☁️ Vultr VPS' if instance_id == 'vultr' else '🖥️ Local'
     msg = (

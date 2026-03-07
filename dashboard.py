@@ -7,8 +7,10 @@ import json
 import os
 import csv
 import io
-from datetime import datetime, timedelta
+import glob
+from datetime import datetime, date, timedelta
 from flask import Flask, jsonify, render_template, Response, request
+from market_holidays import is_nse_holiday
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
@@ -17,9 +19,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EQUITY_STATE = os.path.join(BASE_DIR, 'paper_trades', 'portfolio_state.json')
 COMMODITY_STATE = os.path.join(BASE_DIR, 'paper_trades_commodity', 'commodity_portfolio_state.json')
 CRYPTO_STATE = os.path.join(BASE_DIR, 'paper_trades_crypto', 'crypto_portfolio_state.json')
+STOCK_STATE = os.path.join(BASE_DIR, 'stock_paper_trades', 'stock_portfolio_state.json')
+STOCK_PAPER_DIR = os.path.join(BASE_DIR, 'stock_paper_trades')
 
 EQUITY_CAPITAL = 300000
 COMMODITY_CAPITAL = 300000
+STOCK_CAPITAL = 200000
 
 # Margin per lot for capital invested calculation
 MARGIN_PER_LOT = {'NIFTY': 100000, 'BANKNIFTY': 95000, 'SENSEX': 70000}
@@ -63,6 +68,8 @@ def parse_positions(data, market='equity'):
         if is_sell:
             if market == 'equity':
                 cap_invested = MARGIN_PER_LOT.get(symbol, 100000) * num_lots
+            elif market == 'stocks':
+                cap_invested = pos.get('entry_premium', 0) * lot_size * 3  # Approx margin for stock SELL
             else:
                 cap_invested = MCX_MARGINS.get(symbol, 15000) * num_lots
         else:
@@ -71,12 +78,30 @@ def parse_positions(data, market='equity'):
         # v7.6: PnL percentage
         pnl_pct = round(pnl / cap_invested * 100, 1) if cap_invested > 0 else 0
 
+        # v9.1: Extract expiry from details, format for display
+        raw_expiry = details.get('expiry', '')
+        if raw_expiry:
+            try:
+                exp_dt = datetime.strptime(raw_expiry, '%d%b%Y')
+                expiry_display = exp_dt.strftime('%d %b')
+            except Exception:
+                expiry_display = raw_expiry
+        else:
+            # Fallback: compute from entry_time + dte
+            dte_val = pos.get('dte', 0)
+            if dt and dte_val:
+                exp_date = dt + timedelta(days=dte_val)
+                expiry_display = exp_date.strftime('%d %b')
+            else:
+                expiry_display = '--'
+
         positions.append({
             'id': pos.get('id', ''),
             'symbol': symbol,
             'strategy': pos.get('strategy', ''),
             'type': pos.get('signal_type', ''),
             'strike': pos.get('strike', 0),
+            'expiry': expiry_display,
             'entry_price': pos.get('entry_premium', 0),
             'current_price': pos.get('current_premium', 0),
             'pnl': round(pnl, 2),
@@ -84,6 +109,8 @@ def parse_positions(data, market='equity'):
             'entry_time': entry_time,
             'duration': duration_str,
             'delta': pos.get('delta', 0),
+            'gamma': pos.get('gamma', 0),
+            'theta': pos.get('theta', 0),
             'tsl': pos.get('trailing_sl', None),
             'target': details.get('target', 0),
             'sl': details.get('sl', 0),
@@ -96,6 +123,16 @@ def parse_positions(data, market='equity'):
             'multiplier': multiplier,
             'capital_invested': round(cap_invested, 2),
             'capital_available': pos.get('capital_available', 0),
+            # v10: Enhanced fields for modern dashboard
+            'iv': pos.get('iv', details.get('iv', 0)),
+            'dte': pos.get('dte', details.get('dte', 0)),
+            'entry_oi': pos.get('entry_oi', details.get('entry_oi', 0)),
+            'entry_iv': pos.get('entry_iv', details.get('entry_iv', 0)),
+            'entry_spot': pos.get('entry_spot', details.get('entry_spot', 0)),
+            'peak_premium': pos.get('peak_premium', 0),
+            'trough_premium': pos.get('trough_premium', 0),
+            'breakeven_locked': pos.get('breakeven_locked', False),
+            'reason': pos.get('reason', details.get('reason', '')),
         })
     return positions
 
@@ -131,10 +168,35 @@ def parse_closed_trades(data, market='equity'):
         t_mult = t.get('multiplier', 1)
         t_is_sell = t.get('is_sell', False)
         if t_is_sell:
-            t_cap = MARGIN_PER_LOT.get(t.get('symbol', t.get('commodity', '')), 100000) * t.get('num_lots', 1) if market == 'equity' else MCX_MARGINS.get(t.get('symbol', t.get('commodity', '')), 15000) * t.get('num_lots', 1)
+            if market == 'equity':
+                t_cap = MARGIN_PER_LOT.get(t.get('symbol', t.get('commodity', '')), 100000) * t.get('num_lots', 1)
+            elif market == 'stocks':
+                t_cap = entry_prem * t_lot_size * 3  # Approx margin for stock SELL
+            else:
+                t_cap = MCX_MARGINS.get(t.get('symbol', t.get('commodity', '')), 15000) * t.get('num_lots', 1)
         else:
             t_cap = entry_prem * t_lot_size * t_mult
         t_pnl_pct = round(pnl / t_cap * 100, 1) if t_cap > 0 else 0
+
+        # v9.1: Extract expiry from details
+        raw_expiry = details.get('expiry', '')
+        if raw_expiry:
+            try:
+                exp_dt = datetime.strptime(raw_expiry, '%d%b%Y')
+                expiry_display = exp_dt.strftime('%d %b')
+            except Exception:
+                expiry_display = raw_expiry
+        else:
+            dte_val = t.get('dte', 0)
+            try:
+                entry_dt_exp = datetime.fromisoformat(ts)
+                if dte_val:
+                    exp_date = entry_dt_exp + timedelta(days=dte_val)
+                    expiry_display = exp_date.strftime('%d %b')
+                else:
+                    expiry_display = '--'
+            except Exception:
+                expiry_display = '--'
 
         trades.append({
             'id': t.get('id', ''),
@@ -142,6 +204,7 @@ def parse_closed_trades(data, market='equity'):
             'strategy': t.get('strategy', ''),
             'type': t.get('signal_type', ''),
             'strike': t.get('strike', 0),
+            'expiry': expiry_display,
             'entry_price': t.get('entry_premium', 0),
             'exit_price': t.get('exit_premium', t.get('exit_price', 0)),
             'pnl': round(pnl, 2),
@@ -156,12 +219,13 @@ def parse_closed_trades(data, market='equity'):
             'num_lots': t.get('num_lots', 1),
             'lot_size': t.get('lot_size', 0),
             'multiplier': t.get('multiplier', 1),
+            'capital_invested': round(t_cap, 2),
             'capital_after': t.get('capital_after', 0),
         })
 
     # Sort by exit time and compute running capital_after if not present
     trades.sort(key=lambda x: x.get('exit_time', ''))
-    default_cap = EQUITY_CAPITAL if market == 'equity' else COMMODITY_CAPITAL
+    default_cap = EQUITY_CAPITAL if market == 'equity' else (STOCK_CAPITAL if market == 'stocks' else COMMODITY_CAPITAL)
     capital = data.get('capital', default_cap) if data else default_cap
     if trades and not trades[-1].get('capital_after'):
         total_today = sum(t['pnl'] for t in trades)
@@ -217,41 +281,115 @@ def api_commodity():
     })
 
 
+@app.route('/api/stocks')
+def api_stocks():
+    """Stock options positions + closed trades."""
+    data = load_json(STOCK_STATE)
+    if not data:
+        return jsonify({'error': 'No stock data'}), 404
+    positions = parse_positions(data, 'stocks')
+    closed = parse_closed_trades(data, 'stocks')
+    capital = data.get('capital', STOCK_CAPITAL)
+    invested = sum(p['capital_invested'] for p in positions)
+    today = datetime.now().strftime('%Y-%m-%d')
+    return jsonify({
+        'positions': positions,
+        'closed_trades': closed,
+        'capital': round(capital, 2),
+        'invested': round(invested, 2),
+        'available': round(capital - invested, 2),
+        'daily_pnl': data.get('daily_pnl', {}).get(today, 0),
+        'last_updated': data.get('last_updated', ''),
+    })
+
+
+@app.route('/api/stock_watchlist')
+def api_stock_watchlist():
+    """Today's narrow CPR watchlist from stock scanner."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    scan_path = os.path.join(STOCK_PAPER_DIR, f'cpr_scan_{today}.json')
+    data = load_json(scan_path)
+    return jsonify(data or {'stocks': [], 'narrow_cpr_count': 0, 'date': today})
+
+
 @app.route('/api/summary')
 def api_summary():
     eq_data = load_json(EQUITY_STATE)
     cm_data = load_json(COMMODITY_STATE)
+    stk_data = load_json(STOCK_STATE)
 
+    # Open positions (current)
     eq_positions = parse_positions(eq_data, 'equity') if eq_data else []
     cm_positions = parse_positions(cm_data, 'commodity') if cm_data else []
-    eq_closed = parse_closed_trades(eq_data, 'equity') if eq_data else []
-    cm_closed = parse_closed_trades(cm_data, 'commodity') if cm_data else []
+    stk_positions = parse_positions(stk_data, 'stocks') if stk_data else []
+    all_positions = eq_positions + cm_positions + stk_positions
+    total_open_pnl = sum(p['pnl'] for p in all_positions)
 
-    all_closed = eq_closed + cm_closed
-    total_open_pnl = sum(p['pnl'] for p in eq_positions + cm_positions)
-    total_closed_pnl = sum(t['pnl'] for t in all_closed)
-    wins = sum(1 for t in all_closed if t['pnl'] > 0)
-    losses = sum(1 for t in all_closed if t['pnl'] <= 0)
-    win_rate = round(wins / max(wins + losses, 1) * 100, 1)
+    # Today's closed trades (for daily stats)
+    eq_closed_today = parse_closed_trades(eq_data, 'equity') if eq_data else []
+    cm_closed_today = parse_closed_trades(cm_data, 'commodity') if cm_data else []
+    stk_closed_today = parse_closed_trades(stk_data, 'stocks') if stk_data else []
+    all_closed_today = eq_closed_today + cm_closed_today + stk_closed_today
 
-    best_trade = max(all_closed, key=lambda t: t['pnl']) if all_closed else None
-    worst_trade = min(all_closed, key=lambda t: t['pnl']) if all_closed else None
+    # ALL-TIME closed trades (for total stats — uses _get_all_closed_trades)
+    all_closed_alltime = _get_all_closed_trades('all')
+    total_closed_pnl = sum(t['pnl'] for t in all_closed_alltime)
+    wins = sum(1 for t in all_closed_alltime if t['pnl'] > 0)
+    losses = sum(1 for t in all_closed_alltime if t['pnl'] <= 0)
+    total_trades = wins + losses
+    win_rate = round(wins / max(total_trades, 1) * 100, 1)
+
+    best_trade = max(all_closed_alltime, key=lambda t: t['pnl']) if all_closed_alltime else None
+    worst_trade = min(all_closed_alltime, key=lambda t: t['pnl']) if all_closed_alltime else None
 
     eq_capital = eq_data.get('capital', EQUITY_CAPITAL) if eq_data else EQUITY_CAPITAL
     cm_capital = cm_data.get('capital', COMMODITY_CAPITAL) if cm_data else COMMODITY_CAPITAL
+    stk_capital = stk_data.get('capital', STOCK_CAPITAL) if stk_data else STOCK_CAPITAL
 
     eq_invested = sum(p['capital_invested'] for p in eq_positions)
     cm_invested = sum(p['capital_invested'] for p in cm_positions)
+    stk_invested = sum(p['capital_invested'] for p in stk_positions)
 
     today = datetime.now().strftime('%Y-%m-%d')
     eq_daily = eq_data.get('daily_pnl', {}).get(today, 0) if eq_data else 0
     cm_daily = cm_data.get('daily_pnl', {}).get(today, 0) if cm_data else 0
+    stk_daily = stk_data.get('daily_pnl', {}).get(today, 0) if stk_data else 0
 
     total_pnl = total_open_pnl + total_closed_pnl
-    total_capital = eq_capital + cm_capital
+    total_capital = eq_capital + cm_capital + stk_capital
     total_pnl_pct = round(total_pnl / total_capital * 100, 2) if total_capital > 0 else 0
     eq_pnl_pct = round(eq_daily / eq_capital * 100, 2) if eq_capital > 0 else 0
     cm_pnl_pct = round(cm_daily / cm_capital * 100, 2) if cm_capital > 0 else 0
+    stk_pnl_pct = round(stk_daily / stk_capital * 100, 2) if stk_capital > 0 else 0
+
+    # v10: Advanced stats — Profit Factor, Max Drawdown, Avg Win/Loss (ALL-TIME)
+    winning_pnls = [t['pnl'] for t in all_closed_alltime if t['pnl'] > 0]
+    losing_pnls = [t['pnl'] for t in all_closed_alltime if t['pnl'] <= 0]
+    gross_wins = sum(winning_pnls) if winning_pnls else 0
+    gross_losses = abs(sum(losing_pnls)) if losing_pnls else 0
+    profit_factor = round(gross_wins / gross_losses, 2) if gross_losses > 0 else (999.0 if gross_wins > 0 else 0)
+    avg_win = round(gross_wins / len(winning_pnls), 2) if winning_pnls else 0
+    avg_loss = round(sum(losing_pnls) / len(losing_pnls), 2) if losing_pnls else 0
+
+    # Max drawdown from daily P&L cumulative
+    eq_daily_all = eq_data.get('daily_pnl', {}) if eq_data else {}
+    cm_daily_all = cm_data.get('daily_pnl', {}) if cm_data else {}
+    stk_daily_all = stk_data.get('daily_pnl', {}) if stk_data else {}
+    all_dates = set()
+    all_dates.update(eq_daily_all.keys())
+    all_dates.update(cm_daily_all.keys())
+    all_dates.update(stk_daily_all.keys())
+    cumulative = 0
+    peak = 0
+    max_drawdown = 0
+    for d in sorted(all_dates):
+        day_pnl = eq_daily_all.get(d, 0) + cm_daily_all.get(d, 0) + stk_daily_all.get(d, 0)
+        cumulative += day_pnl
+        if cumulative > peak:
+            peak = cumulative
+        dd = peak - cumulative
+        if dd > max_drawdown:
+            max_drawdown = dd
 
     return jsonify({
         'total_pnl': round(total_pnl, 2),
@@ -262,8 +400,11 @@ def api_summary():
         'equity_daily_pnl_pct': eq_pnl_pct,
         'commodity_daily_pnl': round(cm_daily, 2),
         'commodity_daily_pnl_pct': cm_pnl_pct,
-        'open_positions': len(eq_positions) + len(cm_positions),
-        'closed_today': len(all_closed),
+        'stock_daily_pnl': round(stk_daily, 2),
+        'stock_daily_pnl_pct': stk_pnl_pct,
+        'open_positions': len(all_positions),
+        'closed_today': len(all_closed_today),
+        'total_trades': total_trades,
         'win_rate': win_rate,
         'wins': wins,
         'losses': losses,
@@ -271,8 +412,17 @@ def api_summary():
         'worst_trade': worst_trade,
         'equity_capital': round(eq_capital, 2),
         'commodity_capital': round(cm_capital, 2),
+        'stock_capital': round(stk_capital, 2),
         'equity_available': round(eq_capital - eq_invested, 2),
         'commodity_available': round(cm_capital - cm_invested, 2),
+        'stock_available': round(stk_capital - stk_invested, 2),
+        # v10: Advanced stats
+        'profit_factor': profit_factor,
+        'max_drawdown': round(max_drawdown, 2),
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'gross_wins': round(gross_wins, 2),
+        'gross_losses': round(gross_losses, 2),
         'last_updated': datetime.now().isoformat(),
     })
 
@@ -333,6 +483,29 @@ def _get_all_closed_trades(market='all'):
                     'capital_after': t.get('capital_after', 0),
                     'market': 'commodity',
                 })
+    if market in ('all', 'stocks'):
+        stk_data = load_json(STOCK_STATE)
+        if stk_data:
+            for t in stk_data.get('closed_trades', []):
+                details = t.get('details', {}) if isinstance(t.get('details'), dict) else {}
+                trades.append({
+                    'timestamp': t.get('timestamp', ''),
+                    'exit_time': t.get('exit_time', ''),
+                    'symbol': t.get('stock_symbol', t.get('symbol', '')),
+                    'strategy': t.get('strategy', ''),
+                    'type': t.get('signal_type', ''),
+                    'strike': t.get('strike', 0),
+                    'entry_price': t.get('entry_premium', 0),
+                    'exit_price': t.get('exit_premium', 0),
+                    'gross_pnl': t.get('raw_pnl', t.get('pnl', 0)),
+                    'pnl': t.get('pnl', 0),
+                    'total_slippage': t.get('costs', 0),
+                    'exit_reason': t.get('exit_reason', ''),
+                    'num_lots': 1,
+                    'lot_size': t.get('lot_size', 0),
+                    'capital_after': t.get('capital_after', 0),
+                    'market': 'stocks',
+                })
     trades.sort(key=lambda x: x.get('exit_time', x.get('timestamp', '')))
     return trades
 
@@ -375,9 +548,11 @@ def export_positions():
     eq_data = load_json(EQUITY_STATE)
     cm_data = load_json(COMMODITY_STATE)
 
+    stk_data = load_json(STOCK_STATE)
     eq_positions = parse_positions(eq_data, 'equity') if eq_data else []
     cm_positions = parse_positions(cm_data, 'commodity') if cm_data else []
-    all_positions = eq_positions + cm_positions
+    stk_positions = parse_positions(stk_data, 'stocks') if stk_data else []
+    all_positions = eq_positions + cm_positions + stk_positions
 
     output = io.StringIO()
     fieldnames = [
@@ -407,13 +582,16 @@ def export_summary():
     eq_data = load_json(EQUITY_STATE)
     cm_data = load_json(COMMODITY_STATE)
 
+    stk_data_exp = load_json(STOCK_STATE)
     eq_positions = parse_positions(eq_data, 'equity') if eq_data else []
     cm_positions = parse_positions(cm_data, 'commodity') if cm_data else []
+    stk_positions_exp = parse_positions(stk_data_exp, 'stocks') if stk_data_exp else []
     eq_closed = parse_closed_trades(eq_data, 'equity') if eq_data else []
     cm_closed = parse_closed_trades(cm_data, 'commodity') if cm_data else []
+    stk_closed_exp = parse_closed_trades(stk_data_exp, 'stocks') if stk_data_exp else []
 
-    all_closed = eq_closed + cm_closed
-    all_positions = eq_positions + cm_positions
+    all_closed = eq_closed + cm_closed + stk_closed_exp
+    all_positions = eq_positions + cm_positions + stk_positions_exp
 
     total_open_pnl = sum(p['pnl'] for p in all_positions)
     total_closed_pnl = sum(t['pnl'] for t in all_closed)
@@ -422,6 +600,7 @@ def export_summary():
 
     eq_capital = eq_data.get('capital', EQUITY_CAPITAL) if eq_data else EQUITY_CAPITAL
     cm_capital = cm_data.get('capital', COMMODITY_CAPITAL) if cm_data else COMMODITY_CAPITAL
+    stk_capital_exp = stk_data_exp.get('capital', STOCK_CAPITAL) if stk_data_exp else STOCK_CAPITAL
 
     today = datetime.now().strftime('%Y-%m-%d')
     summary = {
@@ -429,7 +608,8 @@ def export_summary():
         'timestamp': datetime.now().isoformat(),
         'equity_capital': round(eq_capital, 2),
         'commodity_capital': round(cm_capital, 2),
-        'total_capital': round(eq_capital + cm_capital, 2),
+        'stock_capital': round(stk_capital_exp, 2),
+        'total_capital': round(eq_capital + cm_capital + stk_capital_exp, 2),
         'total_pnl': round(total_open_pnl + total_closed_pnl, 2),
         'open_pnl': round(total_open_pnl, 2),
         'closed_pnl': round(total_closed_pnl, 2),
@@ -502,7 +682,12 @@ def manual_close_position():
     if not pos_id:
         return jsonify({'error': 'Missing position id'}), 400
 
-    state_file = EQUITY_STATE if market == 'equity' else COMMODITY_STATE
+    if market == 'equity':
+        state_file = EQUITY_STATE
+    elif market == 'stocks':
+        state_file = STOCK_STATE
+    else:
+        state_file = COMMODITY_STATE
 
     try:
         with open(state_file, 'r') as f:
@@ -580,7 +765,7 @@ def manual_close_position():
 def manual_close_all():
     """Close ALL open positions manually."""
     results = []
-    for market, state_file in [('equity', EQUITY_STATE), ('commodity', COMMODITY_STATE)]:
+    for market, state_file in [('equity', EQUITY_STATE), ('commodity', COMMODITY_STATE), ('stocks', STOCK_STATE)]:
         try:
             with open(state_file, 'r') as f:
                 state = json.load(f)
@@ -643,13 +828,310 @@ def manual_close_all():
 def data_freshness():
     """Return last-modified timestamps of state files."""
     result = {}
-    for name, path in [('equity', EQUITY_STATE), ('commodity', COMMODITY_STATE)]:
+    for name, path in [('equity', EQUITY_STATE), ('commodity', COMMODITY_STATE), ('stocks', STOCK_STATE)]:
         try:
             mtime = os.path.getmtime(path)
             result[name] = datetime.fromtimestamp(mtime).isoformat()
         except Exception:
             result[name] = None
     return jsonify(result)
+
+
+# ====================================================================
+# ENHANCED DASHBOARD — New API Endpoints
+# ====================================================================
+
+@app.route('/api/market_status')
+def api_market_status():
+    """Market status: OPEN/CLOSED/PRE_MARKET/HOLIDAY with countdown."""
+    now = datetime.now()
+    today = now.date()
+    weekday = today.weekday()  # 0=Mon, 6=Sun
+
+    # Check holiday
+    holiday_name = None
+    try:
+        if is_nse_holiday(today):
+            from market_holidays import NSE_HOLIDAYS
+            holiday_name = NSE_HOLIDAYS.get(today, 'Holiday')
+    except Exception:
+        pass
+
+    if weekday >= 5:  # Saturday/Sunday
+        status = 'CLOSED'
+        status_detail = 'Weekend'
+    elif holiday_name:
+        status = 'HOLIDAY'
+        status_detail = holiday_name
+    else:
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        pre_market = now.replace(hour=9, minute=0, second=0, microsecond=0)
+
+        if now < pre_market:
+            status = 'CLOSED'
+            status_detail = 'Pre-market starts at 9:00'
+        elif now < market_open:
+            status = 'PRE_MARKET'
+            status_detail = 'Market opens at 9:15'
+        elif now <= market_close:
+            status = 'OPEN'
+            status_detail = 'Closes at 15:30'
+        else:
+            status = 'CLOSED'
+            status_detail = 'After hours'
+
+    # Countdown (seconds to next event)
+    if status == 'OPEN':
+        countdown = int((now.replace(hour=15, minute=30, second=0) - now).total_seconds())
+        countdown_label = 'to close'
+    elif status == 'PRE_MARKET':
+        countdown = int((now.replace(hour=9, minute=15, second=0) - now).total_seconds())
+        countdown_label = 'to open'
+    elif weekday < 5 and not holiday_name and now.hour < 9:
+        countdown = int((now.replace(hour=9, minute=15, second=0) - now).total_seconds())
+        countdown_label = 'to open'
+    else:
+        countdown = 0
+        countdown_label = ''
+
+    # Total capital
+    eq_data = load_json(EQUITY_STATE)
+    cm_data = load_json(COMMODITY_STATE)
+    stk_data = load_json(STOCK_STATE)
+    total_capital = (
+        (eq_data.get('capital', EQUITY_CAPITAL) if eq_data else EQUITY_CAPITAL) +
+        (cm_data.get('capital', COMMODITY_CAPITAL) if cm_data else COMMODITY_CAPITAL) +
+        (stk_data.get('capital', STOCK_CAPITAL) if stk_data else STOCK_CAPITAL)
+    )
+
+    return jsonify({
+        'status': status,
+        'detail': status_detail,
+        'countdown': countdown,
+        'countdown_label': countdown_label,
+        'total_capital': round(total_capital, 2),
+        'date': today.isoformat(),
+        'day': today.strftime('%A'),
+    })
+
+
+@app.route('/api/strategy_performance')
+def api_strategy_performance():
+    """Per-strategy performance breakdown from all closed trades."""
+    trades = _get_all_closed_trades('all')
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # Also get open positions per strategy
+    eq_data = load_json(EQUITY_STATE)
+    cm_data = load_json(COMMODITY_STATE)
+    stk_data = load_json(STOCK_STATE)
+    all_positions = []
+    if eq_data:
+        all_positions += parse_positions(eq_data, 'equity')
+    if cm_data:
+        all_positions += parse_positions(cm_data, 'commodity')
+    if stk_data:
+        all_positions += parse_positions(stk_data, 'stocks')
+
+    # Group trades by strategy
+    strat_map = {}
+    for t in trades:
+        s = t.get('strategy', 'Unknown')
+        if s not in strat_map:
+            strat_map[s] = {'trades': [], 'today_trades': []}
+        strat_map[s]['trades'].append(t)
+        exit_time = t.get('exit_time', t.get('timestamp', ''))
+        if today in exit_time:
+            strat_map[s]['today_trades'].append(t)
+
+    # Count open positions per strategy
+    open_by_strat = {}
+    for p in all_positions:
+        s = p.get('strategy', 'Unknown')
+        open_by_strat[s] = open_by_strat.get(s, 0) + 1
+
+    results = []
+    for strat_name, data in strat_map.items():
+        all_t = data['trades']
+        today_t = data['today_trades']
+        wins = sum(1 for t in all_t if t['pnl'] > 0)
+        losses = sum(1 for t in all_t if t['pnl'] <= 0)
+        total_pnl = sum(t['pnl'] for t in all_t)
+        today_pnl = sum(t['pnl'] for t in today_t)
+        pnls = [t['pnl'] for t in all_t]
+
+        results.append({
+            'strategy': strat_name,
+            'trades': len(all_t),
+            'wins': wins,
+            'losses': losses,
+            'win_rate': round(wins / max(wins + losses, 1) * 100, 1),
+            'total_pnl': round(total_pnl, 2),
+            'today_pnl': round(today_pnl, 2),
+            'today_trades': len(today_t),
+            'avg_pnl': round(total_pnl / max(len(all_t), 1), 2),
+            'best': round(max(pnls), 2) if pnls else 0,
+            'worst': round(min(pnls), 2) if pnls else 0,
+            'open_positions': open_by_strat.get(strat_name, 0),
+        })
+
+    # Sort by total trades descending
+    results.sort(key=lambda x: x['trades'], reverse=True)
+    return jsonify({'strategies': results})
+
+
+@app.route('/api/signals_today')
+def api_signals_today():
+    """Today's generated signals from signal CSV logs."""
+    today_str = datetime.now().strftime('%Y%m%d')
+    signals = []
+
+    # Equity signals
+    eq_path = os.path.join(BASE_DIR, 'paper_trades', f'signals_{today_str}.csv')
+    if os.path.exists(eq_path):
+        try:
+            with open(eq_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    signals.append({
+                        'timestamp': row.get('timestamp', ''),
+                        'strategy': row.get('strategy', ''),
+                        'symbol': row.get('symbol', ''),
+                        'type': row.get('type', ''),
+                        'strike': float(row.get('strike', 0) or 0),
+                        'premium': round(float(row.get('premium', 0) or 0), 2),
+                        'score': row.get('score', row.get('quality_score', '')),
+                        'reason': row.get('reason', ''),
+                        'market': 'equity',
+                    })
+        except Exception:
+            pass
+
+    # Commodity signals
+    cm_path = os.path.join(BASE_DIR, 'paper_trades_commodity', f'commodity_signals_{today_str}.csv')
+    if os.path.exists(cm_path):
+        try:
+            with open(cm_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    signals.append({
+                        'timestamp': row.get('timestamp', ''),
+                        'strategy': row.get('strategy', ''),
+                        'symbol': row.get('commodity', row.get('symbol', '')),
+                        'type': row.get('type', ''),
+                        'strike': float(row.get('strike', 0) or 0),
+                        'premium': round(float(row.get('premium', 0) or 0), 2),
+                        'score': row.get('score', ''),
+                        'reason': row.get('reason', ''),
+                        'market': 'commodity',
+                    })
+        except Exception:
+            pass
+
+    # Stock signals (from stock_paper_trades dir if exists)
+    stk_path = os.path.join(STOCK_PAPER_DIR, f'stock_signals_{today_str}.csv')
+    if os.path.exists(stk_path):
+        try:
+            with open(stk_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    signals.append({
+                        'timestamp': row.get('timestamp', ''),
+                        'strategy': row.get('strategy', ''),
+                        'symbol': row.get('symbol', ''),
+                        'type': row.get('type', ''),
+                        'strike': float(row.get('strike', 0) or 0),
+                        'premium': round(float(row.get('premium', 0) or 0), 2),
+                        'score': row.get('score', row.get('quality_score', '')),
+                        'reason': row.get('reason', ''),
+                        'market': 'stocks',
+                    })
+        except Exception:
+            pass
+
+    # Sort by timestamp descending, return last 30
+    signals.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    return jsonify({'signals': signals[:30], 'total': len(signals)})
+
+
+@app.route('/api/daily_pnl_history')
+def api_daily_pnl_history():
+    """Daily PnL history from all 3 state files, last 30 days."""
+    eq_data = load_json(EQUITY_STATE)
+    cm_data = load_json(COMMODITY_STATE)
+    stk_data = load_json(STOCK_STATE)
+
+    eq_daily = eq_data.get('daily_pnl', {}) if eq_data else {}
+    cm_daily = cm_data.get('daily_pnl', {}) if cm_data else {}
+    stk_daily = stk_data.get('daily_pnl', {}) if stk_data else {}
+
+    # Merge all dates
+    all_dates = set()
+    all_dates.update(eq_daily.keys())
+    all_dates.update(cm_daily.keys())
+    all_dates.update(stk_daily.keys())
+
+    history = []
+    for d in sorted(all_dates):
+        eq_pnl = eq_daily.get(d, 0)
+        cm_pnl = cm_daily.get(d, 0)
+        stk_pnl = stk_daily.get(d, 0)
+        total = eq_pnl + cm_pnl + stk_pnl
+        history.append({
+            'date': d,
+            'total': round(total, 2),
+            'equity': round(eq_pnl, 2),
+            'commodity': round(cm_pnl, 2),
+            'stocks': round(stk_pnl, 2),
+        })
+
+    # Last 30 days
+    return jsonify({'history': history[-30:]})
+
+
+@app.route('/api/live_indicators')
+def api_live_indicators():
+    """v10: Live indicator data from all 3 bots' scan cycles.
+
+    Each bot writes live_scan_data.json every scan cycle with
+    OI, PCR, IV, CPR levels, VWAP, support/resistance etc.
+    Dashboard uses this to show live indicators next to positions.
+    """
+    eq_file = os.path.join(BASE_DIR, 'paper_trades', 'live_scan_data.json')
+    cm_file = os.path.join(BASE_DIR, 'paper_trades_commodity', 'live_scan_data.json')
+    stk_file = os.path.join(BASE_DIR, 'stock_paper_trades', 'live_scan_data.json')
+
+    result = {
+        'equity': load_json(eq_file),
+        'commodity': load_json(cm_file),
+        'stocks': load_json(stk_file),
+    }
+
+    # Merge all symbols into a flat lookup for easy frontend access
+    all_symbols = {}
+    vix = None
+    last_updated = None
+
+    for market_key in ['equity', 'commodity', 'stocks']:
+        data = result.get(market_key)
+        if data and isinstance(data, dict):
+            symbols = data.get('symbols', {})
+            for sym, ind in symbols.items():
+                all_symbols[sym] = ind
+                all_symbols[sym]['_market'] = market_key
+            if data.get('vix'):
+                vix = data['vix']
+            ts = data.get('last_updated')
+            if ts and (not last_updated or ts > last_updated):
+                last_updated = ts
+
+    return jsonify({
+        'symbols': all_symbols,
+        'vix': vix,
+        'last_updated': last_updated,
+        'markets': result,
+    })
 
 
 if __name__ == '__main__':

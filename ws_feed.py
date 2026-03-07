@@ -220,11 +220,25 @@ class WebSocketFeed:
         """Called on WebSocket error."""
         self._connected = False
         logger.error(f"[WS_FEED] WebSocket ERROR: {error}")
+        try:
+            from trade_notifier import notify_websocket_issue
+            notify_websocket_issue('error', str(error)[:200])
+        except Exception:
+            pass
 
-    def _on_close(self, wsapp):
-        """Called when WebSocket disconnects."""
+    def _on_close(self, wsapp, *args):
+        """Called when WebSocket disconnects.
+        v7.7: Accept *args to handle SmartAPI library signature change
+        (passes close_status_code, close_msg as extra args).
+        """
         self._connected = False
-        logger.warning("[WS_FEED] WebSocket DISCONNECTED")
+        close_code = args[0] if args else None
+        logger.warning(f"[WS_FEED] WebSocket DISCONNECTED (code={close_code})")
+        try:
+            from trade_notifier import notify_websocket_issue
+            notify_websocket_issue('disconnected', f"code={close_code}")
+        except Exception:
+            pass
 
     def get_ltp(self, token):
         """Get cached LTP for a token. Thread-safe, instant (no API call).

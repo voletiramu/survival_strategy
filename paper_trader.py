@@ -2192,12 +2192,13 @@ class StrategyEngine:
 class PaperTrader:
     """Main paper trading orchestrator."""
 
-    def __init__(self, ws_feed=None):
+    def __init__(self, ws_feed=None, market_pipeline=None):
         self.angel = AngelConnection()
         self.portfolio = PaperPortfolio()
         self.engine = StrategyEngine(self.angel, self.portfolio)
         self._running = False
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
+        self.market_pipeline = market_pipeline  # v9: Real-time NSE/BSE option chain pipeline
         self._index_tokens = {
             'NIFTY': {'exchange': 'NSE', 'token': '99926000'},
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
@@ -2257,11 +2258,19 @@ class PaperTrader:
 
     def get_india_vix(self):
         """Fetch India VIX value. Cached for 120 seconds.
-        Tries Angel API first, falls back to historical volatility proxy.
+        Priority: MarketDataPipeline (NSE direct) → Angel API → HV proxy.
         """
         cached = self._vix_cache
         if cached['value'] and cached['time'] and (datetime.now() - cached['time']).total_seconds() < 120:
             return cached['value']
+
+        # Method 0 (v9): Try MarketDataPipeline (NSE direct, most reliable)
+        if self.market_pipeline:
+            vix = self.market_pipeline.get_vix()
+            if vix and 5 < vix < 80:
+                self._vix_cache = {'value': vix, 'time': datetime.now()}
+                self.current_vix = vix
+                return vix
 
         # Method 1: Try Angel API with multiple known VIX tokens
         for token in ['26017', '99926004']:
@@ -2437,6 +2446,7 @@ class PaperTrader:
         now = datetime.now()
         dow = now.weekday()
         all_signals = []
+        scan_data = {}  # v10: Collect indicator data for dashboard live display
 
         # Reset daily counters at market open
         if now.time() < dtime(9, 16) and self.daily_trade_count > 0:
@@ -2479,26 +2489,94 @@ class PaperTrader:
                 logger.warning(f"  No indicators for {symbol}")
                 continue
 
-            # v2.5.2: Replace proxy PCR with real option chain PCR
-            real_pcr = self.get_real_pcr_cached(symbol)
+            # v9: Replace proxy PCR with real option chain PCR
+            # Priority: MarketDataPipeline (NSE/BSE direct) → Angel API → proxy
+            real_pcr = None
+            pcr_source = 'PROXY'
+
+            if self.market_pipeline:
+                real_pcr = self.market_pipeline.get_pcr(symbol)
+                if real_pcr is not None:
+                    pcr_source = 'PIPELINE'
+
+            if real_pcr is None:
+                real_pcr = self.get_real_pcr_cached(symbol)
+                if real_pcr is not None:
+                    pcr_source = 'ANGEL_OI'
+
             if real_pcr is not None:
                 indicators['pcr'] = real_pcr
-                indicators['pcr_source'] = 'REAL_OI'
-            else:
-                indicators['pcr_source'] = 'PROXY'
+            indicators['pcr_source'] = pcr_source
+
+            # v9: Add pipeline-enriched market data to indicators
+            if self.market_pipeline:
+                # PCR shift detection (like Murarka: 0.80→1.29 = bullish)
+                pcr_shift = self.market_pipeline.get_pcr_shift(symbol)
+                if pcr_shift:
+                    indicators['pcr_shift'] = pcr_shift['shift']
+                    indicators['pcr_direction'] = pcr_shift['direction']
+                    indicators['pcr_strength'] = pcr_shift['strength']
+
+                # OI sentiment (accumulation vs unwinding)
+                oi_sent = self.market_pipeline.get_oi_sentiment(symbol)
+                if oi_sent:
+                    indicators['oi_sentiment'] = oi_sent['sentiment']
+                    indicators['oi_sentiment_reason'] = oi_sent['reason']
+
+                # Premium sentiment (CE/PE premium %change)
+                prem_sent = self.market_pipeline.get_premium_sentiment(symbol)
+                if prem_sent:
+                    indicators['premium_signal'] = prem_sent['signal']
+
+                # VIX regime
+                vix_regime = self.market_pipeline.get_vix_regime()
+                if vix_regime:
+                    indicators['vix_regime'] = vix_regime['regime']
+                    indicators['vix_contrarian'] = vix_regime['contrarian_signal']
 
             # v3.1: Track data quality for this symbol
             data_quality = {'has_iv': indicators.get('iv', 0) > 0,
                            'has_pcr': indicators.get('pcr', 0) > 0,
-                           'has_vwap': indicators.get('vwap', 0) > 0}
+                           'has_vwap': indicators.get('vwap', 0) > 0,
+                           'has_pipeline': pcr_source == 'PIPELINE'}
             indicators['_data_quality'] = data_quality
 
             logger.info(f"  ATR: {indicators['atr']:.2f} | IV: {indicators['iv']*100:.1f}% | "
-                       f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f} ({indicators['pcr_source']})")
+                       f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f} ({pcr_source})")
+            if indicators.get('pcr_shift') is not None:
+                logger.info(f"  PCR Shift: {indicators['pcr_shift']:+.3f} ({indicators.get('pcr_direction', 'N/A')}) | "
+                           f"OI: {indicators.get('oi_sentiment', 'N/A')} | "
+                           f"Premium: {indicators.get('premium_signal', 'N/A')}")
             logger.info(f"  Pivot: {indicators['pivot']:.0f} | TC: {indicators['tc']:.0f} | "
                        f"BC: {indicators['bc']:.0f}")
             logger.info(f"  Cam R3: {indicators['cam_r3']:.0f} R4: {indicators['cam_r4']:.0f} | "
                        f"S3: {indicators['cam_s3']:.0f} S4: {indicators['cam_s4']:.0f}")
+
+            # v10: Collect live scan data for dashboard
+            scan_data[symbol] = {
+                'spot': spot,
+                'atr': indicators.get('atr', 0),
+                'iv': indicators.get('iv', 0),
+                'hv': indicators.get('hv', 0),
+                'vwap': indicators.get('vwap', 0),
+                'pcr': indicators.get('pcr', 0),
+                'pcr_shift': indicators.get('pcr_shift'),
+                'pcr_direction': indicators.get('pcr_direction', ''),
+                'oi_sentiment': indicators.get('oi_sentiment', ''),
+                'premium_signal': indicators.get('premium_signal', ''),
+                'pivot': indicators.get('pivot', 0),
+                'tc': indicators.get('tc', 0),
+                'bc': indicators.get('bc', 0),
+                'cpr_width': indicators.get('cpr_width', 0),
+                'cam_r3': indicators.get('cam_r3', 0),
+                'cam_r4': indicators.get('cam_r4', 0),
+                'cam_s3': indicators.get('cam_s3', 0),
+                'cam_s4': indicators.get('cam_s4', 0),
+                'resistance': indicators.get('resistance', 0),
+                'support': indicators.get('support', 0),
+                'demand_zone': indicators.get('demand_zone', 0),
+                'supply_zone': indicators.get('supply_zone', 0),
+            }
 
             dte = max(1, (3 - dow) + 1) if dow <= 3 else 1
 
@@ -2523,6 +2601,9 @@ class PaperTrader:
                     logger.info(f"  SIGNAL [{strat_name}]: {sig['type']} "
                                f"Strike={sig['strike']:.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
+
+        # v10: Write live scan data for dashboard
+        self._write_live_scan_data(scan_data, vix)
 
         return all_signals
 
@@ -2846,6 +2927,7 @@ class PaperTrader:
                     'option_token': option_token,
                     'option_exchange': option_exchange,
                     'quality_score': sig.get('quality_score', 0),  # v2.5: FIX — was missing! Enables dynamic lots
+                    'expiry': expiry,  # v9.1: Store expiry for dashboard display
                 },
                 oi=entry_oi,
                 spot_price=sig.get('spot', 0),
@@ -3273,14 +3355,14 @@ class PaperTrader:
 
             if reverse_pos:
                 try:
-                    from trade_notifier import send_message
+                    from trade_notifier import send_info
                     msg = (f"<b>REVERSAL TRADE</b>\n"
                            f"Closed: {pos['signal_type']} {symbol}\n"
                            f"Opened: {reverse_type} {symbol}\n"
                            f"Reason: {exit_reason}\n"
                            f"Strike: {pos['strike']:.0f}\n"
                            f"Premium: Rs {reversal_premium:.2f}")
-                    send_message(msg)
+                    send_info(msg)
                 except Exception:
                     pass
         except Exception as e:
@@ -3897,6 +3979,26 @@ class PaperTrader:
         with open(report_file, 'w') as f:
             json.dump(report, f, indent=2, default=str)
         logger.info(f"Daily report saved: {report_file}")
+
+    def _write_live_scan_data(self, scan_data, vix=None):
+        """v10: Write live indicator data for dashboard consumption.
+
+        Called every scan cycle. Dashboard reads this file to show
+        live OI, PCR, IV, CPR levels next to each position.
+        """
+        try:
+            live_file = os.path.join(PAPER_DIR, 'live_scan_data.json')
+            payload = {
+                'last_updated': datetime.now().isoformat(),
+                'vix': vix,
+                'market': 'equity',
+                'symbols': scan_data,
+            }
+            with open(live_file, 'w') as f:
+                json.dump(payload, f, indent=2, default=str)
+            logger.debug(f"Live scan data written: {len(scan_data)} symbols")
+        except Exception as e:
+            logger.error(f"Error writing live scan data: {e}")
 
 
 # ====================================================================

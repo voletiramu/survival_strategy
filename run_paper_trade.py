@@ -209,10 +209,11 @@ def run_commodity_scan(offline=False):
 # Shared dict for passing trader references from threads to main (for EOD report)
 _trader_refs = {}
 
-def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
+def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, market_pipeline=None):
     """Equity scanning thread: NIFTY, BANKNIFTY, SENSEX every 15 seconds.
     Creates ONE PaperTrader instance and reuses it across scans.
     Uses WebSocket feed for real-time LTP (falls back to REST if WS unavailable).
+    v9: Uses MarketDataPipeline for real PCR, OI sentiment, VIX from NSE/BSE direct.
     """
     logger.info(f"[EquityThread] Starting | Interval: {interval_sec}s | Hours: {EQUITY_OPEN}-{EQUITY_CLOSE}")
 
@@ -220,7 +221,7 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
         sys.path.insert(0, BASE_DIR)
         from paper_trader import PaperTrader
 
-        trader = PaperTrader(ws_feed=ws_feed)
+        trader = PaperTrader(ws_feed=ws_feed, market_pipeline=market_pipeline)
         _trader_refs['equity'] = trader  # Share for EOD report
         for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
             trader.engine.load_historical(symbol)
@@ -233,6 +234,8 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
                 logger.warning(f"[EquityThread] Angel connection error: {e}. Continuing with offline data.")
 
         scan_count = 0
+        _last_signal_time = {}  # v7.7: Track last signal time per symbol for gap alerts
+        _SIGNAL_GAP_MINUTES = 60  # Alert if no signals for 60 min during market hours
 
         _nse_holiday_logged = None  # Prevent log spam on holidays
 
@@ -257,6 +260,28 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None):
                 logger.info(f"[EquityThread] Scan #{scan_count} | {now.strftime('%H:%M:%S')}")
                 try:
                     trader.run_once()
+                    # v7.7: Track signal times and detect gaps
+                    for sym in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                        if any(s.get('symbol') == sym for s in getattr(trader, 'daily_signals_all', [])):
+                            _last_signal_time[sym] = now
+                        elif sym in _last_signal_time:
+                            gap_mins = (now - _last_signal_time[sym]).total_seconds() / 60
+                            if gap_mins >= _SIGNAL_GAP_MINUTES:
+                                try:
+                                    from trade_notifier import notify_signal_gap
+                                    notify_signal_gap('EQUITY', sym, gap_mins,
+                                                     _last_signal_time[sym].strftime('%H:%M'))
+                                except Exception:
+                                    pass
+                        elif scan_count > 30 and sym not in _last_signal_time:
+                            # 30+ scans with zero signals ever for this symbol
+                            _last_signal_time[sym] = now  # Set to now to trigger gap after next period
+                            try:
+                                from trade_notifier import notify_data_issue
+                                notify_data_issue('EQUITY', 'NO_SIGNALS',
+                                                 f"{sym}: Zero signals after {scan_count} scans")
+                            except Exception:
+                                pass
                 except Exception as e:
                     logger.error(f"[EquityThread] Scan error: {e}")
                     import traceback
@@ -337,6 +362,8 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                 logger.warning(f"[CommodityThread] Angel connection error: {e}. Continuing with offline data.")
 
         scan_count = 0
+        _last_comm_signal_time = {}  # v7.7: Track last signal time per commodity
+        _COMM_SIGNAL_GAP_MINUTES = 90  # MCX has longer gaps, alert after 90 min
 
         _mcx_holiday_logged = None  # Prevent log spam on holidays
 
@@ -362,6 +389,19 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                 logger.info(f"[CommodityThread] Scan #{scan_count} | {now.strftime('%H:%M:%S')}")
                 try:
                     trader.run_once()
+                    # v7.7: Track commodity signal gaps
+                    for comm in PAPER_TRADE_COMMODITIES:
+                        if any(s.get('commodity') == comm for s in getattr(trader, 'daily_signals_all', [])):
+                            _last_comm_signal_time[comm] = now
+                        elif comm in _last_comm_signal_time:
+                            gap_mins = (now - _last_comm_signal_time[comm]).total_seconds() / 60
+                            if gap_mins >= _COMM_SIGNAL_GAP_MINUTES:
+                                try:
+                                    from trade_notifier import notify_signal_gap
+                                    notify_signal_gap('COMMODITY', comm, gap_mins,
+                                                     _last_comm_signal_time[comm].strftime('%H:%M'))
+                                except Exception:
+                                    pass
                 except Exception as e:
                     logger.error(f"[CommodityThread] Scan error: {e}")
                     import traceback
@@ -531,6 +571,18 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
             logger.warning(f"[MAIN] WebSocket setup failed: {e} — using REST API fallback")
             ws_feed = None
 
+    # ---- v9: Start MarketDataPipeline (NSE/BSE direct option chain feed) ----
+    market_pipeline = None
+    if not offline:
+        try:
+            from market_data_pipeline import MarketDataPipeline
+            market_pipeline = MarketDataPipeline()
+            market_pipeline.start()
+            logger.info("[MAIN] MarketDataPipeline ACTIVE — Real PCR from NSE/BSE every 3 min")
+        except Exception as e:
+            logger.warning(f"[MAIN] MarketDataPipeline failed to start: {e} — using Angel API fallback")
+            market_pipeline = None
+
     # v7.2: Detect auto-restart (if lock file existed, this is a restart, not first start)
     instance_label = get_instance_label(instance_id)
     is_restart = os.path.exists(os.path.join(LOCK_DIR, 'last_shutdown.flag'))
@@ -547,12 +599,14 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
 
+    pipeline_status = "NSE/BSE Pipeline" if market_pipeline else "Angel API only"
     ws_status = "WebSocket" if ws_feed else "REST API polling"
     logger.info("=" * 70)
     logger.info(f"THREADED PAPER TRADING SYSTEM STARTING — {instance_label}")
     logger.info("=" * 70)
     logger.info(f"  Instance:           {instance_id} ({instance_label})")
-    logger.info(f"  Data feed:          {ws_status}")
+    logger.info(f"  LTP feed:           {ws_status}")
+    logger.info(f"  Option chain:       {pipeline_status}")
     logger.info(f"  Equity interval:    {equity_interval}s ({equity_interval/60:.1f} min)")
     logger.info(f"  Commodity interval: {commodity_interval}s ({commodity_interval/60:.1f} min)")
     logger.info(f"  Crypto interval:    {crypto_interval}s ({crypto_interval/60:.1f} min)")
@@ -564,10 +618,10 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
     logger.info(f"  Press Ctrl+C to stop")
     logger.info("=" * 70 + "\n")
 
-    # Create threads (pass ws_feed to equity and commodity)
+    # Create threads (pass ws_feed + market_pipeline to equity, ws_feed to commodity)
     t_equity = threading.Thread(
         target=equity_loop,
-        args=(equity_interval, offline, stop_event, ws_feed),
+        args=(equity_interval, offline, stop_event, ws_feed, market_pipeline),
         name="EquityThread",
         daemon=True
     )
@@ -671,9 +725,12 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
         else:
             logger.info(f"  Thread {t.name} exited")
 
-    # Shutdown WebSocket feed
+    # Shutdown WebSocket feed and MarketDataPipeline
     if ws_feed:
         ws_feed.stop()
+    if market_pipeline:
+        market_pipeline.stop()
+        logger.info("[MAIN] MarketDataPipeline stopped")
 
     # Release PID lock and set restart detection flag
     release_lock()

@@ -1818,14 +1818,14 @@ class CommodityPaperTrader:
 
             if reverse_pos:
                 try:
-                    from trade_notifier import send_message
+                    from trade_notifier import send_info
                     msg = (f"<b>MCX REVERSAL TRADE</b>\n"
                            f"Closed: {pos['signal_type']} {commodity}\n"
                            f"Opened: {reverse_type} {commodity}\n"
                            f"Reason: {exit_reason}\n"
                            f"Strike: {pos['strike']:.0f}\n"
                            f"Premium: Rs {reversal_premium:.2f}")
-                    send_message(msg)
+                    send_info(msg)
                 except Exception:
                     pass
         except Exception as e:
@@ -1839,6 +1839,7 @@ class CommodityPaperTrader:
         now = datetime.now()
         dow = now.weekday()
         all_signals = []
+        scan_data = {}  # v10: Collect indicator data for dashboard live display
 
         # Reset daily counters at market open
         if now.time() < dtime(9, 16) and self.daily_trade_count > 0:
@@ -1880,6 +1881,28 @@ class CommodityPaperTrader:
             logger.info(f"  Pivot: {indicators['pivot']:,.0f} | TC: {indicators['tc']:,.0f} | "
                        f"BC: {indicators['bc']:,.0f}")
 
+            # v10: Collect live scan data for dashboard
+            scan_data[commodity] = {
+                'spot': spot,
+                'atr': indicators.get('atr', 0),
+                'iv': indicators.get('iv', 0),
+                'hv': indicators.get('hv', 0),
+                'vwap': indicators.get('vwap', 0),
+                'pcr': indicators.get('pcr', 0),
+                'pivot': indicators.get('pivot', 0),
+                'tc': indicators.get('tc', 0),
+                'bc': indicators.get('bc', 0),
+                'cpr_width': indicators.get('cpr_width', 0),
+                'cam_r3': indicators.get('cam_r3', 0),
+                'cam_r4': indicators.get('cam_r4', 0),
+                'cam_s3': indicators.get('cam_s3', 0),
+                'cam_s4': indicators.get('cam_s4', 0),
+                'resistance': indicators.get('resistance', 0),
+                'support': indicators.get('support', 0),
+                'demand_zone': indicators.get('demand_zone', 0),
+                'supply_zone': indicators.get('supply_zone', 0),
+            }
+
             # Monthly expiry - estimate DTE
             dte = max(5, 15 - (now.day % 28))
 
@@ -1904,6 +1927,9 @@ class CommodityPaperTrader:
                     logger.info(f"  SIGNAL [{strat_name}]: {sig['type']} "
                                f"Strike={sig['strike']:,.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
+
+        # v10: Write live scan data for dashboard
+        self._write_live_scan_data(scan_data)
 
         return all_signals
 
@@ -2158,7 +2184,8 @@ class CommodityPaperTrader:
                 details={'reason': sig['reason'], 'target': sig.get('target'),
                          'sl': sig.get('sl'), 'spot': sig.get('spot'),
                          'option_token': option_token,
-                         'quality_score': sig.get('quality_score', 0)},  # v2.5: FIX — was missing!
+                         'quality_score': sig.get('quality_score', 0),  # v2.5: FIX — was missing!
+                         'expiry': expiry},  # v9.1: Store expiry for dashboard display
                 oi=entry_oi,
                 iv=sig['greeks'].get('iv', 0),
             )
@@ -2582,6 +2609,22 @@ class CommodityPaperTrader:
             'dummy_pnl': round(dummy_pnl, 2),
             'capital_used': round(capital_used, 2),
         }
+
+    def _write_live_scan_data(self, scan_data):
+        """v10: Write live indicator data for dashboard consumption."""
+        try:
+            live_file = os.path.join(PAPER_DIR, 'live_scan_data.json')
+            payload = {
+                'last_updated': datetime.now().isoformat(),
+                'vix': None,  # Commodities don't track India VIX
+                'market': 'commodity',
+                'symbols': scan_data,
+            }
+            with open(live_file, 'w') as f:
+                json.dump(payload, f, indent=2, default=str)
+            logger.debug(f"Live scan data written: {len(scan_data)} commodities")
+        except Exception as e:
+            logger.error(f"Error writing live scan data: {e}")
 
     def run_once(self):
         signals = self.scan_all()

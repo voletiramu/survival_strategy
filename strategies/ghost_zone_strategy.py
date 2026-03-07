@@ -1,521 +1,323 @@
 """
-Ghost Trade Zone (GTZ) v7 - Manish Maheshwari "Ghost Trader" Methodology
-=========================================================================
-Based on the Free F&O Masterclass by Abhishek Kar ft. Manish Maheshwari.
+Ghost Trade Zone (GTZ) v7 -- Manish Maheshwari "Ghost Trader" methodology.
+Instrument-agnostic: takes spot, ohlc, indicators, config, and historical DataFrame.
 
-Core Philosophy:
-  A Ghost Zone is NOT random support/resistance. It is an UNMITIGATED
-  Institutional Supply or Demand Zone — the exact price block where
-  "Whales" injected massive capital but haven't returned to collect
-  their remaining orders.
+Based on the Ghost Trader's Free F&O Masterclass:
+    - Grandfather (Candlesticks): Institutional footprint candles
+    - Father (Volume): 3x+ volume spike = institutional money injection
+    - Mother (OI): Validates zone with OI support
 
-The Family Hierarchy:
-  Grandfather (Candlesticks) — permanent, most reliable price structure
-  Father (Volume/Volatility) — where money is actually injected
-  Mother (Open Interest) — protector, validation of the trend
-  Siblings (Indicators) — lagging, only for final confirmation
-
-Phase 1: Identify the Ghost Zone
-  Scan for 3 institutional "footprint" candles:
-    1. Injection (Pin Bar) — long wick = institutions injected money
-    2. Bat/Hammer — aggressive expansion candle, money dumped forcefully
-    3. Belan (Doji/Mother) — stalemate that breaks violently
-
-  Volume Filter: Trigger candle must have >= 3x average volume.
-  Zone = High and Low of the trigger candle itself.
-  Zone is "unmitigated" if price moved away without returning.
-
-Phase 2: The Setup
-  Wait for the 300/1000 Exhaustion Rule:
-    - NIFTY trends exhaust after ~300 points
-    - BANKNIFTY exhausts after ~800-1000 points
-    - After exhaustion, Ghost Zone mean-reversion is high-probability
-
-  Fake Breakout Detection:
-    - If a retail pattern forms near the zone and fails → trap
-    - Enter on the reversion back into the Ghost Zone
-
-Phase 3: Execution
-  Entry: Limit order at 50% mark of the Ghost Zone
-  Stop Loss: Few points below zone bottom (demand) / above zone top (supply)
-  Target: Trail until 300pt (NIFTY) / 1000pt (BANKNIFTY) exhaustion
-  Fallback target: 2.5:1 risk-reward minimum
-
-NOTE: Backtesting runs on DAILY bars. True Ghost Zones use 3-5 min candles
-      with 4-hour zone blocks. Daily adaptation:
-      - Pin bars, bats, and dojis are detected on daily bars
-      - When volume data is absent (Angel index data), candle range > 1.2x ATR
-        serves as a proxy for institutional activity ("Father" substitute)
-      - Paper trader uses real-time Angel API for intraday zone detection
-
-Timeframe Architecture (from Manish Maheshwari):
-      - 4H charts: Identify Ghost Zones (demand/supply from institutional candles)
-      - 5m/3m charts: Entry timing at 50% of zone
-      - Daily bars (our backtest): Each daily candle ≈ one 4H zone equivalent
-      - Paper trader aggregates 5m candles into 4H blocks for zone detection
+Phase 1: Identify Ghost Zone from institutional candles + volume
+Phase 2: Check exhaustion rule
+Phase 3: Entry at 50% of zone on retest, SL below zone
 """
 
-import pandas as pd
 import numpy as np
-from backtest_engine import BacktestEngine, Trade, TradeType, BacktestResult, estimate_iv_from_atr
+import pandas as pd
+
+from .greeks import bs_greeks
+from .utils import RISK_FREE_RATE, get_nearest_strike
 
 
-# Exhaustion thresholds (points from trend origin)
-# Per Manish Maheshwari: NIFTY exhausts after ~300pts, BANKNIFTY after ~1000pts
-# These are DAILY targets — the trend reverses after this much movement
-EXHAUSTION_POINTS = {
-    'NIFTY50': 300, 'NIFTY': 300,
-    'BANKNIFTY': 1000,
-    'SENSEX': 1000,  # Similar to BANKNIFTY scale
-}
+# ====================================================================
+# GHOST ZONE DETECTION
+# ====================================================================
+def detect_ghost_zones(df, atr, lookback=40):
+    """Detect demand and supply zones from daily OHLCV bars.
 
+    Uses the Ghost Trader's candle classification:
+        - Injection (Pin Bar): Small body (<35% of range), long wick (>55%)
+        - Bat (Expansion): Large body (>70% of range, >0.8x ATR)
+        - Belan (Doji): Tiny body (<15% of range), decent range (>0.5x ATR)
 
-class GhostZoneStrategy:
-    NAME = "Ghost Trade Zone (GTZ)"
+    Zones require volume confirmation (3x avg if volume available,
+    or range > 1.2x ATR as proxy when no volume data).
 
-    def __init__(self, volume_spike_mult: float = 1.2,
-                 max_zone_age: int = 80, max_zones: int = 8,
-                 sl_buffer_pct: float = 0.002, min_target_rr: float = 2.5):
-        """
-        Args:
-            volume_spike_mult: Trigger candle volume must be >= this × 20-bar avg.
-                               3.0x for 5-min candles (paper trading — true Ghost Trader threshold).
-                               1.2x for daily bars (backtesting — daily averages out intraday spikes).
-                               Tested: 1.2x → 96-100% WR, 1.5x → 100% WR (fewer trades).
-            max_zone_age: Max bars before a zone expires (institutional zones are sticky)
-            max_zones: Max demand + supply zones to track
-            sl_buffer_pct: SL buffer beyond zone edge as % of spot
-            min_target_rr: Minimum risk-reward ratio for entry
-        """
-        self.volume_spike_mult = volume_spike_mult
-        self.max_zone_age = max_zone_age
-        self.max_zones = max_zones
-        self.sl_buffer_pct = sl_buffer_pct
-        self.min_target_rr = min_target_rr
+    Args:
+        df: Historical daily OHLCV DataFrame with Open, High, Low, Close, Volume.
+        atr: Current ATR value.
+        lookback: Number of bars to scan (default 40).
 
-    # ================================================================
-    # PHASE 1: Candle Classification (The Grandfather)
-    # ================================================================
-    def _classify_candle(self, row, atr: float):
-        """Classify a candle into institutional footprint types.
+    Returns:
+        (demand_zones, supply_zones): Each is a list of zone dicts with keys:
+            low, high, mid, candle_type, vol_mult, timeframe.
+    """
+    demand_zones = []
+    supply_zones = []
 
-        Returns:
-            str: 'injection', 'bat', 'belan', or None
-            str: 'bullish', 'bearish', or 'neutral'
-        """
-        o, h, l, c = row['Open'], row['High'], row['Low'], row['Close']
+    if df is None or len(df) < 3 or atr <= 0:
+        return demand_zones, supply_zones
+
+    lookback_df = df.tail(lookback)
+    avg_vol_20 = df['Volume'].tail(20).mean() if 'Volume' in df.columns else 0
+    has_volume = avg_vol_20 > 0
+
+    for j in range(1, len(lookback_df) - 2):
+        bar = lookback_df.iloc[j]
+        next_bar = lookback_df.iloc[j + 1]
+
+        o, h, l, c = bar['Open'], bar['High'], bar['Low'], bar['Close']
         body = abs(c - o)
         full_range = h - l
         if full_range <= 0:
-            return None, 'neutral'
+            continue
 
-        upper_wick = h - max(o, c)
+        body_ratio = body / full_range
         lower_wick = min(o, c) - l
-        body_ratio = body / full_range  # How much of the range is body
+        upper_wick = h - max(o, c)
 
-        direction = 'bullish' if c > o else ('bearish' if c < o else 'neutral')
-
-        # 1. INJECTION (Pin Bar): Long wick on one side, small body
-        #    Wick must be > 2x the body AND > 60% of full range
-        if body_ratio < 0.35:
-            if lower_wick > body * 2 and lower_wick > full_range * 0.55:
-                # Long lower wick = bullish injection (money injected from below)
-                return 'injection', 'bullish'
-            if upper_wick > body * 2 and upper_wick > full_range * 0.55:
-                # Long upper wick = bearish injection (money injected from above)
-                return 'injection', 'bearish'
-
-        # 2. BAT (Expansion/Hammer): Large body, aggressive momentum
-        #    Body > 70% of range AND body > 0.8 ATR
-        if body_ratio > 0.70 and body > atr * 0.8:
-            return 'bat', direction
-
-        # 3. BELAN (Doji/Mother Candle): Stalemate, very small body
-        #    Body < 15% of range AND range > 0.5 ATR (not a tiny doji)
-        if body_ratio < 0.15 and full_range > atr * 0.5:
-            return 'belan', 'neutral'
-
-        return None, direction
-
-    # ================================================================
-    # PHASE 1: Zone Creation from Trigger Candles
-    # ================================================================
-    def _scan_for_zones(self, df, i: int, atr: float, avg_vol: float,
-                        has_volume: bool = True):
-        """Scan recent bars for institutional trigger candles that create Ghost Zones.
-
-        A valid Ghost Zone requires:
-        1. An institutional candle type (injection, bat, or belan)
-        2. Volume spike >= volume_spike_mult × average (when volume data exists)
-           OR candle range >= 1.2x ATR (when no volume — "Father" substitute)
-        3. Price must have moved away from the zone (unmitigated)
-        """
-        new_demand = []
-        new_supply = []
-
-        # Scan the last 20 bars for trigger candles
-        scan_start = max(0, i - 20)
-        for j in range(scan_start, i - 1):
-            bar = df.iloc[j]
-            candle_type, bias = self._classify_candle(bar, atr)
-
-            if candle_type is None:
+        # Father: Volume or Range confirmation
+        if has_volume:
+            vol = bar['Volume']
+            vol_mult = vol / max(avg_vol_20, 1)
+            if vol_mult < 2.5:
                 continue
-
-            # FATHER: Volume/Range confirmation
-            if has_volume:
-                # When volume data exists: require volume spike
-                vol = bar['Volume']
-                if vol < avg_vol * self.volume_spike_mult:
-                    continue
-            else:
-                # When no volume (Angel index data): use range as proxy
-                # Institutional candles tend to have larger ranges
-                # Range > 1.2x ATR = significant institutional activity
-                candle_range = bar['High'] - bar['Low']
-                if candle_range < atr * 1.2:
-                    continue
-
-            # Zone = exact High and Low of the trigger candle
-            zone_high = bar['High']
-            zone_low = bar['Low']
-
-            # Check if zone is UNMITIGATED (price didn't close back into the zone)
-            # On daily bars: check if any subsequent bar's CLOSE was inside the zone
-            # (wicks through are OK — institutional orders absorb them)
-            unmitigated = True
-            for k in range(j + 2, min(j + 15, i)):  # Check next 15 bars max
-                check = df.iloc[k]
-                # Zone is mitigated if price CLOSED inside the zone (not just wicked)
-                if zone_low <= check['Close'] <= zone_high:
-                    unmitigated = False
-                    break
-
-            if not unmitigated:
-                continue
-
-            # Next bar after trigger should show impulse AWAY from zone
-            # On daily: close beyond zone boundary is sufficient
-            next_bar = df.iloc[j + 1]
-            impulse_up = next_bar['Close'] > zone_high * 0.998  # Allow tiny tolerance
-            impulse_down = next_bar['Close'] < zone_low * 1.002
-
-            # Compute volume multiplier for zone metadata
-            vol = bar['Volume'] if has_volume else 0
-            vol_mult = vol / max(avg_vol, 1) if has_volume else (
-                (bar['High'] - bar['Low']) / max(atr, 1)  # Range/ATR as proxy
-            )
-
-            # Classify as demand or supply zone
-            zone_meta = {
-                'low': zone_low, 'high': zone_high,
-                'mid': (zone_low + zone_high) / 2,
-                'created_at': j, 'candle_type': candle_type,
-                'volume': vol, 'vol_mult': vol_mult,
-            }
-
-            if candle_type == 'injection':
-                if bias == 'bullish' and impulse_up:
-                    new_demand.append(zone_meta.copy())
-                elif bias == 'bearish' and impulse_down:
-                    new_supply.append(zone_meta.copy())
-
-            elif candle_type == 'bat':
-                if bias == 'bullish' and impulse_up:
-                    new_demand.append(zone_meta.copy())
-                elif bias == 'bearish' and impulse_down:
-                    new_supply.append(zone_meta.copy())
-
-            elif candle_type == 'belan':
-                # Belan breaks violently — check which direction the break was
-                if impulse_up:
-                    new_demand.append(zone_meta.copy())
-                elif impulse_down:
-                    new_supply.append(zone_meta.copy())
-
-        return new_demand, new_supply
-
-    # ================================================================
-    # PHASE 2: Exhaustion Rule (300pt NIFTY / 1000pt BANKNIFTY)
-    # ================================================================
-    def _compute_trend_distance(self, df, i: int, lookback: int = 20):
-        """Compute the total distance of the current trend from its origin.
-
-        Returns:
-            float: trend distance in points (positive = up, negative = down)
-            float: absolute distance
-        """
-        if i < lookback:
-            return 0, 0
-
-        # Find the trend origin: the recent swing low (uptrend) or swing high (downtrend)
-        recent = df.iloc[i - lookback:i + 1]
-        current_close = df.iloc[i]['Close']
-
-        # Simple: distance from the lookback period's min/max to current
-        recent_low = recent['Low'].min()
-        recent_high = recent['High'].max()
-
-        dist_from_low = current_close - recent_low    # Distance of uptrend
-        dist_from_high = current_close - recent_high   # Distance of downtrend (negative)
-
-        # Which trend is dominant?
-        if abs(dist_from_low) > abs(dist_from_high):
-            return dist_from_low, abs(dist_from_low)  # In an uptrend
         else:
-            return dist_from_high, abs(dist_from_high)  # In a downtrend
-
-    def _is_trend_exhausted(self, df, i: int, symbol: str) -> bool:
-        """Check if the current trend has hit the exhaustion threshold.
-
-        Once NIFTY moves 300pts or BANKNIFTY moves 1000pts from origin,
-        the trend is exhausted and Ghost Zone mean-reversion is high probability.
-        """
-        threshold = EXHAUSTION_POINTS.get(symbol, 300)
-        _, abs_dist = self._compute_trend_distance(df, i, lookback=30)
-        return abs_dist >= threshold
-
-    # ================================================================
-    # Zone Validation: is zone still unmitigated?
-    # ================================================================
-    def _is_zone_valid(self, zone: dict, current_bar: int, df, is_demand: bool) -> bool:
-        """A zone is invalidated if:
-        - Too old (> max_zone_age bars)
-        - Price has CLOSED through the zone (not just wicked through)
-        - Zone has been "mitigated" (price returned to 50% level)
-        """
-        age = current_bar - zone['created_at']
-        if age > self.max_zone_age:
-            return False
-
-        # Check recent bars for zone breach
-        check_start = max(zone['created_at'] + 2, current_bar - 10)
-        for k in range(check_start, current_bar):
-            if k >= len(df):
-                break
-            bar = df.iloc[k]
-
-            if is_demand:
-                # Demand zone invalid if price closed BELOW the zone low
-                if bar['Close'] < zone['low'] * 0.997:
-                    return False
-            else:
-                # Supply zone invalid if price closed ABOVE the zone high
-                if bar['Close'] > zone['high'] * 1.003:
-                    return False
-
-        return True
-
-    # ================================================================
-    # PHASE 3: Backtest Execution
-    # ================================================================
-    def backtest(self, df: pd.DataFrame, engine: BacktestEngine,
-                 symbol: str = "NIFTY50") -> BacktestResult:
-        engine.reset()
-        df = df.copy()
-
-        # Compute ATR + Volume average
-        df['TR'] = np.maximum(
-            df['High'] - df['Low'],
-            np.maximum(
-                abs(df['High'] - df['Close'].shift(1)),
-                abs(df['Low'] - df['Close'].shift(1))
-            )
-        )
-        df['ATR'] = df['TR'].rolling(14).mean()
-        df['AvgVol'] = df['Volume'].rolling(20).mean()
-
-        # Detect if volume data exists (Angel index data has Volume=0 for all rows)
-        # When no volume: use candle range/ATR as the "Father" substitute
-        has_volume = df['Volume'].sum() > 0
-
-        # Persistent zone tracking
-        demand_zones = []
-        supply_zones = []
-        exhaustion_pts = EXHAUSTION_POINTS.get(symbol, 300)
-
-        start = 25  # Need enough history for ATR/volume average
-
-        for i in range(start, len(df)):
-            row = df.iloc[i]
-            date = df.index[i]
-            atr = df.iloc[i]['ATR']
-            avg_vol = df.iloc[i]['AvgVol']
-
-            if pd.isna(atr) or atr == 0:
-                engine.record_equity(date)
-                continue
-            # Skip volume check when volume data is absent
-            if has_volume and (pd.isna(avg_vol) or avg_vol == 0):
-                engine.record_equity(date)
+            # No volume: use range > 1.2x ATR as proxy
+            vol_mult = full_range / max(atr, 1)
+            if vol_mult < 1.2:
                 continue
 
-            low = row['Low']
-            high = row['High']
-            close = row['Close']
-            open_price = row['Open']
+        candle_type = None
+        bias = 'bullish' if c > o else 'bearish'
 
-            # ---- PHASE 1: Scan for new Ghost Zones every 3 bars ----
-            if i % 3 == 0:
-                new_demand, new_supply = self._scan_for_zones(
-                    df, i, atr, avg_vol, has_volume=has_volume
-                )
+        # Injection (Pin Bar): small body, long wick
+        if body_ratio < 0.35:
+            if lower_wick > full_range * 0.55:
+                candle_type = 'injection'
+                bias = 'bullish'
+            elif upper_wick > full_range * 0.55:
+                candle_type = 'injection'
+                bias = 'bearish'
 
-                # Add non-overlapping zones
-                for nz in new_demand:
-                    overlaps = any(
-                        abs(nz['mid'] - ez['mid']) < atr * 0.8
-                        for ez in demand_zones
-                    )
-                    if not overlaps:
-                        demand_zones.append(nz)
+        # Bat (Expansion): large body
+        if candle_type is None and body_ratio > 0.70 and body > atr * 0.8:
+            candle_type = 'bat'
 
-                for nz in new_supply:
-                    overlaps = any(
-                        abs(nz['mid'] - ez['mid']) < atr * 0.8
-                        for ez in supply_zones
-                    )
-                    if not overlaps:
-                        supply_zones.append(nz)
+        # Belan (Doji): tiny body, decent range
+        if candle_type is None and body_ratio < 0.15 and full_range > atr * 0.5:
+            candle_type = 'belan'
 
-                # Keep only max_zones (sorted by recency)
-                demand_zones = sorted(
-                    demand_zones, key=lambda z: z['created_at'], reverse=True
-                )[:self.max_zones]
-                supply_zones = sorted(
-                    supply_zones, key=lambda z: z['created_at'], reverse=True
-                )[:self.max_zones]
+        if candle_type is None:
+            continue
 
-            # Remove invalidated zones
-            demand_zones = [z for z in demand_zones if self._is_zone_valid(z, i, df, True)]
-            supply_zones = [z for z in supply_zones if self._is_zone_valid(z, i, df, False)]
+        # Impulse check: next bar must break beyond the zone
+        impulse_up = next_bar['Close'] > h
+        impulse_down = next_bar['Close'] < l
 
-            # Capital check
-            if not engine.can_trade(TradeType.BUY_CE):
-                engine.record_equity(date)
+        zone = {
+            'low': l,
+            'high': h,
+            'mid': (l + h) / 2,
+            'candle_type': candle_type,
+            'vol_mult': vol_mult,
+            'timeframe': 'daily',
+        }
+
+        if (bias == 'bullish' or candle_type == 'belan') and impulse_up:
+            demand_zones.append(zone)
+        if (bias == 'bearish' or candle_type == 'belan') and impulse_down:
+            supply_zones.append(zone)
+
+    # Keep only the 5 most recent zones
+    demand_zones = demand_zones[-5:]
+    supply_zones = supply_zones[-5:]
+
+    return demand_zones, supply_zones
+
+
+def enrich_indicators_with_zones(indicators, demand_zones, supply_zones, atr):
+    """Add Ghost Zone data to an indicators dict.
+
+    Modifies indicators in-place, adding demand/supply zone fields.
+
+    Args:
+        indicators: Existing indicators dict from compute_all_indicators().
+        demand_zones: List of demand zone dicts.
+        supply_zones: List of supply zone dicts.
+        atr: Current ATR value.
+    """
+    if demand_zones:
+        indicators['demand_zone'] = demand_zones[-1]['low']
+        indicators['demand_zone_high'] = demand_zones[-1]['high']
+    else:
+        low_10 = indicators.get('prev_low', 0)
+        indicators['demand_zone'] = low_10
+        indicators['demand_zone_high'] = low_10 + atr
+
+    if supply_zones:
+        indicators['supply_zone'] = supply_zones[-1]['high']
+        indicators['supply_zone_low'] = supply_zones[-1]['low']
+    else:
+        high_10 = indicators.get('prev_high', 0)
+        indicators['supply_zone'] = high_10
+        indicators['supply_zone_low'] = high_10 - atr
+
+    indicators['demand_strength'] = len(demand_zones)
+    indicators['supply_strength'] = len(supply_zones)
+    indicators['demand_zones'] = demand_zones
+    indicators['supply_zones'] = supply_zones
+
+
+# ====================================================================
+# GHOST ZONE SIGNAL GENERATION
+# ====================================================================
+def check_ghost_zone_signals(spot, ohlc, indicators, config):
+    """Ghost Zone signals -- buy at demand, sell at supply.
+
+    Generates BUY CE when price retests a demand zone and bounces,
+    BUY PE when price retests a supply zone and rejects.
+
+    Args:
+        spot: Current spot price.
+        ohlc: Today's OHLC dict: {'open', 'high', 'low', 'close'}.
+        indicators: dict with demand_zones, supply_zones, demand_strength,
+            supply_strength, atr, iv, plus standard indicator keys.
+        config: Strategy config dict:
+            'strike_interval': int (e.g. 50),
+            'min_premium_buy': float (e.g. 15),
+            'dte': int (days to expiry),
+            'r': float (risk-free rate, default RISK_FREE_RATE),
+            'chain_ltp_ce': float (real LTP from chain, 0 if unavailable),
+            'chain_iv_ce': float (real IV from chain, 0 if unavailable),
+            'chain_ltp_pe': float (real LTP from chain, 0 if unavailable),
+            'chain_iv_pe': float (real IV from chain, 0 if unavailable),
+            'chain_strike_ce': int (chain-selected CE strike, 0 if unavailable),
+            'chain_strike_pe': int (chain-selected PE strike, 0 if unavailable),
+            'oi_demand_strike': float (OI-confirmed demand strike, 0 if unavailable),
+            'oi_supply_strike': float (OI-confirmed supply strike, 0 if unavailable),
+            'max_put_oi': float (max PUT OI near demand, 0 if unavailable),
+            'max_call_oi': float (max CALL OI near supply, 0 if unavailable),
+            'oi_available': bool (whether OI data was fetched, default False),
+            'target_mult': float (target multiplier, default 1.5),
+            'sl_mult': float (SL multiplier, default 0.35).
+
+    Returns:
+        list of signal dicts.
+    """
+    signals = []
+    ind = indicators
+    dte = config.get('dte', 7)
+    T = dte / 365
+    r = config.get('r', RISK_FREE_RATE)
+    strike_interval = config.get('strike_interval', 50)
+    min_premium_buy = config.get('min_premium_buy', 15)
+    atr = ind.get('atr', 0)
+    target_mult = config.get('target_mult', 1.5)
+    sl_mult = config.get('sl_mult', 0.35)
+
+    if atr <= 0:
+        return signals
+
+    # OI data (The Mother)
+    oi_demand_strike = config.get('oi_demand_strike', 0)
+    oi_supply_strike = config.get('oi_supply_strike', 0)
+    max_put_oi = config.get('max_put_oi', 0)
+    max_call_oi = config.get('max_call_oi', 0)
+    oi_available = config.get('oi_available', False)
+
+    demand_zones = ind.get('demand_zones', [])
+    supply_zones = ind.get('supply_zones', [])
+
+    # ---- DEMAND ZONE RETEST: BUY CE ----
+    for dz in demand_zones:
+        zone_low = dz['low']
+        zone_high = dz['high']
+        zone_mid = (zone_low + zone_high) / 2
+
+        # Price dips INTO the zone and bounces (close above zone)
+        if (ohlc['low'] <= zone_high
+                and ohlc['low'] >= zone_low * 0.998
+                and spot > zone_high):
+
+            # OI validation (The Mother)
+            oi_label = ""
+            oi_score = 0
+            if (oi_demand_strike > 0
+                    and abs(oi_demand_strike - zone_low) <= strike_interval):
+                oi_score = max_put_oi
+                oi_label = f" [PUT OI={max_put_oi:,.0f}@{oi_demand_strike}]"
+
+            # Zone strength checks
+            if ind.get('demand_strength', 0) >= 2 or oi_score > 10000:
+                pass  # Strong zone -- take it
+            elif oi_score == 0 and oi_available:
+                continue  # OI data available but no OI backing -- skip
+            elif oi_score == 0 and not oi_available and ind.get('demand_strength', 0) < 1:
+                continue  # No OI data AND no price-action strength -- skip
+
+            # Strike selection
+            chain_ltp = config.get('chain_ltp_ce', 0)
+            chain_iv = config.get('chain_iv_ce', 0)
+            chain_strike = config.get('chain_strike_ce', 0)
+
+            ce_strike = chain_strike if chain_strike > 0 else get_nearest_strike(spot, strike_interval)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, ce_strike, T, r, use_iv, 'CE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+
+            if premium > min_premium_buy:
+                signals.append({
+                    'type': 'BUY_CE_GTZ',
+                    'strike': ce_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': (f"GTZ v7 Demand: zone={zone_low:.0f}-{zone_high:.0f} "
+                               f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
+                               f"{oi_label}"
+                               f"{'  [CHAIN]' if chain_ltp > 0 else ''}"),
+                    'target': premium * target_mult,
+                    'sl': premium * sl_mult,
+                })
+                break  # Only one demand signal per scan
+
+    # ---- SUPPLY ZONE RETEST: BUY PE ----
+    for sz in supply_zones:
+        zone_low = sz['low']
+        zone_high = sz['high']
+        zone_mid = (zone_low + zone_high) / 2
+
+        # Price spikes INTO the zone and rejects (close below zone)
+        if (ohlc['high'] >= zone_low
+                and ohlc['high'] <= zone_high * 1.002
+                and spot < zone_low):
+
+            oi_label = ""
+            oi_score = 0
+            if (oi_supply_strike > 0
+                    and abs(oi_supply_strike - zone_high) <= strike_interval):
+                oi_score = max_call_oi
+                oi_label = f" [CALL OI={max_call_oi:,.0f}@{oi_supply_strike}]"
+
+            if ind.get('supply_strength', 0) >= 2 or oi_score > 10000:
+                pass
+            elif oi_score == 0 and oi_available:
+                continue
+            elif oi_score == 0 and not oi_available and ind.get('supply_strength', 0) < 1:
                 continue
 
-            # ---- PHASE 2: Exhaustion check ----
-            trend_dist, abs_trend_dist = self._compute_trend_distance(df, i, lookback=30)
-            is_exhausted = abs_trend_dist >= exhaustion_pts
+            chain_ltp = config.get('chain_ltp_pe', 0)
+            chain_iv = config.get('chain_iv_pe', 0)
+            chain_strike = config.get('chain_strike_pe', 0)
 
-            # Boost zone confidence when trend is exhausted
-            # (Ghost Zone setups are highest probability after exhaustion)
-            exhaustion_boost = 1.5 if is_exhausted else 1.0
+            pe_strike = chain_strike if chain_strike > 0 else get_nearest_strike(spot, strike_interval)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, pe_strike, T, r, use_iv, 'PE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
 
-            trade_taken = False
-            iv = estimate_iv_from_atr(atr, close)
+            if premium > min_premium_buy:
+                signals.append({
+                    'type': 'BUY_PE_GTZ',
+                    'strike': pe_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': (f"GTZ v7 Supply: zone={zone_low:.0f}-{zone_high:.0f} "
+                               f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
+                               f"{oi_label}"
+                               f"{'  [CHAIN]' if chain_ltp > 0 else ''}"),
+                    'target': premium * target_mult,
+                    'sl': premium * sl_mult,
+                })
+                break  # Only one supply signal per scan
 
-            # ---- PHASE 3: Entry at Ghost Zone Retest ----
-
-            # DEMAND ZONE RETEST → BUY CE
-            for zone in demand_zones:
-                if trade_taken:
-                    break
-
-                zone_mid = zone['mid']
-                zone_width = zone['high'] - zone['low']
-
-                # Price must dip INTO the zone (low reaches near 50% level)
-                # AND close ABOVE the zone (bounce confirmed)
-                # The 50% entry is a LIMIT ORDER — price must reach it to fill
-                if low <= zone_mid * 1.003 and close > zone['high']:
-
-                    # Entry at 50% of the zone (institutional limit order level)
-                    entry_spot = zone_mid
-                    sl_spot = zone['low'] - close * self.sl_buffer_pct
-
-                    risk = entry_spot - sl_spot
-                    if risk <= 0:
-                        continue
-
-                    # Target: exhaustion-based or min RR
-                    if is_exhausted and trend_dist < 0:
-                        # Trend was DOWN and is exhausted → reversal target is larger
-                        target_spot = entry_spot + exhaustion_pts * 0.5
-                    else:
-                        target_spot = entry_spot + risk * self.min_target_rr * exhaustion_boost
-
-                    # Exit logic
-                    if high >= target_spot:
-                        exit_spot = target_spot
-                    elif low <= sl_spot:
-                        exit_spot = sl_spot
-                    else:
-                        exit_spot = close  # Time stop: close at EOD
-
-                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
-                        entry_spot, exit_spot, TradeType.BUY_CE, symbol,
-                        lots=1, iv=iv, atr=atr, trade_date=date
-                    )
-
-                    trade = Trade(
-                        entry_date=date, exit_date=date,
-                        trade_type=TradeType.BUY_CE,
-                        entry_price=entry_spot, exit_price=exit_spot,
-                        option_entry_premium=entry_prem,
-                        option_exit_premium=exit_prem,
-                        strike=strike,
-                        quantity=engine.lot_size,
-                        pnl=pnl, status="CLOSED"
-                    )
-                    engine.add_trade(trade)
-                    trade_taken = True
-
-                    # Zone is now mitigated — remove it
-                    demand_zones = [z for z in demand_zones if z is not zone]
-
-            # SUPPLY ZONE RETEST → BUY PE
-            for zone in supply_zones:
-                if trade_taken:
-                    break
-
-                zone_mid = zone['mid']
-                zone_width = zone['high'] - zone['low']
-
-                # Price must rise INTO the zone (high reaches near 50% level)
-                # AND close BELOW the zone (rejection confirmed)
-                if high >= zone_mid * 0.997 and close < zone['low']:
-
-                    entry_spot = zone_mid
-                    sl_spot = zone['high'] + close * self.sl_buffer_pct
-
-                    risk = sl_spot - entry_spot
-                    if risk <= 0:
-                        continue
-
-                    if is_exhausted and trend_dist > 0:
-                        target_spot = entry_spot - exhaustion_pts * 0.5
-                    else:
-                        target_spot = entry_spot - risk * self.min_target_rr * exhaustion_boost
-
-                    if low <= target_spot:
-                        exit_spot = target_spot
-                    elif high >= sl_spot:
-                        exit_spot = sl_spot
-                    else:
-                        exit_spot = close
-
-                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
-                        entry_spot, exit_spot, TradeType.BUY_PE, symbol,
-                        lots=1, iv=iv, atr=atr, trade_date=date
-                    )
-
-                    trade = Trade(
-                        entry_date=date, exit_date=date,
-                        trade_type=TradeType.BUY_PE,
-                        entry_price=entry_spot, exit_price=exit_spot,
-                        option_entry_premium=entry_prem,
-                        option_exit_premium=exit_prem,
-                        strike=strike,
-                        quantity=engine.lot_size,
-                        pnl=pnl, status="CLOSED"
-                    )
-                    engine.add_trade(trade)
-                    trade_taken = True
-
-                    supply_zones = [z for z in supply_zones if z is not zone]
-
-            engine.record_equity(date)
-
-        return engine.compute_results(self.NAME, symbol, "intraday_simulated")
+    return signals
