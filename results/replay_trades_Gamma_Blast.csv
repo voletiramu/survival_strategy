@@ -1,0 +1,2 @@
+signal_time,exit_time,strategy,symbol,signal_type,strike,entry_premium,exit_premium,target,sl,entry_spot,exit_spot,exit_reason,pnl,lot_size,hold_bars,hold_minutes,iv,dte
+2026-02-18 13:21:41.890168,2026-02-19 12:35:00,Gamma Blast,BANKNIFTY,BUY_CE_GAMMA,61350.0,338.8,100.1,846.99,101.64,61366.25,61013.05,SL_HIT,-7260.86,30,66,1390,0.1763,2
