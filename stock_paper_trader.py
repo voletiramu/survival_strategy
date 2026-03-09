@@ -2799,9 +2799,9 @@ class StockPaperTrader:
                     notify_trade_entry(
                         market="STOCKS", strategy=strategy,
                         symbol=symbol, signal_type=signal_type,
-                        strike=strike, premium=entry_premium,
-                        lot_size=lot_size, quality_score=score,
-                        spot=spot, multiplier=1, delta=g.get('delta', 0),
+                        strike=strike, entry_price=entry_premium,
+                        spot=spot, lot_size=lot_size, multiplier=1,
+                        delta=g.get('delta', 0),
                         target=target, sl=sl_price,
                         capital_used=capital_needed,
                         reason=f"Stock CPR Bot | {symbol} | Score={score}",

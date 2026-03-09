@@ -626,6 +626,10 @@ class OIPaperTrader:
                 # Telegram notification
                 try:
                     from trade_notifier import notify_trade_entry
+                    lot_size = LOT_SIZES.get(sig['symbol'], 75)
+                    cap_used = sig['entry_premium'] * lot_size
+                    invested = sum(p['entry_premium'] * p.get('lot_size', 75)
+                                   for p in self.portfolio.positions)
                     notify_trade_entry(
                         market="OI",
                         strategy=sig['strategy_type'],
@@ -633,13 +637,19 @@ class OIPaperTrader:
                         signal_type=sig['signal_type'],
                         strike=sig['strike'],
                         entry_price=sig['entry_premium'],
+                        spot=sig.get('spot', 0),
+                        lot_size=lot_size,
+                        multiplier=1,
+                        delta=sig.get('greeks', {}).get('delta', 0),
                         target=sig['target'],
                         sl=sig['sl'],
-                        quality_score=sig.get('quality_score', 0),
-                        reason=sig.get('reason', ''),
+                        capital_used=cap_used,
+                        reason=sig.get('reason', f"OI Bot | {sig['strategy_type']} | Score={sig.get('quality_score', 0)}"),
+                        capital_available=self.portfolio.capital - invested,
+                        total_invested=invested,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Telegram entry notify failed: {e}")
 
     def check_exits(self):
         """Check exit conditions for all open positions."""
@@ -781,19 +791,24 @@ class OIPaperTrader:
         """Send Telegram notification for trade exit."""
         try:
             from trade_notifier import notify_trade_exit
-            pnl = (exit_premium - pos['entry_premium']) * pos['lot_size']
+            lot_size = pos.get('lot_size', LOT_SIZES.get(pos['symbol'], 75))
+            pnl = (exit_premium - pos['entry_premium']) * lot_size
+            capital_used = pos['entry_premium'] * lot_size
             notify_trade_exit(
                 market="OI",
                 strategy=pos['strategy'],
                 symbol=pos['symbol'],
                 signal_type=pos['signal_type'],
+                strike=pos.get('strike', 0),
                 entry_price=pos['entry_premium'],
                 exit_price=exit_premium,
+                entry_time=pos.get('timestamp', ''),
                 pnl=pnl,
-                reason=reason,
+                capital_used=capital_used,
+                exit_reason=reason,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Telegram exit notify failed: {e}")
 
     def save_signals_csv(self, signals):
         """Log all signals to CSV for analysis."""

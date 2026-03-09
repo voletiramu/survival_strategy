@@ -108,6 +108,7 @@ RestartSec=30
 Environment=TZ=Asia/Kolkata
 Environment=ANGEL_CRED_FILE=/root/angel_creds.txt
 Environment=TRADING_INSTANCE=vultr
+Environment=TELEGRAM_NOTIFY_LEVEL=ALL
 StandardOutput=journal
 StandardError=journal
 MemoryMax=1500M
@@ -161,6 +162,7 @@ RestartSec=30
 Environment=TZ=Asia/Kolkata
 Environment=ANGEL_CRED_FILE=/root/angel_creds.txt
 Environment=TRADING_INSTANCE=vultr
+Environment=TELEGRAM_NOTIFY_LEVEL=ALL
 StandardOutput=journal
 StandardError=journal
 MemoryMax=500M

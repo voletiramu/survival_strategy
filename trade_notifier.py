@@ -17,8 +17,8 @@ CHAT_ID = int(os.environ.get('TELEGRAM_CHAT_ID', '1722559857') or '1722559857')
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Notification level: 'ERROR' = only errors/failures, 'ALL' = everything
-# Set TELEGRAM_NOTIFY_LEVEL=ALL to get trade entries, exits, summaries
-NOTIFY_LEVEL = os.environ.get('TELEGRAM_NOTIFY_LEVEL', 'ERROR').upper()
+# Set TELEGRAM_NOTIFY_LEVEL=ERROR to suppress trade entries, exits, summaries
+NOTIFY_LEVEL = os.environ.get('TELEGRAM_NOTIFY_LEVEL', 'ALL').upper()
 
 
 def _is_info_allowed():
