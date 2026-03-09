@@ -2962,8 +2962,10 @@ class StockPaperTrader:
         except Exception as e:
             logger.error(f"Error saving scan results: {e}")
 
-        # Send Telegram notification
-        if watchlist:
+        # v9.3: Send Telegram notification — ONCE per day only
+        # Uses a flag file to prevent duplicate notifications on restarts
+        notify_flag = os.path.join(STOCK_PAPER_DIR, f'.scan_notified_{datetime.now().strftime("%Y%m%d")}')
+        if watchlist and not os.path.exists(notify_flag):
             try:
                 from trade_notifier import send_info
                 stock_list = '\n'.join(
@@ -2978,8 +2980,14 @@ class StockPaperTrader:
                        f"Capital: Rs {self.portfolio.capital:,.0f}\n"
                        f"Available: Rs {self.portfolio.get_available_capital():,.0f}")
                 send_info(msg)
+                # Write flag file to prevent duplicate Telegram on restart
+                with open(notify_flag, 'w') as f:
+                    f.write(datetime.now().isoformat())
+                logger.info("Morning scan Telegram notification sent.")
             except Exception:
                 pass
+        elif os.path.exists(notify_flag):
+            logger.info("Morning scan Telegram already sent today — skipping.")
 
         return watchlist
 

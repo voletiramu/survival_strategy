@@ -1769,10 +1769,10 @@ class StrategyEngine:
         cache_key = f"{symbol}_{opt_type}"
         now = time.time()
 
-        # Check cache (5 min TTL)
+        # Check cache (5 min TTL for chain hits, 30s for fallbacks — v9.3)
         if hasattr(self, '_strike_cache') and cache_key in self._strike_cache:
             cached = self._strike_cache[cache_key]
-            if now - cached['time'] < 300:  # 5 min
+            if now - cached['time'] < 300:  # 5 min (fallback entries expire in ~30s)
                 return cached['strike'], cached['ltp'], cached['iv']
 
         if not hasattr(self, '_strike_cache'):
@@ -1800,9 +1800,9 @@ class StrategyEngine:
             except Exception as e:
                 logger.debug(f"Option chain strike lookup failed for {symbol}: {e}")
 
-        # Fallback
+        # Fallback — v9.3: Short cache (30s) for ltp=0 so we retry quickly at market open
         self._strike_cache[cache_key] = {
-            'strike': fallback_strike, 'ltp': 0, 'iv': 0, 'time': now
+            'strike': fallback_strike, 'ltp': 0, 'iv': 0, 'time': now - 270
         }
         return fallback_strike, 0, 0
 

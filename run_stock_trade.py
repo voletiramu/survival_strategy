@@ -162,17 +162,25 @@ def stock_loop(interval_sec=30, stop_event=None):
         logger.error("[StockLoop] Initialization failed!")
         return
 
-    # Morning scan if pre-market
+    # v9.3: Morning scan — only if before market close (prevents restart-loop spam)
     now = datetime.now().time()
     if now < EQUITY_OPEN:
-        logger.info("[StockLoop] Pre-market: Running morning CPR scan...")
-        trader.morning_scan()
-    elif not trader._todays_watchlist:
-        # Market already open but no scan yet — run now
-        logger.info("[StockLoop] No watchlist found, running CPR scan now...")
-        trader.morning_scan()
+        if now >= SCANNER_TIME:
+            logger.info("[StockLoop] Pre-market: Running morning CPR scan...")
+            trader.morning_scan()
+        else:
+            logger.info(f"[StockLoop] Too early for scan. Waiting for {SCANNER_TIME}...")
+    elif now <= EQUITY_CLOSE:
+        # Market open but no scan yet — run now
+        if not trader._todays_watchlist:
+            logger.info("[StockLoop] No watchlist found, running CPR scan now...")
+            trader.morning_scan()
+    else:
+        # v9.3: After market hours — DO NOT run morning scan (prevents Telegram spam on restart)
+        logger.info("[StockLoop] After market hours. Sleeping until next trading day...")
 
     scan_count = 0
+    eod_done = False
     nse_holiday_logged = None
     last_health_check = datetime.now()  # v9.2: Token health check timer
 
@@ -189,7 +197,10 @@ def stock_loop(interval_sec=30, stop_event=None):
                 if nse_holiday_logged != now.date():
                     logger.info(f"[StockLoop] NSE HOLIDAY: {holiday_name} — skipping stock trading")
                     nse_holiday_logged = now.date()
-                time.sleep(300)
+                if stop_event:
+                    stop_event.wait(300)
+                else:
+                    time.sleep(300)
                 continue
         except ImportError:
             pass
@@ -199,6 +210,7 @@ def stock_loop(interval_sec=30, stop_event=None):
 
         if market_open:
             scan_count += 1
+            eod_done = False  # Reset for today
             # v9.2: Proactive token health check every 30 min
             if (datetime.now() - last_health_check).total_seconds() > 1800:
                 try:
@@ -212,23 +224,26 @@ def stock_loop(interval_sec=30, stop_event=None):
             except Exception as e:
                 logger.error(f"[StockLoop] Scan error: {e}", exc_info=True)
 
-            # Check if market is about to close
-            if current_time > EQUITY_CLOSE:
-                logger.info("[StockLoop] Market closed. Running EOD summary...")
-                trader.eod_summary()
-                break
-
             if stop_event:
                 stop_event.wait(interval_sec)
             else:
                 time.sleep(interval_sec)
 
         elif current_time > EQUITY_CLOSE:
-            # After market
-            if scan_count > 0:
-                logger.info("[StockLoop] Market closed after trading. EOD summary...")
-                trader.eod_summary()
-            break
+            # v9.3: After market — run EOD summary once, then sleep (don't break/exit)
+            if not eod_done:
+                if scan_count > 0:
+                    logger.info("[StockLoop] Market closed. Running EOD summary...")
+                    trader.eod_summary()
+                else:
+                    logger.info("[StockLoop] Market closed (no scans today).")
+                eod_done = True
+
+            # Sleep 5 min, stay alive to prevent systemd restart → Telegram spam
+            if stop_event:
+                stop_event.wait(300)
+            else:
+                time.sleep(300)
 
         elif current_time < EQUITY_OPEN:
             # Pre-market: check if it's time for morning scan
