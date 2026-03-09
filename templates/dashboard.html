@@ -949,10 +949,10 @@
             el('scOpenPnl').className = 'sc-sub ' + pnlClass(s.open_pnl);
 
             // Today's P&L
-            const todayTotal = (s.equity_daily_pnl || 0) + (s.commodity_daily_pnl || 0) + (s.stock_daily_pnl || 0);
+            const todayTotal = (s.equity_daily_pnl || 0) + (s.commodity_daily_pnl || 0) + (s.stock_daily_pnl || 0) + (s.oi_daily_pnl || 0);
             el('scTodayPnl').textContent = (todayTotal >= 0 ? '+' : '') + fmtK(todayTotal);
             el('scTodayPnl').className = 'sc-value ' + pnlClass(todayTotal);
-            el('scTodayBreak').textContent = `Eq: ${fmtK(s.equity_daily_pnl)} | Cm: ${fmtK(s.commodity_daily_pnl)} | Stk: ${fmtK(s.stock_daily_pnl)}`;
+            el('scTodayBreak').textContent = `Eq: ${fmtK(s.equity_daily_pnl)} | Cm: ${fmtK(s.commodity_daily_pnl)} | Stk: ${fmtK(s.stock_daily_pnl)} | OI: ${fmtK(s.oi_daily_pnl)}`;
 
             el('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString('en-IN');
         }
@@ -978,7 +978,8 @@
             };
             content.innerHTML = mkBar('Equity', s.equity_capital, s.equity_available, 'var(--accent-blue)') +
                 mkBar('Commodity', s.commodity_capital, s.commodity_available, 'var(--accent-green)') +
-                mkBar('Stocks', s.stock_capital, s.stock_available, 'var(--accent-orange)');
+                mkBar('Stocks', s.stock_capital, s.stock_available, 'var(--accent-orange)') +
+                mkBar('OI Strats', s.oi_capital, s.oi_available, 'var(--accent-purple)');
         }
 
         // ====== RENDER MARKET STATUS ======
@@ -1428,7 +1429,7 @@
                         : `height:${barH}px;margin-bottom:${chartHeight/2 - barH}px`;
                     return `<div class="pnl-bar-wrap">
                         <span class="pnl-bar-value ${pnlClass(d.total)}">${d.total >= 0 ? '+' : ''}${fmtK(d.total)}</span>
-                        <div class="pnl-bar ${isProfit ? 'profit' : 'loss'}" style="${barStyle}" title="Eq: ${fmt(d.equity)} | Cm: ${fmt(d.commodity)} | Stk: ${fmt(d.stocks)}"></div>
+                        <div class="pnl-bar ${isProfit ? 'profit' : 'loss'}" style="${barStyle}" title="Eq: ${fmt(d.equity)} | Cm: ${fmt(d.commodity)} | Stk: ${fmt(d.stocks)} | OI: ${fmt(d.oi || 0)}"></div>
                         <span class="pnl-bar-date">${dateLabel}</span>
                     </div>`;
                 }).join('');
@@ -1479,10 +1480,11 @@
         // ====== MAIN REFRESH ======
         async function refreshAll() {
             try {
-                const [eqRes, cmRes, stkRes, sumRes, wlRes, mktRes, stratRes, sigRes, pnlRes, liveRes] = await Promise.all([
+                const [eqRes, cmRes, stkRes, oiRes, sumRes, wlRes, mktRes, stratRes, sigRes, pnlRes, liveRes] = await Promise.all([
                     fetch('/api/equity').then(r => r.json()).catch(() => null),
                     fetch('/api/commodity').then(r => r.json()).catch(() => null),
                     fetch('/api/stocks').then(r => r.json()).catch(() => null),
+                    fetch('/api/oi').then(r => r.json()).catch(() => null),
                     fetch('/api/summary').then(r => r.json()).catch(() => null),
                     fetch('/api/stock_watchlist').then(r => r.json()).catch(() => null),
                     fetch('/api/market_status').then(r => r.json()).catch(() => null),
@@ -1501,11 +1503,13 @@
                     ...(eqRes && eqRes.positions ? eqRes.positions : []),
                     ...(cmRes && cmRes.positions ? cmRes.positions : []),
                     ...(stkRes && stkRes.positions ? stkRes.positions : []),
+                    ...(oiRes && oiRes.positions ? oiRes.positions : []),
                 ];
                 const allClosed = [
                     ...(eqRes && eqRes.closed_trades ? eqRes.closed_trades : []),
                     ...(cmRes && cmRes.closed_trades ? cmRes.closed_trades : []),
                     ...(stkRes && stkRes.closed_trades ? stkRes.closed_trades : []),
+                    ...(oiRes && oiRes.closed_trades ? oiRes.closed_trades : []),
                 ];
 
                 allPositionsGlobal = allPositions;
