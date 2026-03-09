@@ -1011,6 +1011,32 @@ class MarketDataPipeline:
 
         return snapshot
 
+    def get_option_chain(self, symbol):
+        """Get cached option chain data for a symbol.
+
+        Returns:
+            dict with 'CE', 'PE' lists and 'expiry' string, or None if unavailable.
+            Each entry in CE/PE: {strike, ltp, oi, oi_change, volume, iv, ...}
+        """
+        with self._lock:
+            chain = self._option_chains.get(symbol)
+            if chain:
+                return {
+                    'CE': list(chain.get('CE', [])),
+                    'PE': list(chain.get('PE', [])),
+                    'expiry': chain.get('expiry'),
+                }
+        return None
+
+    def get_spot(self, symbol):
+        """Get cached spot price for a symbol.
+
+        Returns:
+            float spot price or None.
+        """
+        with self._lock:
+            return self._spots.get(symbol)
+
     def get_data_status(self):
         """Get pipeline health status for monitoring.
 

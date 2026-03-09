@@ -80,9 +80,13 @@ echo "Step 6: Creating data directories..."
 mkdir -p "$REMOTE_DIR/paper_trades"
 mkdir -p "$REMOTE_DIR/paper_trades_commodity"
 mkdir -p "$REMOTE_DIR/paper_trades_crypto"
+mkdir -p "$REMOTE_DIR/paper_trades_oi"
+mkdir -p "$REMOTE_DIR/stock_paper_trades"
 mkdir -p "$REMOTE_DIR/logs"
+mkdir -p "$REMOTE_DIR/locks"
 mkdir -p "$REMOTE_DIR/reports"
 mkdir -p "$REMOTE_DIR/historical_data"
+mkdir -p "$REMOTE_DIR/data/oi_history"
 echo "  Directories created."
 
 # --- Step 7: Create systemd service for paper trading ---
@@ -138,6 +142,35 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
+# --- Step 8b: Create systemd service for OI paper trading ---
+echo ""
+echo "Step 8b: Creating OI trading service (algo-oi-trading)..."
+cat > /etc/systemd/system/algo-oi-trading.service << 'EOF'
+[Unit]
+Description=Algo Trading OI Paper Trader (OI Wall, Max Pain, VWAP Bounce)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/algo_trading
+ExecStart=/usr/bin/python3 -u run_oi_trade.py --interval 180
+Restart=always
+RestartSec=30
+Environment=TZ=Asia/Kolkata
+Environment=ANGEL_CRED_FILE=/root/angel_creds.txt
+Environment=TRADING_INSTANCE=vultr
+StandardOutput=journal
+StandardError=journal
+MemoryMax=500M
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 # --- Step 9: Set up log rotation ---
 echo ""
 echo "Step 9: Setting up log rotation..."
@@ -160,12 +193,14 @@ echo "Step 10: Enabling services..."
 systemctl daemon-reload
 systemctl enable algo-trading
 systemctl enable algo-dashboard
+systemctl enable algo-oi-trading
 
 # Don't start yet if no credentials
 if [ -f "$CRED_FILE" ]; then
     echo "  Angel credentials found. Starting services..."
     systemctl start algo-trading
     systemctl start algo-dashboard
+    systemctl start algo-oi-trading
     sleep 3
     echo ""
     echo "  Service status:"
@@ -198,8 +233,9 @@ echo "  VPS SETUP COMPLETE!"
 echo "============================================"
 echo ""
 echo "  Services:"
-echo "    algo-trading   : Paper trader (equity + commodity + crypto)"
-echo "    algo-dashboard : Flask dashboard on port 5000"
+echo "    algo-trading    : Paper trader (equity + commodity)"
+echo "    algo-oi-trading : OI strategies bot (OI Wall, Max Pain, VWAP)"
+echo "    algo-dashboard  : Flask dashboard on port 5000"
 echo ""
 echo "  Useful commands:"
 echo "    journalctl -u algo-trading -f    # Live logs"
