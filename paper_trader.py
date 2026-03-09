@@ -145,6 +145,7 @@ VIX_HIGH_MULTIPLIER = 0.8        # Multiply thresholds by 0.8 in high VIX
 GRACE_PERIOD_SECONDS = 180       # v7.5: 3 min (was 10 min — missed fast spikes)
 GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry same direction
 REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
+DIRECTION_FLIP_COOLDOWN_SECONDS = 900  # v9.2: 15 min after DIRECTION_FLIP, no re-entry ANY direction
 MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
 MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x brokerage)
 
@@ -2746,6 +2747,46 @@ class PaperTrader:
 
         logger.info(f"\n  {len(signals)} SIGNALS TO EXECUTE (PAPER MODE):")
 
+        # v9.2: PRE-FILTER — Remove conflicting signals within the same scan batch.
+        # If two signals for the SAME symbol point in OPPOSITE directions (CE vs PE),
+        # keep only the higher-scored one. This prevents a weak GAMMA CE (score=56)
+        # from entering when CPR PE (score=85) will immediately flip it.
+        by_symbol = {}
+        for sig in signals:
+            sym = sig['symbol']
+            direction = 'CE' if 'CE' in sig['type'] else 'PE'
+            score = sig.get('quality_score', 0)
+            if sym not in by_symbol:
+                by_symbol[sym] = {}
+            if direction not in by_symbol[sym]:
+                by_symbol[sym][direction] = []
+            by_symbol[sym][direction].append(sig)
+
+        suppressed = set()  # Signal IDs to suppress
+        for sym, directions in by_symbol.items():
+            if 'CE' in directions and 'PE' in directions:
+                # Conflict: same symbol, opposing directions
+                best_ce = max(directions['CE'], key=lambda s: s.get('quality_score', 0))
+                best_pe = max(directions['PE'], key=lambda s: s.get('quality_score', 0))
+                ce_score = best_ce.get('quality_score', 0)
+                pe_score = best_pe.get('quality_score', 0)
+                # Suppress the weaker direction's signals entirely
+                if ce_score > pe_score:
+                    for s in directions['PE']:
+                        suppressed.add(id(s))
+                    logger.info(f"  CONFLICT_FILTER: {sym} CE(score={ce_score}) > PE(score={pe_score}) "
+                               f"— suppressing {len(directions['PE'])} PE signals")
+                elif pe_score > ce_score:
+                    for s in directions['CE']:
+                        suppressed.add(id(s))
+                    logger.info(f"  CONFLICT_FILTER: {sym} PE(score={pe_score}) > CE(score={ce_score}) "
+                               f"— suppressing {len(directions['CE'])} CE signals")
+                # Equal scores: keep both (let other filters decide)
+
+        signals = [s for s in signals if id(s) not in suppressed]
+        if suppressed:
+            logger.info(f"  {len(suppressed)} conflicting signals suppressed, {len(signals)} remaining")
+
         vix_mult = self.get_vix_multiplier()
         executed = 0
         skipped = 0
@@ -2830,6 +2871,7 @@ class PaperTrader:
                 for opp in all_opposite:
                     opp_pnl = opp.get('unrealized_pnl', 0)
                     opp_current = opp.get('current_premium', opp['entry_premium'])
+
                     # v7.7: Only flip LOSING positions. Profitable ones run regardless of breakeven_locked.
                     if opp_pnl <= 0:
                         logger.info(f"  DIRECTION_FLIP: Closing {opp['id']} ({opp['strategy']} "
@@ -2870,14 +2912,25 @@ class PaperTrader:
             now = datetime.now()
             cooldown_hit = False
             for eh in self.exit_history:
-                if eh['symbol'] == sig['symbol'] and eh['direction'] == sig_opt_type:
+                if eh['symbol'] == sig['symbol']:
                     elapsed = (now - eh['time']).total_seconds()
-                    if elapsed < REENTRY_COOLDOWN_SECONDS:
-                        logger.info(f"  SKIP_COOLDOWN: {sig['symbol']} {sig_opt_type} exited {int(elapsed)}s ago "
-                                   f"(need {REENTRY_COOLDOWN_SECONDS}s)")
-                        skipped += 1
-                        cooldown_hit = True
-                        break
+                    # v9.2: DIRECTION_FLIP exits block ANY direction re-entry for 15 min
+                    # (prevents CE→PE→CE→PE churn). Normal exits block same-direction only.
+                    if eh.get('reason') == 'DIRECTION_FLIP':
+                        if elapsed < DIRECTION_FLIP_COOLDOWN_SECONDS:
+                            logger.info(f"  SKIP_FLIP_COOLDOWN: {sig['symbol']} {sig_opt_type} — "
+                                       f"DIRECTION_FLIP exit {int(elapsed)}s ago "
+                                       f"(need {DIRECTION_FLIP_COOLDOWN_SECONDS}s any direction)")
+                            skipped += 1
+                            cooldown_hit = True
+                            break
+                    elif eh['direction'] == sig_opt_type:
+                        if elapsed < REENTRY_COOLDOWN_SECONDS:
+                            logger.info(f"  SKIP_COOLDOWN: {sig['symbol']} {sig_opt_type} exited {int(elapsed)}s ago "
+                                       f"(need {REENTRY_COOLDOWN_SECONDS}s)")
+                            skipped += 1
+                            cooldown_hit = True
+                            break
             if cooldown_hit:
                 continue
 
