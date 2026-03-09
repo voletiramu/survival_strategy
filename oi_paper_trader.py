@@ -36,7 +36,7 @@ logger = logging.getLogger('OITrader')
 # CONFIGURATION
 # ====================================================================
 INITIAL_CAPITAL = 300000            # Rs 3L
-LOT_SIZES = {'NIFTY': 75, 'BANKNIFTY': 30, 'SENSEX': 20}
+LOT_SIZES = {'NIFTY': 65, 'BANKNIFTY': 30, 'SENSEX': 20}  # NSE revised Jan 2026
 STRIKE_INTERVALS = {'NIFTY': 50, 'BANKNIFTY': 100, 'SENSEX': 100}
 SYMBOLS = ['NIFTY', 'BANKNIFTY', 'SENSEX']
 

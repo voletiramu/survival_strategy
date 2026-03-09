@@ -58,13 +58,13 @@ COMMODITIES = {
         'exchange': 'MCX', 'description': 'Gold Mini (100g)',
     },
     'SILVERM': {
-        'lot_size': 5, 'multiplier': 5, 'margin': 15000,
+        'lot_size': 1, 'multiplier': 5, 'margin': 15000,
         'strike_interval': 500, 'vol_adj': 1.15,
         'file': 'SILVERM_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Silver Mini (5kg)',
     },
     'CRUDEOILM': {
-        'lot_size': 10, 'multiplier': 10, 'margin': 8000,
+        'lot_size': 1, 'multiplier': 10, 'margin': 8000,
         'strike_interval': 50, 'vol_adj': 1.4,
         'file': 'CRUDEOILM_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Crude Oil Mini (10 bbl)',
@@ -76,19 +76,19 @@ COMMODITIES = {
         'exchange': 'MCX', 'description': 'Gold Standard (1kg)',
     },
     'SILVER': {
-        'lot_size': 30, 'multiplier': 30, 'margin': 80000,
+        'lot_size': 1, 'multiplier': 30, 'margin': 80000,
         'strike_interval': 500, 'vol_adj': 1.15,
         'file': 'SILVER_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Silver (30kg)',
     },
     'NATURALGAS': {
-        'lot_size': 1250, 'multiplier': 1250, 'margin': 70000,
+        'lot_size': 1, 'multiplier': 1250, 'margin': 70000,
         'strike_interval': 5, 'vol_adj': 1.8,
         'file': 'NATURALGAS_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Natural Gas (1250 mmBtu)',
     },
     'COPPER': {
-        'lot_size': 2500, 'multiplier': 2500, 'margin': 60000,
+        'lot_size': 1, 'multiplier': 2500, 'margin': 60000,
         'strike_interval': 5, 'vol_adj': 1.1,
         'file': 'COPPER_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Copper (2500kg)',
