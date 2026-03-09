@@ -446,6 +446,21 @@ def _send_heartbeat(instance_id='local'):
     """Log heartbeat locally (no Telegram spam — user wants fewer messages)."""
     logger.info(f"  [Heartbeat] System alive at {datetime.now().strftime('%H:%M')}")
 
+    # v9.2: Proactive token health check — re-authenticate before expiry
+    try:
+        eq_trader = _trader_refs.get('equity')
+        if eq_trader and hasattr(eq_trader, 'angel') and eq_trader.angel:
+            eq_trader.angel.check_token_health()
+    except Exception as e:
+        logger.warning(f"  [Heartbeat] Equity token health check failed: {e}")
+
+    try:
+        comm_trader = _trader_refs.get('commodity')
+        if comm_trader and hasattr(comm_trader, 'angel') and comm_trader.angel:
+            comm_trader.angel.check_token_health()
+    except Exception as e:
+        logger.warning(f"  [Heartbeat] Commodity token health check failed: {e}")
+
 
 def show_combined_status():
     """Show both equity and commodity portfolio status."""

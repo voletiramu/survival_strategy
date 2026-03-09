@@ -211,6 +211,12 @@ def oi_loop(interval_sec=180, stop_event=None):
                             f"trades={trader.daily_trade_count} | "
                             f"positions={len(trader.portfolio.positions)}")
                 last_heartbeat = datetime.now()
+                # v9.2: Proactive token health check
+                try:
+                    if hasattr(trader, 'angel') and trader.angel:
+                        trader.angel.check_token_health()
+                except Exception as e:
+                    logger.warning(f"[OILoop] Token health check failed: {e}")
 
             # Check if market closing
             if current_time > EQUITY_CLOSE:

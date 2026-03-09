@@ -174,6 +174,7 @@ def stock_loop(interval_sec=30, stop_event=None):
 
     scan_count = 0
     nse_holiday_logged = None
+    last_health_check = datetime.now()  # v9.2: Token health check timer
 
     while not (stop_event and stop_event.is_set()):
         now = datetime.now()
@@ -198,6 +199,14 @@ def stock_loop(interval_sec=30, stop_event=None):
 
         if market_open:
             scan_count += 1
+            # v9.2: Proactive token health check every 30 min
+            if (datetime.now() - last_health_check).total_seconds() > 1800:
+                try:
+                    if hasattr(trader, 'angel') and trader.angel:
+                        trader.angel.check_token_health()
+                except Exception as e:
+                    logger.warning(f"[StockLoop] Token health check failed: {e}")
+                last_health_check = datetime.now()
             try:
                 trader.run_once()
             except Exception as e:

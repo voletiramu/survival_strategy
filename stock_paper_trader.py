@@ -506,6 +506,9 @@ class StockAngelConnection:
         self._last_api_call = 0
         self._api_min_interval = 1.0  # Min 1s between REST calls
         self._backoff_until = 0       # Exponential backoff timestamp
+        self._auth_time = 0           # v9.2: Track when we last authenticated
+        self._app_type = 'Historical' # v9.2: Remember app type for reconnect
+        self._reconnecting = False    # v9.2: Prevent recursive reconnect loops
 
     def load_credentials(self):
         """Load Angel credentials from file.
@@ -564,6 +567,55 @@ class StockAngelConnection:
         except Exception:
             pass
 
+    def _is_token_expired(self, data):
+        """v9.2: Check if API response indicates expired/invalid token."""
+        if not data or not isinstance(data, dict):
+            return False
+        err_code = str(data.get('errorcode', ''))
+        err_msg = str(data.get('message', '')).lower()
+        return err_code in ('AG8001', 'AG8002', 'AB8050') or 'invalid token' in err_msg or 'token expired' in err_msg
+
+    def reconnect(self):
+        """v9.2: Re-authenticate to Angel API when token expires."""
+        if self._reconnecting:
+            return False
+        self._reconnecting = True
+        logger.warning("STOCK TOKEN_EXPIRED: Attempting re-authentication...")
+        try:
+            from trade_notifier import notify_system_event
+            notify_system_event('STOCKS', 'Angel API token expired — reconnecting...')
+        except Exception:
+            pass
+        try:
+            self._connected = False
+            result = self.connect(self._app_type)
+            if result:
+                logger.info("STOCK TOKEN_REFRESH: Re-authentication successful")
+            else:
+                logger.error("STOCK TOKEN_REFRESH: Re-authentication FAILED")
+            return result
+        finally:
+            self._reconnecting = False
+
+    def check_token_health(self):
+        """v9.2: Proactive token health check — call from heartbeat."""
+        if not self._connected:
+            return False
+        token_age_hours = (time.time() - self._auth_time) / 3600 if self._auth_time else 0
+        if token_age_hours > 5:
+            logger.info(f"STOCK TOKEN_HEALTH: Token age {token_age_hours:.1f}h > 5h, proactive refresh...")
+            return self.reconnect()
+        try:
+            self._throttle()
+            data = self.obj.ltpData('NSE', '99926000', '99926000')  # NIFTY 50 index
+            if self._is_token_expired(data):
+                logger.warning(f"STOCK TOKEN_HEALTH: Token invalid, reconnecting...")
+                return self.reconnect()
+            return True
+        except Exception as e:
+            logger.warning(f"STOCK TOKEN_HEALTH: Ping failed ({e}), reconnecting...")
+            return self.reconnect()
+
     def connect(self, app_type='Historical'):
         """Connect to Angel SmartAPI with retry on rate limit.
 
@@ -581,6 +633,7 @@ class StockAngelConnection:
             from SmartApi import SmartConnect
             import pyotp
 
+        self._app_type = app_type  # v9.2: Remember for reconnect
         creds = self.load_credentials()
         app = creds.get(app_type, creds.get('Historical', {}))
 
@@ -599,6 +652,7 @@ class StockAngelConnection:
 
                 if self.session and self.session.get('status'):
                     self._connected = True
+                    self._auth_time = time.time()  # v9.2: Track auth time
                     logger.info(f"Angel One connected: {client}")
                     return True
                 else:
@@ -654,6 +708,14 @@ class StockAngelConnection:
             data = self.obj.ltpData(exchange, symbol_token, symbol_token)
             if data and data.get('data'):
                 return data['data'].get('ltp')
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"Stock LTP: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.ltpData(exchange, symbol_token, symbol_token)
+                    if data and data.get('data'):
+                        return data['data'].get('ltp')
         except Exception as e:
             err_str = str(e)
             if 'TooMany' in err_str or 'AB1004' in err_str:
@@ -679,6 +741,14 @@ class StockAngelConnection:
             data = self.obj.getMarketData("FULL", {exchange: [symbol_token]})
             if data and data.get('data') and data['data'].get('fetched'):
                 return data['data']['fetched'][0]
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"Stock MarketData: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.getMarketData("FULL", {exchange: [symbol_token]})
+                    if data and data.get('data') and data['data'].get('fetched'):
+                        return data['data']['fetched'][0]
         except Exception as e:
             err_str = str(e)
             if 'TooMany' in err_str or 'AB1004' in err_str:
@@ -707,6 +777,14 @@ class StockAngelConnection:
             })
             if data and data.get('data'):
                 return data['data']
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"Stock Greeks: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.optionGreek({"name": name, "expirydate": expiry_date})
+                    if data and data.get('data'):
+                        return data['data']
             err_code = str(data.get('errorcode', '')) if data else ''
             if 'AB1004' in err_code:
                 self._handle_rate_limit(f"optionGreek {name}")
@@ -745,6 +823,14 @@ class StockAngelConnection:
             data = self.obj.getCandleData(params)
             if data and data.get('data'):
                 return data['data']
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"Stock Historical: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.getCandleData(params)
+                    if data and data.get('data'):
+                        return data['data']
             if data and 'AB1004' in str(data.get('errorcode', '')):
                 self._handle_rate_limit(str(data.get('message', '')))
         except Exception as e:

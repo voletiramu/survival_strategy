@@ -1162,6 +1162,9 @@ class AngelMCXConnection:
         self._last_api_call = 0  # Timestamp of last REST API call
         self._api_min_interval = 1.0  # v7.7: Minimum 1s between REST calls (was 0.5s, caused AB1004)
         self._backoff_until = 0  # v7.7: Exponential backoff timestamp
+        self._auth_time = 0  # v9.2: Track when we last authenticated
+        self._reconnecting = False  # v9.2: Prevent recursive reconnect loops
+        self._creds_cache = None  # v9.2: Cache credentials for reconnect
 
     def _throttle(self):
         """Enforce minimum interval between REST API calls to avoid rate limiting."""
@@ -1185,6 +1188,63 @@ class AngelMCXConnection:
             notify_api_rate_limit('COMMODITY', 'REST API', error_msg)
         except Exception:
             pass
+
+    def _is_token_expired(self, data):
+        """v9.2: Check if API response indicates expired/invalid token."""
+        if not data or not isinstance(data, dict):
+            return False
+        err_code = str(data.get('errorcode', ''))
+        err_msg = str(data.get('message', '')).lower()
+        return err_code in ('AG8001', 'AG8002', 'AB8050') or 'invalid token' in err_msg or 'token expired' in err_msg
+
+    def reconnect(self):
+        """v9.2: Re-authenticate to Angel MCX API when token expires."""
+        if self._reconnecting:
+            return False
+        self._reconnecting = True
+        logger.warning("MCX TOKEN_EXPIRED: Attempting re-authentication...")
+        try:
+            from trade_notifier import notify_system_event
+            notify_system_event('COMMODITY', 'Angel MCX API token expired — reconnecting...')
+        except Exception:
+            pass
+        try:
+            self._connected = False
+            result = self.connect()
+            if result:
+                logger.info("MCX TOKEN_REFRESH: Re-authentication successful")
+                try:
+                    from trade_notifier import notify_system_event
+                    notify_system_event('COMMODITY', 'Angel MCX API reconnected successfully')
+                except Exception:
+                    pass
+            else:
+                logger.error("MCX TOKEN_REFRESH: Re-authentication FAILED")
+            return result
+        finally:
+            self._reconnecting = False
+
+    def check_token_health(self):
+        """v9.2: Proactive token health check — call from heartbeat."""
+        if not self._connected:
+            return False
+        token_age_hours = (time.time() - self._auth_time) / 3600 if self._auth_time else 0
+        if token_age_hours > 5:
+            logger.info(f"MCX TOKEN_HEALTH: Token age {token_age_hours:.1f}h > 5h, proactive refresh...")
+            return self.reconnect()
+        try:
+            self._throttle()
+            # Ping with a known MCX token (GOLDM futures)
+            if self._futures_tokens:
+                first_token = next(iter(self._futures_tokens.values()))
+                data = self.obj.ltpData('MCX', first_token, first_token)
+                if self._is_token_expired(data):
+                    logger.warning(f"MCX TOKEN_HEALTH: Token invalid, reconnecting...")
+                    return self.reconnect()
+            return True
+        except Exception as e:
+            logger.warning(f"MCX TOKEN_HEALTH: Ping failed ({e}), reconnecting...")
+            return self.reconnect()
 
     def connect(self):
         try:
@@ -1225,6 +1285,7 @@ class AngelMCXConnection:
 
                 if session and session.get('status'):
                     self._connected = True
+                    self._auth_time = time.time()  # v9.2: Track auth time
                     logger.info(f"Angel MCX connected")
                     self._load_mcx_tokens()
                     return True
@@ -1269,6 +1330,14 @@ class AngelMCXConnection:
             data = self.obj.getCandleData(params)
             if data and data.get('data'):
                 return data['data']
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"MCX Historical: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.getCandleData(params)
+                    if data and data.get('data'):
+                        return data['data']
             if data and 'AB1004' in str(data.get('errorcode', '')):
                 self._handle_rate_limit(str(data.get('message', '')))
         except Exception as e:
@@ -1288,6 +1357,15 @@ class AngelMCXConnection:
                                     self._futures_tokens[commodity])
             if data and data.get('data'):
                 return data['data'].get('ltp')
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"MCX LTP: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.ltpData('MCX', self._futures_tokens[commodity],
+                                            self._futures_tokens[commodity])
+                    if data and data.get('data'):
+                        return data['data'].get('ltp')
         except Exception as e:
             logger.error(f"LTP error {commodity}: {e}")
         return None
@@ -1301,6 +1379,14 @@ class AngelMCXConnection:
             data = self.obj.getMarketData("FULL", {exchange: [str(symbol_token)]})
             if data and data.get('data') and data['data'].get('fetched'):
                 return data['data']['fetched'][0]
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"MCX MarketData: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.getMarketData("FULL", {exchange: [str(symbol_token)]})
+                    if data and data.get('data') and data['data'].get('fetched'):
+                        return data['data']['fetched'][0]
         except Exception as e:
             logger.error(f"MCX Market data error: {e}")
         return None

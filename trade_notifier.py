@@ -512,6 +512,20 @@ def notify_service_restart(instance_id='vultr', reason=''):
     return send_message(msg)
 
 
+def notify_system_event(market, message):
+    """v9.2: Notify important system events (token refresh, reconnect, etc.)."""
+    if not _is_info_allowed():
+        return True
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"<b>⚙️ SYSTEM EVENT</b>\n"
+        f"<b>Bot:</b> {market}\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Event:</b> {message}\n"
+    )
+    return send_message(msg)
+
+
 if __name__ == "__main__":
     # Test: send a test message
     print("Testing Telegram Bot connection...")

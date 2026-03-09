@@ -498,6 +498,9 @@ class AngelConnection:
         self._last_api_call = 0  # Timestamp of last REST API call
         self._api_min_interval = 1.0  # v7.7: Minimum 1s between REST calls (was 0.5s, caused AB1004)
         self._backoff_until = 0  # v7.7: Exponential backoff timestamp
+        self._auth_time = 0  # v9.2: Track when we last authenticated
+        self._app_type = 'Historical'  # v9.2: Remember app type for reconnect
+        self._reconnecting = False  # v9.2: Prevent recursive reconnect loops
 
     def load_credentials(self):
         """Load Angel credentials."""
@@ -553,6 +556,42 @@ class AngelConnection:
         except Exception:
             pass
 
+    def _is_token_expired(self, data):
+        """v9.2: Check if API response indicates expired/invalid token."""
+        if not data or not isinstance(data, dict):
+            return False
+        err_code = str(data.get('errorcode', ''))
+        err_msg = str(data.get('message', '')).lower()
+        # AG8001 = Invalid Token, AG8002 = Token Expired, AB8050 = Unauthorized
+        return err_code in ('AG8001', 'AG8002', 'AB8050') or 'invalid token' in err_msg or 'token expired' in err_msg
+
+    def reconnect(self):
+        """v9.2: Re-authenticate to Angel API when token expires."""
+        if self._reconnecting:
+            return False  # Prevent recursive reconnect loops
+        self._reconnecting = True
+        logger.warning("TOKEN_EXPIRED: Attempting re-authentication...")
+        try:
+            from trade_notifier import notify_system_event
+            notify_system_event('EQUITY', 'Angel API token expired — reconnecting...')
+        except Exception:
+            pass
+        try:
+            self._connected = False
+            result = self.connect(self._app_type)
+            if result:
+                logger.info("TOKEN_REFRESH: Re-authentication successful")
+                try:
+                    from trade_notifier import notify_system_event
+                    notify_system_event('EQUITY', 'Angel API reconnected successfully')
+                except Exception:
+                    pass
+            else:
+                logger.error("TOKEN_REFRESH: Re-authentication FAILED")
+            return result
+        finally:
+            self._reconnecting = False
+
     def connect(self, app_type='Historical'):
         """Connect to Angel SmartAPI with retry on rate limit."""
         try:
@@ -564,6 +603,7 @@ class AngelConnection:
             import pyotp
 
         creds = self.load_credentials()
+        self._app_type = app_type  # v9.2: Remember for reconnect
         app = creds.get(app_type, creds.get('Historical', {}))
 
         api_key = app.get('ANGEL_API_KEY', '')
@@ -581,6 +621,7 @@ class AngelConnection:
 
                 if self.session and self.session.get('status'):
                     self._connected = True
+                    self._auth_time = time.time()  # v9.2: Track auth time
                     logger.info(f"Angel One connected: {client}")
                     return True
                 else:
@@ -605,6 +646,14 @@ class AngelConnection:
             data = self.obj.ltpData(exchange, symbol_token, symbol_token)
             if data and data.get('data'):
                 return data['data'].get('ltp')
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"LTP: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.ltpData(exchange, symbol_token, symbol_token)
+                    if data and data.get('data'):
+                        return data['data'].get('ltp')
         except Exception as e:
             logger.error(f"LTP error: {e}")
         return None
@@ -618,6 +667,14 @@ class AngelConnection:
             data = self.obj.getMarketData("FULL", {exchange: [symbol_token]})
             if data and data.get('data') and data['data'].get('fetched'):
                 return data['data']['fetched'][0]
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"MarketData: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.getMarketData("FULL", {exchange: [symbol_token]})
+                    if data and data.get('data') and data['data'].get('fetched'):
+                        return data['data']['fetched'][0]
         except Exception as e:
             logger.error(f"Market data error: {e}")
         return None
@@ -634,6 +691,14 @@ class AngelConnection:
             })
             if data and data.get('data'):
                 return data['data']
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"Greeks: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.optionGreek({"name": name, "expirydate": expiry_date})
+                    if data and data.get('data'):
+                        return data['data']
             # v7.7: Handle specific error codes with Telegram alerts
             err_code = str(data.get('errorcode', '')) if data else ''
             err_msg = str(data.get('message', '')) if data else ''
@@ -671,6 +736,14 @@ class AngelConnection:
             data = self.obj.getCandleData(params)
             if data and data.get('data'):
                 return data['data']
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"Historical: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.getCandleData(params)
+                    if data and data.get('data'):
+                        return data['data']
             # v7.7: Detect rate limit from error response
             if data and 'AB1004' in str(data.get('errorcode', '')):
                 self._handle_rate_limit(str(data.get('message', '')))
@@ -754,6 +827,13 @@ class AngelConnection:
             data = self.obj.putCallRatio()
             if data and data.get('data'):
                 return data['data']
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"PCR: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    data = self.obj.putCallRatio()
+                    if data and data.get('data'):
+                        return data['data']
         except Exception as e:
             logger.error(f"PCR error: {e}")
         return None
@@ -771,6 +851,12 @@ class AngelConnection:
                 "name": name,
                 "expirydate": expiry_date
             })
+            # v9.2: Detect token expiry and auto-reconnect
+            if self._is_token_expired(data):
+                logger.warning(f"RealPCR: Token expired ({data.get('errorcode')}), reconnecting...")
+                if self.reconnect():
+                    self._throttle()
+                    data = self.obj.optionGreek({"name": name, "expirydate": expiry_date})
             if data and data.get('data'):
                 total_put_oi = 0
                 total_call_oi = 0
@@ -912,6 +998,29 @@ class AngelConnection:
         # Fallback: mathematical derivation
         logger.info(f"  FALLBACK_STRIKE: {name} {opt_type} using ATM={atm_strike} (option chain unavailable)")
         return {'strike': atm_strike, 'ltp': 0, 'oi': 0, 'iv': 0, 'volume': 0}
+
+    def check_token_health(self):
+        """v9.2: Proactive token health check — call from heartbeat.
+        Returns True if token is healthy, False if expired/reconnected.
+        """
+        if not self._connected:
+            return False
+        # Proactive refresh if token is older than 5 hours
+        token_age_hours = (time.time() - self._auth_time) / 3600 if self._auth_time else 0
+        if token_age_hours > 5:
+            logger.info(f"TOKEN_HEALTH: Token age {token_age_hours:.1f}h > 5h, proactive refresh...")
+            return self.reconnect()
+        # Lightweight API ping to verify token is still valid
+        try:
+            self._throttle()
+            data = self.obj.ltpData('NSE', '99926000', '99926000')  # NIFTY 50 index
+            if self._is_token_expired(data):
+                logger.warning(f"TOKEN_HEALTH: Token invalid (ping returned {data.get('errorcode')}), reconnecting...")
+                return self.reconnect()
+            return True
+        except Exception as e:
+            logger.warning(f"TOKEN_HEALTH: Ping failed ({e}), reconnecting...")
+            return self.reconnect()
 
 
 # ====================================================================
