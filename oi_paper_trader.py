@@ -46,6 +46,8 @@ MAX_POSITIONS_PER_SYMBOL = 2        # Max per symbol
 MAX_DAILY_LOSS = 30000              # Rs 30K daily loss limit (10% of capital)
 MAX_TRADES_PER_DAY = 10             # Hard cap
 MIN_SIGNAL_SCORE = 50               # Quality threshold
+OI_REENTRY_COOLDOWN_SECONDS = 600   # v9.5: 10 min after any exit, same symbol+direction
+OI_MAX_SAME_DIRECTION_PER_SYMBOL = 3  # v9.5: Max BUY_CE or BUY_PE per symbol per day
 
 # Transaction costs
 BROKERAGE = 20                      # Rs 20 per order
@@ -352,7 +354,15 @@ class OIPaperTrader:
         self._current_dte = {}          # {symbol: int}
         self._current_iv = {}           # {symbol: float}
         self.daily_signal_count = 0
-        self.daily_trade_count = 0
+        # v9.5: Reconstruct daily_trade_count from portfolio state (restart-safe)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        self.daily_trade_count = sum(1 for t in self.portfolio.closed_trades
+            if t.get('exit_time', '').startswith(today_str)
+            or t.get('timestamp', '').startswith(today_str))
+        self.daily_trade_count += len(self.portfolio.positions)
+        if self.daily_trade_count > 0:
+            logger.info(f"[OITrader] RESTART_SAFE: Recovered daily_trade_count={self.daily_trade_count}")
+        self.exit_history = []          # v9.5: [{symbol, direction, time, reason}] for re-entry cooldown
         self._last_heartbeat = None
 
     def initialize(self):
@@ -607,18 +617,70 @@ class OIPaperTrader:
         return all_signals
 
     def execute_signals(self, signals):
-        """Execute the best signals within risk limits."""
-        now = datetime.now().time()
+        """Execute the best signals within risk limits. v9.5: Anti-churn gates."""
+        now_time = datetime.now().time()
+        now = datetime.now()
 
-        if now < FIRST_TRADE_TIME:
+        if now_time < FIRST_TRADE_TIME:
             return
-        if now > LAST_ENTRY_TIME:
+        if now_time > LAST_ENTRY_TIME:
             return
 
+        skipped = 0
         for sig in signals:
             if self.daily_trade_count >= MAX_TRADES_PER_DAY:
                 break
 
+            sig_opt_type = 'CE' if 'CE' in sig.get('signal_type', '') else 'PE'
+
+            # --- v9.5 Anti-churn gate 1: Same strategy + same direction already traded today ---
+            today_str = now.strftime('%Y-%m-%d')
+            same_strat_closed = [t for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str)
+                and t.get('symbol') == sig['symbol']
+                and t.get('strategy') == sig.get('strategy_type', '')
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type]
+            if same_strat_closed:
+                logger.info(f"  SKIP_STRAT_DIR: {sig.get('strategy_type','')} already traded "
+                           f"{sig['symbol']} {sig_opt_type} today ({len(same_strat_closed)} time(s))")
+                skipped += 1; continue
+
+            # --- v9.5 Anti-churn gate 2: Max same-direction trades per symbol per day ---
+            today_same_dir = sum(1 for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str)
+                and t.get('symbol') == sig['symbol']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type)
+            today_same_dir += sum(1 for p in self.portfolio.positions
+                if p['symbol'] == sig['symbol']
+                and ('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
+            if today_same_dir >= OI_MAX_SAME_DIRECTION_PER_SYMBOL:
+                logger.info(f"  SKIP_DIR_CAP: {sig['symbol']} {sig_opt_type} — "
+                           f"{today_same_dir} trades today (max {OI_MAX_SAME_DIRECTION_PER_SYMBOL})")
+                skipped += 1; continue
+
+            # --- v9.5 Anti-churn gate 3: Escalating cooldown after losses ---
+            dir_losses = sum(1 for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str)
+                and t.get('symbol') == sig['symbol']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type
+                and (t.get('net_pnl', 0) < 0 or
+                     (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
+            escalated_cooldown = OI_REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
+
+            cooldown_blocked = False
+            for eh in self.exit_history:
+                if eh['symbol'] == sig['symbol'] and eh['direction'] == sig_opt_type:
+                    elapsed = (now - eh['time']).total_seconds()
+                    if elapsed < escalated_cooldown:
+                        logger.info(f"  SKIP_ESCALATED_COOLDOWN: {sig['symbol']} {sig_opt_type} — "
+                                   f"{elapsed:.0f}s < {escalated_cooldown:.0f}s "
+                                   f"(losses={dir_losses})")
+                        cooldown_blocked = True
+                        break
+            if cooldown_blocked:
+                skipped += 1; continue
+
+            # --- All gates passed — execute ---
             result = self.portfolio.open_position(sig, self.daily_trade_count)
             if result:
                 self.daily_trade_count += 1
@@ -651,6 +713,9 @@ class OIPaperTrader:
                 except Exception as e:
                     logger.warning(f"Telegram entry notify failed: {e}")
 
+        if skipped > 0:
+            logger.info(f"[OITrader] Anti-churn: {skipped} signal(s) blocked")
+
     def check_exits(self):
         """Check exit conditions for all open positions."""
         from strategies.exit_engine import (
@@ -672,6 +737,7 @@ class OIPaperTrader:
             for pos in list(self.portfolio.positions):
                 current = pos.get('current_premium', pos['entry_premium'])
                 self.portfolio.close_position(pos['id'], current, 'CIRCUIT_BREAKER')
+                self._track_exit(pos, 'CIRCUIT_BREAKER')
             return
 
         for pos in list(self.portfolio.positions):
@@ -686,6 +752,7 @@ class OIPaperTrader:
             if datetime.now().time() > EOD_CLOSE_TIME:
                 current = pos.get('current_premium', pos['entry_premium'])
                 self.portfolio.close_position(pos['id'], current, 'EOD_FORCE_CLOSE')
+                self._track_exit(pos, 'EOD_FORCE_CLOSE')
                 continue
 
             # Get current option premium (3-source fallback)
@@ -716,6 +783,7 @@ class OIPaperTrader:
                 self.portfolio.close_position(
                     pos['id'], current_premium,
                     f'TRAILING_SL_HIT ({tsl_result["phase"]})')
+                self._track_exit(pos, 'TRAILING_SL_HIT')
                 self._notify_exit(pos, current_premium, 'TRAILING_SL_HIT')
                 continue
 
@@ -723,6 +791,7 @@ class OIPaperTrader:
             target_hit, _ = check_target_hit(pos, current_premium)
             if target_hit:
                 self.portfolio.close_position(pos['id'], current_premium, 'TARGET_HIT')
+                self._track_exit(pos, 'TARGET_HIT')
                 self._notify_exit(pos, current_premium, 'TARGET_HIT')
                 continue
 
@@ -730,6 +799,7 @@ class OIPaperTrader:
             sl_hit, _ = check_sl_hit(pos, current_premium)
             if sl_hit:
                 self.portfolio.close_position(pos['id'], current_premium, 'SL_HIT')
+                self._track_exit(pos, 'SL_HIT')
                 self._notify_exit(pos, current_premium, 'SL_HIT')
                 continue
 
@@ -769,6 +839,7 @@ class OIPaperTrader:
             should_weak, reason = check_signal_weak_exit(pos, hold_score)
             if should_weak:
                 self.portfolio.close_position(pos['id'], current_premium, reason)
+                self._track_exit(pos, 'SIGNAL_WEAK_EXIT')
                 self._notify_exit(pos, current_premium, 'SIGNAL_WEAK_EXIT')
                 continue
 
@@ -776,6 +847,7 @@ class OIPaperTrader:
             should_time, reason = check_time_exit(pos)
             if should_time and hold_score < 60:
                 self.portfolio.close_position(pos['id'], current_premium, reason)
+                self._track_exit(pos, 'TIME_EXIT')
                 self._notify_exit(pos, current_premium, 'TIME_EXIT')
                 continue
 
@@ -784,8 +856,20 @@ class OIPaperTrader:
             if max_loss_hit:
                 self.portfolio.close_position(
                     pos['id'], current_premium, 'MAX_LOSS_60PCT')
+                self._track_exit(pos, 'MAX_LOSS_60PCT')
                 self._notify_exit(pos, current_premium, 'MAX_LOSS_60PCT')
                 continue
+
+    def _track_exit(self, pos, exit_reason):
+        """v9.5: Track exit for cooldown logic. Called after every close_position."""
+        direction = 'CE' if 'CE' in pos.get('signal_type', '') else 'PE'
+        self.exit_history.append({
+            'symbol': pos['symbol'],
+            'direction': direction,
+            'time': datetime.now(),
+            'reason': exit_reason,
+            'strategy': pos.get('strategy', ''),
+        })
 
     def _notify_exit(self, pos, exit_premium, reason):
         """Send Telegram notification for trade exit."""

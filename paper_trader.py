@@ -147,6 +147,7 @@ GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry 
 REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
 DIRECTION_FLIP_COOLDOWN_SECONDS = 900  # v9.2: 15 min after DIRECTION_FLIP, no re-entry ANY direction
 MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
+MAX_SAME_DIRECTION_PER_SYMBOL = 3  # v9.5: Max BUY_CE or BUY_PE per symbol per day (across all strategies)
 MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x brokerage)
 
 # v7.5: Trailing Stop Loss — based on PREMIUM GAIN % (not target distance %)
@@ -2351,7 +2352,14 @@ class PaperTrader:
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
         # v2.3: Trade quality tracking
-        self.daily_trade_count = 0
+        # v9.5: Reconstruct daily_trade_count from portfolio state (restart-safe)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        self.daily_trade_count = sum(1 for t in self.portfolio.closed_trades
+            if t.get('exit_time', '').startswith(today_str)
+            or t.get('timestamp', '').startswith(today_str))
+        self.daily_trade_count += len(self.portfolio.positions)
+        if self.daily_trade_count > 0:
+            logger.info(f"  RESTART_SAFE: Recovered daily_trade_count={self.daily_trade_count} from portfolio state")
         self.exit_history = []          # [{symbol, direction, time}] for re-entry cooldown
         self.ghost_zone_losses = {}     # {(symbol, 'CE'/'PE'): datetime}
         self._vix_cache = {'value': None, 'time': None}
@@ -2860,6 +2868,34 @@ class PaperTrader:
                            f"{sig['strike']}{sig_opt_type} — already held @ {same_strat_dup[0]['strike']}")
                 skipped += 1
                 continue
+
+            # v9.5: Same strategy + same direction — check CLOSED trades too (one shot per day)
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            same_strat_closed = [t for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str)
+                and t.get('symbol') == sig['symbol']
+                and t.get('strategy') == sig['strategy']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type]
+            if same_strat_closed:
+                logger.info(f"  SKIP_STRAT_DIR: {sig['strategy']} already traded "
+                           f"{sig['symbol']} {sig_opt_type} today ({len(same_strat_closed)} time(s))")
+                skipped += 1
+                continue
+
+            # v9.5: Max same-direction trades per symbol per day (across all strategies)
+            today_same_dir = sum(1 for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str)
+                and t.get('symbol') == sig['symbol']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type)
+            today_same_dir += sum(1 for p in self.portfolio.positions
+                if p['symbol'] == sig['symbol']
+                and ('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
+            if today_same_dir >= MAX_SAME_DIRECTION_PER_SYMBOL:
+                logger.info(f"  SKIP_DIR_CAP: {sig['symbol']} {sig_opt_type} — "
+                           f"{today_same_dir} trades today (max {MAX_SAME_DIRECTION_PER_SYMBOL})")
+                skipped += 1
+                continue
+
             # Different strategy holding same direction = confirmation, allow entry
             diff_strat_same_dir = [p for p in self.portfolio.positions
                                    if p['symbol'] == sig['symbol']
@@ -2952,29 +2988,40 @@ class PaperTrader:
             logger.info(f"  STRAT_USAGE: {strat_name} using Rs {strat_used:,.0f} "
                        f"(target {strat_target_pct:.0f}% of Rs {EQUITY_CAPITAL:,.0f} pool)")
 
-            # ---- v2.3: Re-entry cooldown check ----
+            # ---- v2.3: Re-entry cooldown check (v9.5: escalating + elif fix) ----
             now = datetime.now()
             cooldown_hit = False
+
+            # v9.5: Escalating cooldown — count today's same-direction losses
+            today_str_cd = datetime.now().strftime('%Y-%m-%d')
+            dir_losses = sum(1 for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str_cd)
+                and t.get('symbol') == sig['symbol']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type
+                and (t.get('net_pnl', 0) < 0 or
+                     (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
+            escalated_cooldown = REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
+
             for eh in self.exit_history:
                 if eh['symbol'] == sig['symbol']:
                     elapsed = (now - eh['time']).total_seconds()
-                    # v9.2: DIRECTION_FLIP exits block ANY direction re-entry for 15 min
-                    # (prevents CE→PE→CE→PE churn). Normal exits block same-direction only.
-                    if eh.get('reason') == 'DIRECTION_FLIP':
-                        if elapsed < DIRECTION_FLIP_COOLDOWN_SECONDS:
-                            logger.info(f"  SKIP_FLIP_COOLDOWN: {sig['symbol']} {sig_opt_type} — "
-                                       f"DIRECTION_FLIP exit {int(elapsed)}s ago "
-                                       f"(need {DIRECTION_FLIP_COOLDOWN_SECONDS}s any direction)")
-                            skipped += 1
-                            cooldown_hit = True
-                            break
-                    elif eh['direction'] == sig_opt_type:
-                        if elapsed < REENTRY_COOLDOWN_SECONDS:
-                            logger.info(f"  SKIP_COOLDOWN: {sig['symbol']} {sig_opt_type} exited {int(elapsed)}s ago "
-                                       f"(need {REENTRY_COOLDOWN_SECONDS}s)")
-                            skipped += 1
-                            cooldown_hit = True
-                            break
+                    # v9.5 fix: Two independent checks (was elif — bug where expired FLIP blocked nothing)
+                    # DIRECTION_FLIP exits block ANY direction re-entry for 15 min
+                    if eh.get('reason') == 'DIRECTION_FLIP' and elapsed < DIRECTION_FLIP_COOLDOWN_SECONDS:
+                        logger.info(f"  SKIP_FLIP_COOLDOWN: {sig['symbol']} {sig_opt_type} — "
+                                   f"DIRECTION_FLIP exit {int(elapsed)}s ago "
+                                   f"(need {DIRECTION_FLIP_COOLDOWN_SECONDS}s any direction)")
+                        skipped += 1
+                        cooldown_hit = True
+                        break
+                    # Same-direction cooldown with escalation based on losses
+                    if eh['direction'] == sig_opt_type and elapsed < escalated_cooldown:
+                        cd_label = "SKIP_ESCALATED_COOLDOWN" if dir_losses > 0 else "SKIP_COOLDOWN"
+                        logger.info(f"  {cd_label}: {sig['symbol']} {sig_opt_type} exited {int(elapsed)}s ago "
+                                   f"(need {int(escalated_cooldown)}s, {dir_losses} prior losses)")
+                        skipped += 1
+                        cooldown_hit = True
+                        break
             if cooldown_hit:
                 continue
 

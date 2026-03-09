@@ -184,6 +184,7 @@ MCX_GRACE_PERIOD_SECONDS = 180     # v7.6: 3 min (was 10 min — missed fast spi
 MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
 MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
 MCX_MAX_TRADES_PER_DAY = 12           # Hard cap on daily commodity trades
+MCX_MAX_SAME_DIRECTION_PER_COMMODITY = 3  # v9.5: Max BUY_CE or BUY_PE per commodity per day
 MCX_MIN_OI_EXIT_PNL = 50              # Min Rs 50 PnL to allow OI/IV exit (covers 2x MCX brokerage)
 
 # MCX Trading costs
@@ -235,6 +236,69 @@ def black76_greeks(F, K, T, r, sigma, opt_type='CE'):
     vega = F * np.sqrt(T) * norm.pdf(d1) * disc / 100
     return {'price': max(price, 0.01), 'delta': delta, 'gamma': gamma,
             'theta': theta, 'vega': vega, 'iv': sigma}
+
+
+def select_optimal_mcx_strike(spot, strike_int, T, r, iv, opt_type, min_premium=5.0):
+    """v9.5: Select best strike using delta+gamma optimization.
+
+    Evaluates 5 candidate strikes (ATM-2 to ATM+2) and picks the one with:
+    - Delta closest to 0.50 (sweet spot for directional trades)
+    - Highest gamma (maximum acceleration)
+    - Premium above minimum threshold
+
+    Args:
+        spot: Current spot/futures price
+        strike_int: Strike interval (e.g., 50 for CRUDEOILM)
+        T: Time to expiry in years
+        r: Risk-free rate
+        iv: Implied volatility (decimal)
+        opt_type: 'CE' or 'PE'
+        min_premium: Minimum premium filter (default Rs 5)
+
+    Returns:
+        dict: {strike, greeks} where greeks is the black76_greeks output for the chosen strike
+    """
+    atm = round(spot / strike_int) * strike_int
+    candidates = [atm + i * strike_int for i in range(-2, 3)]
+
+    best_strike = atm
+    best_score = -1
+    best_greeks = None
+
+    for strike in candidates:
+        g = black76_greeks(spot, strike, T, r, iv, opt_type)
+        delta = abs(g['delta'])
+        gamma = g['gamma']
+        premium = g['price']
+
+        if premium < min_premium:
+            continue  # too cheap, skip
+
+        # Delta score: peak at 0.50, drops off linearly
+        # delta=0.50 → score=1.0, delta=0.30 or 0.70 → score=0.0
+        delta_score = max(0, 1 - abs(delta - 0.50) * 5)
+
+        # Gamma score: normalize (gamma typically 0.0001-0.001 for commodities)
+        gamma_score = gamma * 10000
+
+        # Premium penalty: slightly penalize very expensive deep ITM options
+        premium_penalty = max(0, (premium - 500) * 0.001) if premium > 500 else 0
+
+        # Weighted score: delta (40%) + gamma (40%) + premium reasonableness (20%)
+        score = delta_score * 40 + gamma_score * 40 + max(0, 1 - premium_penalty) * 20
+
+        if score > best_score:
+            best_score = score
+            best_strike = strike
+            best_greeks = g
+
+    # Fallback: if no candidate passed, use ATM
+    if best_greeks is None:
+        best_greeks = black76_greeks(spot, atm, T, r, iv, opt_type)
+        best_strike = atm
+        logger.debug(f"  GREEKS_STRIKE: Fallback to ATM={atm} (no candidate passed min_premium)")
+
+    return {'strike': best_strike, 'greeks': best_greeks}
 
 
 def implied_vol_b76(market_price, F, K, T, r, opt_type='CE', max_iter=50, tol=1e-4):
@@ -899,24 +963,32 @@ class CommodityStrategyEngine:
 
         if ind['cpr_width'] < 0.4:
             if spot > ind['tc']:
-                ce_strike = round(spot / strike_int) * strike_int
-                g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
+                # v9.5: Greeks-based strike selection (best delta + highest gamma)
+                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
+                ce_strike = opt['strike']
+                g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    logger.info(f"  GREEKS_STRIKE: {commodity} CE ATM={round(spot/strike_int)*strike_int} "
+                               f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
                     signals.append({
                         'type': 'BUY_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bullish breakout",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.4
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
                     })
             elif spot < ind['bc']:
-                pe_strike = round(spot / strike_int) * strike_int
-                g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
+                # v9.5: Greeks-based strike selection (best delta + highest gamma)
+                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
+                pe_strike = opt['strike']
+                g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    logger.info(f"  GREEKS_STRIKE: {commodity} PE ATM={round(spot/strike_int)*strike_int} "
+                               f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
                     signals.append({
                         'type': 'BUY_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bearish breakout",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.4
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
                     })
 
         elif ind['cpr_width'] > 0.6:
@@ -961,24 +1033,32 @@ class CommodityStrategyEngine:
         body = spot - ohlc['open']
         if abs(body) > atr * 0.2:
             if body > 0:
-                ce_strike = round(spot / strike_int) * strike_int
-                g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv * 1.2, 'CE')
+                # v9.5: Greeks-based strike selection (best delta + highest gamma)
+                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * 1.2, 'CE', MCX_MIN_PREMIUM_BUY)
+                ce_strike = opt['strike']
+                g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    logger.info(f"  GREEKS_STRIKE: {commodity} CE(Gamma) ATM={round(spot/strike_int)*strike_int} "
+                               f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
                     signals.append({
                         'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Gamma Blast: Up breakout body={body:.1f}",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.3
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
                     })
             else:
-                pe_strike = round(spot / strike_int) * strike_int
-                g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv * 1.2, 'PE')
+                # v9.5: Greeks-based strike selection (best delta + highest gamma)
+                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * 1.2, 'PE', MCX_MIN_PREMIUM_BUY)
+                pe_strike = opt['strike']
+                g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    logger.info(f"  GREEKS_STRIKE: {commodity} PE(Gamma) ATM={round(spot/strike_int)*strike_int} "
+                               f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
                     signals.append({
                         'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
                         'reason': f"Gamma Blast: Down breakout body={body:.1f}",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,  # v7.6: Was 2.5x/0.3
+                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
                     })
         return signals
 
@@ -1463,7 +1543,14 @@ class CommodityPaperTrader:
         self.daily_signal_count = 0
         self.daily_signals_all = []  # ALL signals (including skipped) for dummy PnL
         # v2.3: Trade quality tracking
-        self.daily_trade_count = 0
+        # v9.5: Reconstruct daily_trade_count from portfolio state (restart-safe)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        self.daily_trade_count = sum(1 for t in self.portfolio.closed_trades
+            if t.get('exit_time', '').startswith(today_str)
+            or t.get('timestamp', '').startswith(today_str))
+        self.daily_trade_count += len(self.portfolio.positions)
+        if self.daily_trade_count > 0:
+            logger.info(f"  MCX_RESTART_SAFE: Recovered daily_trade_count={self.daily_trade_count} from portfolio state")
         self.exit_history = []          # [{commodity, direction, time}] for re-entry cooldown
         self.ghost_zone_losses = {}     # {(commodity, 'CE'/'PE'): datetime}
 
@@ -2073,6 +2160,34 @@ class CommodityPaperTrader:
                            f"{sig['strike']}{sig_opt_type} — already held @ {same_strat_dup[0]['strike']}")
                 skipped += 1
                 continue
+
+            # v9.5: Same strategy + same direction — check CLOSED trades too (one shot per day)
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            same_strat_closed = [t for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str)
+                and t.get('commodity') == sig['commodity']
+                and t.get('strategy') == sig['strategy']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type]
+            if same_strat_closed:
+                logger.info(f"  SKIP_STRAT_DIR: {sig['strategy']} already traded "
+                           f"{sig['commodity']} {sig_opt_type} today ({len(same_strat_closed)} time(s))")
+                skipped += 1
+                continue
+
+            # v9.5: Max same-direction trades per commodity per day (across all strategies)
+            today_same_dir = sum(1 for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str)
+                and t.get('commodity') == sig['commodity']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type)
+            today_same_dir += sum(1 for p in self.portfolio.positions
+                if p['commodity'] == sig['commodity']
+                and ('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
+            if today_same_dir >= MCX_MAX_SAME_DIRECTION_PER_COMMODITY:
+                logger.info(f"  SKIP_DIR_CAP: {sig['commodity']} {sig_opt_type} — "
+                           f"{today_same_dir} trades today (max {MCX_MAX_SAME_DIRECTION_PER_COMMODITY})")
+                skipped += 1
+                continue
+
             diff_strat_same_dir = [p for p in self.portfolio.positions
                                    if p['commodity'] == sig['commodity']
                                    and abs(p['strike'] - sig['strike']) <= tol
@@ -2147,15 +2262,27 @@ class CommodityPaperTrader:
             logger.info(f"  STRAT_USAGE: {strat_name} using Rs {strat_used:,.0f} "
                        f"(target {strat_target_pct:.0f}% of Rs {COMMODITY_CAPITAL:,.0f} pool)")
 
-            # ---- v2.3: Re-entry cooldown check ----
+            # ---- v2.3: Re-entry cooldown check (v9.5: escalating) ----
             now = datetime.now()
             cooldown_hit = False
+
+            # v9.5: Escalating cooldown — count today's same-direction losses
+            today_str_cd = datetime.now().strftime('%Y-%m-%d')
+            dir_losses = sum(1 for t in self.portfolio.closed_trades
+                if t.get('exit_time', '').startswith(today_str_cd)
+                and t.get('commodity') == sig['commodity']
+                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type
+                and (t.get('net_pnl', 0) < 0 or
+                     (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
+            escalated_cooldown = MCX_REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
+
             for eh in self.exit_history:
                 if eh['commodity'] == sig['commodity'] and eh['direction'] == sig_opt_type:
                     elapsed = (now - eh['time']).total_seconds()
-                    if elapsed < MCX_REENTRY_COOLDOWN_SECONDS:
-                        logger.info(f"  SKIP_COOLDOWN: {sig['commodity']} {sig_opt_type} exited {int(elapsed)}s ago "
-                                   f"(need {MCX_REENTRY_COOLDOWN_SECONDS}s)")
+                    if elapsed < escalated_cooldown:
+                        cd_label = "SKIP_ESCALATED_COOLDOWN" if dir_losses > 0 else "SKIP_COOLDOWN"
+                        logger.info(f"  {cd_label}: {sig['commodity']} {sig_opt_type} exited {int(elapsed)}s ago "
+                                   f"(need {int(escalated_cooldown)}s, {dir_losses} prior losses)")
                         skipped += 1
                         cooldown_hit = True
                         break
