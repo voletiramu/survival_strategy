@@ -2225,6 +2225,16 @@ class CommodityPaperTrader:
             # Replace BS premium with real market LTP + compute real Greeks
             bs_premium = sig['premium']
             commodity_greeks = sig['greeks']
+
+            # v9.4: CRITICAL — Skip trade if no real LTP from Angel API
+            # Never enter trades at Black-76 derived pricing (causes phantom PnL)
+            if not real_ltp or real_ltp <= 0:
+                logger.warning(f"  MCX_SKIP_NO_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
+                              f"— no real LTP from Angel API. "
+                              f"Black-76 premium Rs {bs_premium:.2f} rejected. Trade skipped.")
+                skipped += 1
+                continue
+
             if real_ltp and real_ltp > 0:
                 # Preserve target/SL ratios from strategy, apply to real premium
                 if bs_premium > 0:
@@ -2255,9 +2265,6 @@ class CommodityPaperTrader:
                 logger.info(f"  MCX_REAL_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
                            f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
                            f"Target={sig['target']:.2f} SL={sig['sl']:.2f}")
-            else:
-                logger.warning(f"  MCX_REAL_LTP: Unavailable for {sig['commodity']} {sig['strike']}{opt_type}, "
-                              f"using Black-76 premium Rs {bs_premium:.2f}")
 
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],

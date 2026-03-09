@@ -1781,7 +1781,7 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 50)
         fallback_strike = round(spot / strike_interval) * strike_interval
 
-        # Try option chain
+        # Source 1: Angel API option chain (best for strike selection with OI/liquidity)
         if self.angel and self.angel._connected:
             try:
                 expiry = self._get_nearest_expiry(symbol)
@@ -1799,6 +1799,34 @@ class StrategyEngine:
                         return result['strike'], result.get('ltp', 0), result.get('iv', 0)
             except Exception as e:
                 logger.debug(f"Option chain strike lookup failed for {symbol}: {e}")
+
+        # Source 2: v9.4 — Pipeline chain from NSE/BSE (get real LTP for ATM strike)
+        if self.market_pipeline:
+            try:
+                chain = self.market_pipeline.get_option_chain(symbol)
+                if chain:
+                    contracts = chain.get(opt_type, [])
+                    # Find ATM contract closest to spot with real LTP
+                    best = None
+                    best_dist = float('inf')
+                    for c in contracts:
+                        if c.get('ltp', 0) > 0:
+                            dist = abs(c['strike'] - spot)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best = c
+                    if best:
+                        self._strike_cache[cache_key] = {
+                            'strike': best['strike'],
+                            'ltp': best['ltp'],
+                            'iv': best.get('iv', 0),
+                            'time': now,
+                        }
+                        logger.info(f"  PIPELINE_STRIKE: {symbol} {opt_type} "
+                                   f"strike={best['strike']} LTP={best['ltp']:.2f} (from NSE/BSE chain)")
+                        return best['strike'], best['ltp'], best.get('iv', 0)
+            except Exception as e:
+                logger.debug(f"Pipeline strike lookup failed for {symbol}: {e}")
 
         # Fallback — v9.3: Short cache (30s) for ltp=0 so we retry quickly at market open
         self._strike_cache[cache_key] = {
@@ -2427,17 +2455,33 @@ class PaperTrader:
         return 1.0
 
     def _get_option_ltp(self, pos):
-        """Get real-time option LTP for a position, with 15s cache.
-        Returns LTP float or None if unavailable.
+        """Get real-time option LTP for a position. 3-source fallback.
+
+        v9.4: Pipeline chain LTP is primary source (NSE/BSE website data).
+        Angel API is secondary. Returns None if both unavailable.
         """
+        symbol = pos['symbol']
+        opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+
+        # Source 1: Pipeline chain LTP from NSE/BSE (most reliable, no API auth needed)
+        try:
+            if self.market_pipeline:
+                chain = self.market_pipeline.get_option_chain(symbol)
+                if chain:
+                    contracts = chain.get(opt_type, [])
+                    for c in contracts:
+                        if c.get('strike') == pos['strike'] and c.get('ltp', 0) > 0:
+                            return c['ltp']
+        except Exception as e:
+            logger.debug(f"  Pipeline exit LTP failed for {symbol} {pos['strike']}{opt_type}: {e}")
+
+        # Source 2: Angel API with 15s cache
         details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
         option_token = details.get('option_token')
         exchange = details.get('option_exchange')
 
         # Backfill for positions opened before this fix (no stored token)
         if not option_token:
-            symbol = pos['symbol']
-            opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
             expiry = self._get_nearest_expiry(symbol)
             if expiry:
                 option_info = self.angel.find_option_tokens(symbol, expiry, pos['strike'], opt_type)
@@ -2998,14 +3042,32 @@ class PaperTrader:
 
             g = sig['greeks']
 
-            # Fetch entry OI + real option LTP from market data
+            # v9.4: Fetch entry OI + real option LTP — pipeline chain LTP is PRIMARY source
             entry_oi = 0
             option_token = None
             option_exchange = None
             mkt_data = None
             real_ltp = None
+            opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
+
+            # Source 1: Pipeline chain LTP from NSE/BSE website (most reliable)
             try:
-                opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
+                if self.market_pipeline:
+                    chain = self.market_pipeline.get_option_chain(sig['symbol'])
+                    if chain:
+                        contracts = chain.get(opt_type, [])
+                        for c in contracts:
+                            if c.get('strike') == sig['strike'] and c.get('ltp', 0) > 0:
+                                real_ltp = c['ltp']
+                                entry_oi = float(c.get('oi', 0) or 0)
+                                logger.info(f"  PIPELINE_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                                           f"LTP={real_ltp:.2f} OI={entry_oi} (from NSE/BSE chain)")
+                                break
+            except Exception as e:
+                logger.debug(f"  Pipeline chain lookup failed for {sig['symbol']}: {e}")
+
+            # Source 2: Angel API (fallback if pipeline didn't have LTP)
+            try:
                 expiry = self._get_nearest_expiry(sig['symbol'])
                 if expiry:
                     option_info = self.angel.find_option_tokens(
@@ -3016,18 +3078,30 @@ class PaperTrader:
                         option_exchange = 'BFO' if sig['symbol'] == 'SENSEX' else 'NFO'
                         mkt_data = self.angel.get_market_data(option_exchange, option_token)
                         if mkt_data:
-                            entry_oi = float(mkt_data.get('opnInterest', mkt_data.get('oi', 0)) or 0)
+                            if not entry_oi:
+                                entry_oi = float(mkt_data.get('opnInterest', mkt_data.get('oi', 0)) or 0)
                             logger.info(f"  ENTRY_OI: {sig['symbol']} {sig['strike']}{opt_type} OI={entry_oi}")
-                            # Extract real option LTP from same API response (zero extra calls)
-                            fetched_ltp = float(mkt_data.get('ltp', 0) or 0)
-                            if fetched_ltp > 0:
-                                real_ltp = fetched_ltp
+                            # Use Angel LTP only if pipeline didn't provide one
+                            if not real_ltp:
+                                fetched_ltp = float(mkt_data.get('ltp', 0) or 0)
+                                if fetched_ltp > 0:
+                                    real_ltp = fetched_ltp
+                                    logger.info(f"  ANGEL_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                                               f"LTP={real_ltp:.2f} (Angel API fallback)")
             except Exception as e:
                 logger.info(f"  OI/LTP fetch at entry failed for {sig['symbol']}: {e}")
 
-            # Replace BS premium with real market LTP + compute real Greeks
-            # v7.3: Always use LIVE market price — no BS-derived pricing in live trading
+            # v9.4: CRITICAL — Skip trade if no real LTP from ANY source
+            # Never enter trades at BS-derived pricing (causes phantom PnL)
             bs_premium = sig['premium']
+            if not real_ltp or real_ltp <= 0:
+                logger.warning(f"  SKIP_NO_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                              f"— no real LTP from pipeline or Angel API. "
+                              f"BS premium Rs {bs_premium:.2f} rejected. Trade skipped.")
+                skipped += 1
+                continue
+
+            # Replace BS premium with real market LTP + compute real Greeks
             if real_ltp and real_ltp > 0:
                 # Log BS vs Market gap for monitoring (info only, never reject)
                 if bs_premium > 0:
@@ -3066,9 +3140,6 @@ class PaperTrader:
                 logger.info(f"  REAL_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
                            f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
                            f"Target={sig['target']:.2f} SL={sig['sl']:.2f}")
-            else:
-                logger.warning(f"  REAL_LTP: Unavailable for {sig['symbol']} {sig['strike']}{opt_type}, "
-                              f"using BS premium Rs {bs_premium:.2f}")
 
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
