@@ -45,7 +45,7 @@ def simulate_anti_churn():
         trades = [t for t in data.get('closed_trades', [])
                   if t.get('timestamp', '').startswith('2026-03-09')]
         trades.sort(key=lambda t: t.get('timestamp', ''))
-        results['commodity'] = simulate_bot_antichurn(trades, 'commodity', max_dir=3)
+        results['commodity'] = simulate_bot_antichurn(trades, 'commodity', max_dir=5)
 
     # --- Equity trades ---
     eq_path = os.path.join(BACKTEST_DIR, 'equity_portfolio_mar9.json')
@@ -55,7 +55,7 @@ def simulate_anti_churn():
         trades = [t for t in data.get('closed_trades', [])
                   if t.get('timestamp', '').startswith('2026-03-09')]
         trades.sort(key=lambda t: t.get('timestamp', ''))
-        results['equity'] = simulate_bot_antichurn(trades, 'equity', max_dir=3)
+        results['equity'] = simulate_bot_antichurn(trades, 'equity', max_dir=5)
 
     # --- Summary ---
     print("\n" + "-" * 60)
@@ -73,15 +73,23 @@ def simulate_anti_churn():
     return results
 
 
-def simulate_bot_antichurn(trades, bot_type, max_dir=3):
-    """Apply v9.5 anti-churn gates to a list of actual trades."""
+def simulate_bot_antichurn(trades, bot_type, max_dir=5):
+    """Apply v9.5 score-based anti-churn gates to a list of actual trades.
+
+    New approach: Instead of hard-blocking same strategy+direction,
+    escalate the score threshold. Score=0 signals (from indicators=None bug)
+    get blocked. High-score re-entries are allowed.
+    """
     print(f"\n  --- {bot_type.upper()} BOT: {len(trades)} trades ---")
 
+    MIN_SCORE = 50
+    SCORE_ESCALATION = 15
     COOLDOWN_BASE = 600  # 10 min
+
     allowed = []
     blocked = []
-    # Track: {(symbol, strategy, direction)} -> bool (already traded)
-    strat_dir_used = set()
+    # Track: {(symbol, strategy, direction)} -> count of prior trades
+    strat_dir_count = Counter()
     # Track: {(symbol, direction)} -> count
     dir_count = Counter()
     # Track exits for cooldown: [(symbol, direction, exit_time, was_loss)]
@@ -94,6 +102,7 @@ def simulate_bot_antichurn(trades, bot_type, max_dir=3):
         direction = 'CE' if 'CE' in sig_type else 'PE'
         entry_time = t.get('timestamp', '')
         exit_time = t.get('exit_time', '')
+        score = t.get('quality_score', 0)
 
         # Compute PnL
         entry_p = float(t.get('entry_premium', 0))
@@ -105,20 +114,29 @@ def simulate_bot_antichurn(trades, bot_type, max_dir=3):
         trade_info = {
             'symbol': symbol, 'strategy': strategy, 'direction': direction,
             'entry': entry_time[:16], 'exit': exit_time[:16],
-            'pnl': pnl, 'reason': t.get('exit_reason', '?')
+            'pnl': pnl, 'reason': t.get('exit_reason', '?'),
+            'score': score,
         }
 
-        # Gate 1: Same strategy + same direction already traded today
+        # Gate 0: MANDATORY score check (fixes indicators=None bypass bug)
+        # On March 9, only the first signal had score=75, rest had score=0
+        # because compute_indicators() returned None and the check was skipped
         key1 = (symbol, strategy, direction)
-        if key1 in strat_dir_used:
-            trade_info['block_reason'] = 'SKIP_STRAT_DIR'
+        reentry_count = strat_dir_count[key1]
+        escalated_min = MIN_SCORE + (reentry_count * SCORE_ESCALATION)
+
+        if score < escalated_min:
+            if score == 0:
+                trade_info['block_reason'] = f'SKIP_NO_SCORE (score=0, indicators=None bug)'
+            else:
+                trade_info['block_reason'] = (f'SKIP_REENTRY_SCORE (score={score} < '
+                                              f'{escalated_min}, reentry #{reentry_count+1})')
             blocked.append(trade_info)
-            # Still log exit for cooldown
             is_loss = pnl < 0
             exit_log.append((symbol, direction, exit_time, is_loss))
             continue
 
-        # Gate 2: Max same-direction per symbol
+        # Gate 1: Max same-direction per symbol (hard safety cap)
         key2 = (symbol, direction)
         if dir_count[key2] >= max_dir:
             trade_info['block_reason'] = 'SKIP_DIR_CAP'
@@ -127,7 +145,7 @@ def simulate_bot_antichurn(trades, bot_type, max_dir=3):
             exit_log.append((symbol, direction, exit_time, is_loss))
             continue
 
-        # Gate 3: Escalating cooldown
+        # Gate 2: Escalating cooldown
         dir_losses = sum(1 for s, d, et, loss in exit_log
                         if s == symbol and d == direction and loss)
         escalated = COOLDOWN_BASE * (2 ** min(dir_losses, 4))
@@ -152,9 +170,9 @@ def simulate_bot_antichurn(trades, bot_type, max_dir=3):
             exit_log.append((symbol, direction, exit_time, is_loss))
             continue
 
-        # Allowed
+        # Allowed — score meets threshold
         allowed.append(trade_info)
-        strat_dir_used.add(key1)
+        strat_dir_count[key1] += 1
         dir_count[key2] += 1
         is_loss = pnl < 0
         exit_log.append((symbol, direction, exit_time, is_loss))
@@ -163,14 +181,29 @@ def simulate_bot_antichurn(trades, bot_type, max_dir=3):
     print(f"    Allowed ({len(allowed)}):")
     for a in allowed:
         print(f"      ✓ {a['entry']} {a['symbol']} {a['strategy']} {a['direction']} "
-              f"PnL={a['pnl']:+,.0f} ({a['reason']})")
+              f"score={a['score']} PnL={a['pnl']:+,.0f} ({a['reason']})")
 
     if blocked:
         print(f"    Blocked ({len(blocked)}):")
-        block_reasons = Counter(b['block_reason'] for b in blocked)
-        for reason, cnt in block_reasons.most_common():
-            pnl_sum = sum(b['pnl'] for b in blocked if b['block_reason'] == reason)
-            print(f"      ✗ {reason}: {cnt} trades (PnL that would have been: {pnl_sum:+,.0f})")
+        # Group by block reason prefix
+        block_groups = defaultdict(list)
+        for b in blocked:
+            # Simplify reason for grouping
+            reason = b['block_reason']
+            if reason.startswith('SKIP_NO_SCORE'):
+                group = 'SKIP_NO_SCORE (indicators=None bug fix)'
+            elif reason.startswith('SKIP_REENTRY_SCORE'):
+                group = 'SKIP_REENTRY_SCORE (escalated threshold)'
+            elif reason.startswith('SKIP_COOLDOWN'):
+                group = 'SKIP_COOLDOWN (escalating timer)'
+            else:
+                group = reason
+            block_groups[group].append(b)
+
+        for group, trades_in_group in block_groups.items():
+            pnl_sum = sum(b['pnl'] for b in trades_in_group)
+            print(f"      ✗ {group}: {len(trades_in_group)} trades "
+                  f"(PnL avoided: {pnl_sum:+,.0f})")
 
     return {'total': len(trades), 'allowed': allowed, 'blocked': blocked}
 

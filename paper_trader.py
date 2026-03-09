@@ -147,7 +147,8 @@ GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry 
 REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
 DIRECTION_FLIP_COOLDOWN_SECONDS = 900  # v9.2: 15 min after DIRECTION_FLIP, no re-entry ANY direction
 MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
-MAX_SAME_DIRECTION_PER_SYMBOL = 3  # v9.5: Max BUY_CE or BUY_PE per symbol per day (across all strategies)
+MAX_SAME_DIRECTION_PER_SYMBOL = 5  # v9.5: Max BUY_CE or BUY_PE per symbol per day (across all strategies)
+SCORE_ESCALATION_PER_REENTRY = 15  # v9.5: Each re-entry same strat+dir needs +15 score
 MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x brokerage)
 
 # v7.5: Trailing Stop Loss — based on PREMIUM GAIN % (not target distance %)
@@ -2869,20 +2870,24 @@ class PaperTrader:
                 skipped += 1
                 continue
 
-            # v9.5: Same strategy + same direction — check CLOSED trades too (one shot per day)
+            # v9.5: Count prior same-strategy+direction trades today (for score escalation)
             today_str = datetime.now().strftime('%Y-%m-%d')
             same_strat_closed = [t for t in self.portfolio.closed_trades
                 if t.get('exit_time', '').startswith(today_str)
                 and t.get('symbol') == sig['symbol']
                 and t.get('strategy') == sig['strategy']
                 and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type]
-            if same_strat_closed:
-                logger.info(f"  SKIP_STRAT_DIR: {sig['strategy']} already traded "
-                           f"{sig['symbol']} {sig_opt_type} today ({len(same_strat_closed)} time(s))")
-                skipped += 1
-                continue
+            reentry_count = len(same_strat_closed)
 
-            # v9.5: Max same-direction trades per symbol per day (across all strategies)
+            # v9.5: Escalating score threshold — each re-entry needs higher conviction
+            # 1st: MIN_SIGNAL_SCORE (50), 2nd: +15 (65), 3rd: +30 (80), 4th: +45 (95)
+            escalated_min_score = MIN_SIGNAL_SCORE + (reentry_count * SCORE_ESCALATION_PER_REENTRY)
+            sig['_escalated_min_score'] = escalated_min_score
+            if reentry_count > 0:
+                logger.info(f"  REENTRY #{reentry_count+1}: {sig['strategy']} {sig['symbol']} {sig_opt_type} "
+                           f"— need score >= {escalated_min_score} (base {MIN_SIGNAL_SCORE} + {reentry_count}x{SCORE_ESCALATION_PER_REENTRY})")
+
+            # v9.5: Max same-direction trades per symbol per day (hard safety cap across all strategies)
             today_same_dir = sum(1 for t in self.portfolio.closed_trades
                 if t.get('exit_time', '').startswith(today_str)
                 and t.get('symbol') == sig['symbol']
@@ -3062,18 +3067,27 @@ class PaperTrader:
                             skipped += 1
                             continue
 
-            # ---- v2.3: Signal quality score check ----
+            # ---- v9.5: Signal quality score check (MANDATORY — no bypass) ----
+            min_score_required = sig.get('_escalated_min_score', MIN_SIGNAL_SCORE)
             indicators = self.engine.compute_indicators(sig['symbol'],
                          self.get_intraday_ohlc(sig['symbol']) or
                          {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
             if indicators:
                 score = compute_signal_score(sig, sig['spot'], indicators, self.current_vix)
                 sig['quality_score'] = score
-                if score < MIN_SIGNAL_SCORE:
-                    logger.info(f"  SKIP_QUALITY: {sig['symbol']} {sig['type']} score={score} < {MIN_SIGNAL_SCORE}")
+                if score < min_score_required:
+                    logger.info(f"  SKIP_QUALITY: {sig['symbol']} {sig['type']} score={score} < {min_score_required}"
+                               f"{' (escalated)' if min_score_required > MIN_SIGNAL_SCORE else ''}")
                     skipped += 1
                     continue
-                logger.info(f"  QUALITY_SCORE: {sig['symbol']} {sig['type']} score={score}/100")
+                logger.info(f"  QUALITY_SCORE: {sig['symbol']} {sig['type']} score={score}/100"
+                           f" (min required: {min_score_required})")
+            else:
+                # v9.5 FIX: indicators unavailable — BLOCK trade (was silently bypassing score check)
+                logger.warning(f"  SKIP_NO_INDICATORS: {sig['symbol']} {sig['type']} "
+                              f"— cannot compute quality score, trade blocked")
+                skipped += 1
+                continue
 
             # ---- v2.3: Profit filter check ----
             lot_size = LOT_SIZES.get(sig['symbol'], 50)

@@ -184,7 +184,8 @@ MCX_GRACE_PERIOD_SECONDS = 180     # v7.6: 3 min (was 10 min — missed fast spi
 MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
 MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
 MCX_MAX_TRADES_PER_DAY = 12           # Hard cap on daily commodity trades
-MCX_MAX_SAME_DIRECTION_PER_COMMODITY = 3  # v9.5: Max BUY_CE or BUY_PE per commodity per day
+MCX_MAX_SAME_DIRECTION_PER_COMMODITY = 5  # v9.5: Max BUY_CE or BUY_PE per commodity per day
+MCX_SCORE_ESCALATION_PER_REENTRY = 15    # v9.5: Each re-entry same strat+dir needs +15 score
 MCX_MIN_OI_EXIT_PNL = 50              # Min Rs 50 PnL to allow OI/IV exit (covers 2x MCX brokerage)
 
 # MCX Trading costs
@@ -2161,20 +2162,24 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
-            # v9.5: Same strategy + same direction — check CLOSED trades too (one shot per day)
+            # v9.5: Count prior same-strategy+direction trades today (for score escalation)
             today_str = datetime.now().strftime('%Y-%m-%d')
             same_strat_closed = [t for t in self.portfolio.closed_trades
                 if t.get('exit_time', '').startswith(today_str)
                 and t.get('commodity') == sig['commodity']
                 and t.get('strategy') == sig['strategy']
                 and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type]
-            if same_strat_closed:
-                logger.info(f"  SKIP_STRAT_DIR: {sig['strategy']} already traded "
-                           f"{sig['commodity']} {sig_opt_type} today ({len(same_strat_closed)} time(s))")
-                skipped += 1
-                continue
+            reentry_count = len(same_strat_closed)
 
-            # v9.5: Max same-direction trades per commodity per day (across all strategies)
+            # v9.5: Escalating score threshold — each re-entry needs higher conviction
+            # 1st trade: MCX_MIN_SIGNAL_SCORE (50), 2nd: +15 (65), 3rd: +30 (80), 4th: +45 (95)
+            escalated_min_score = MCX_MIN_SIGNAL_SCORE + (reentry_count * MCX_SCORE_ESCALATION_PER_REENTRY)
+            sig['_escalated_min_score'] = escalated_min_score  # Pass to score check below
+            if reentry_count > 0:
+                logger.info(f"  REENTRY #{reentry_count+1}: {sig['strategy']} {sig['commodity']} {sig_opt_type} "
+                           f"— need score >= {escalated_min_score} (base {MCX_MIN_SIGNAL_SCORE} + {reentry_count}x{MCX_SCORE_ESCALATION_PER_REENTRY})")
+
+            # v9.5: Max same-direction trades per commodity per day (hard safety cap across all strategies)
             today_same_dir = sum(1 for t in self.portfolio.closed_trades
                 if t.get('exit_time', '').startswith(today_str)
                 and t.get('commodity') == sig['commodity']
@@ -2299,17 +2304,26 @@ class CommodityPaperTrader:
                         skipped += 1
                         continue
 
-            # ---- v2.3: Signal quality score check ----
+            # ---- v9.5: Signal quality score check (MANDATORY — no bypass) ----
+            min_score_required = sig.get('_escalated_min_score', MCX_MIN_SIGNAL_SCORE)
             indicators = self.engine.compute_indicators(sig['commodity'],
                          {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
             if indicators:
                 score = mcx_compute_signal_score(sig, sig['spot'], indicators)
                 sig['quality_score'] = score
-                if score < MCX_MIN_SIGNAL_SCORE:
-                    logger.info(f"  SKIP_QUALITY: {sig['commodity']} {sig['type']} score={score} < {MCX_MIN_SIGNAL_SCORE}")
+                if score < min_score_required:
+                    logger.info(f"  SKIP_QUALITY: {sig['commodity']} {sig['type']} score={score} < {min_score_required}"
+                               f"{' (escalated)' if min_score_required > MCX_MIN_SIGNAL_SCORE else ''}")
                     skipped += 1
                     continue
-                logger.info(f"  QUALITY_SCORE: {sig['commodity']} {sig['type']} score={score}/100")
+                logger.info(f"  QUALITY_SCORE: {sig['commodity']} {sig['type']} score={score}/100"
+                           f" (min required: {min_score_required})")
+            else:
+                # v9.5 FIX: indicators unavailable — BLOCK trade (was silently bypassing score check)
+                logger.warning(f"  SKIP_NO_INDICATORS: {sig['commodity']} {sig['type']} "
+                              f"— cannot compute quality score, trade blocked")
+                skipped += 1
+                continue
 
             # ---- v2.3: Profit filter check ----
             is_sell = 'SELL' in sig['type']

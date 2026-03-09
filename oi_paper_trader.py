@@ -47,7 +47,8 @@ MAX_DAILY_LOSS = 30000              # Rs 30K daily loss limit (10% of capital)
 MAX_TRADES_PER_DAY = 10             # Hard cap
 MIN_SIGNAL_SCORE = 50               # Quality threshold
 OI_REENTRY_COOLDOWN_SECONDS = 600   # v9.5: 10 min after any exit, same symbol+direction
-OI_MAX_SAME_DIRECTION_PER_SYMBOL = 3  # v9.5: Max BUY_CE or BUY_PE per symbol per day
+OI_MAX_SAME_DIRECTION_PER_SYMBOL = 5  # v9.5: Max BUY_CE or BUY_PE per symbol per day
+OI_SCORE_ESCALATION_PER_REENTRY = 15  # v9.5: Each re-entry same strat+dir needs +15 score
 
 # Transaction costs
 BROKERAGE = 20                      # Rs 20 per order
@@ -633,16 +634,26 @@ class OIPaperTrader:
 
             sig_opt_type = 'CE' if 'CE' in sig.get('signal_type', '') else 'PE'
 
-            # --- v9.5 Anti-churn gate 1: Same strategy + same direction already traded today ---
+            # --- v9.5 Anti-churn gate 1: Score escalation for re-entries ---
             today_str = now.strftime('%Y-%m-%d')
             same_strat_closed = [t for t in self.portfolio.closed_trades
                 if t.get('exit_time', '').startswith(today_str)
                 and t.get('symbol') == sig['symbol']
                 and t.get('strategy') == sig.get('strategy_type', '')
                 and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type]
-            if same_strat_closed:
-                logger.info(f"  SKIP_STRAT_DIR: {sig.get('strategy_type','')} already traded "
-                           f"{sig['symbol']} {sig_opt_type} today ({len(same_strat_closed)} time(s))")
+            reentry_count = len(same_strat_closed)
+
+            # Escalating score threshold: 1st=50, 2nd=65, 3rd=80, 4th=95
+            escalated_min_score = MIN_SIGNAL_SCORE + (reentry_count * OI_SCORE_ESCALATION_PER_REENTRY)
+            sig_score = sig.get('quality_score', 0)
+            if sig_score < escalated_min_score:
+                if reentry_count > 0:
+                    logger.info(f"  SKIP_REENTRY_SCORE: {sig.get('strategy_type','')} {sig['symbol']} {sig_opt_type} "
+                               f"score={sig_score} < {escalated_min_score} "
+                               f"(reentry #{reentry_count+1}, need +{reentry_count * OI_SCORE_ESCALATION_PER_REENTRY})")
+                else:
+                    logger.info(f"  SKIP_QUALITY: {sig.get('strategy_type','')} {sig['symbol']} {sig_opt_type} "
+                               f"score={sig_score} < {escalated_min_score}")
                 skipped += 1; continue
 
             # --- v9.5 Anti-churn gate 2: Max same-direction trades per symbol per day ---
