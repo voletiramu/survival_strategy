@@ -3263,9 +3263,24 @@ class PaperTrader:
                 dir_valid, dir_reason, dir_adj = validate_signal_direction(
                     sig['type'], sig['spot'], dir_ohlc, dir_indicators)
                 if not dir_valid:
-                    # v10.2: Direction Flip — trade correct direction instead of just blocking
+                    # v10.2b: Direction Flip — trade correct direction instead of just blocking
+                    # Guard: Don't flip AGAINST the daily EMA trend
+                    # If EMA bullish (9>20), only flip to CE, never to PE
+                    # If EMA bearish (9<20), only flip to PE, never to CE
                     orig_type = sig['type']
+                    ema_9 = dir_indicators.get('ema_9', 0)
+                    ema_20 = dir_indicators.get('ema_20', 0)
+
                     flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
+                    flip_to_pe = 'PE' in flipped_type
+
+                    if ema_9 > 0 and ema_20 > 0:
+                        daily_bullish = ema_9 > ema_20
+                        if (daily_bullish and flip_to_pe) or (not daily_bullish and not flip_to_pe):
+                            logger.info(f"  DIR_REJECT: {sig['symbol']} {orig_type} -- {dir_reason} "
+                                       f"(no flip to {'PE' if flip_to_pe else 'CE'}: "
+                                       f"daily EMA {'bullish' if daily_bullish else 'bearish'})")
+                            skipped += 1; continue
                     flip_valid, flip_reason, flip_adj = validate_signal_direction(
                         flipped_type, sig['spot'], dir_ohlc, dir_indicators)
                     if flip_valid:
