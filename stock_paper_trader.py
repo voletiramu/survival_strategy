@@ -2974,16 +2974,39 @@ class StockPaperTrader:
                     skipped += 1
                     continue
 
+            # ---- v10.1: Pending reverse check (breakout failure → opposite direction fast entry) ----
+            is_reverse_signal = False
+            pending_rev = self.pending_reverses.get(symbol)
+            if pending_rev and pending_rev.get('opt_type') == new_direction:
+                try:
+                    rev_ts = datetime.fromisoformat(pending_rev['timestamp'])
+                    rev_age = (datetime.now() - rev_ts).total_seconds()
+                    if rev_age <= 600:  # 10 min
+                        is_reverse_signal = True
+                        logger.info(f"  REVERSE_MATCH: {symbol} BUY_{new_direction} matches pending reverse "
+                                   f"from {pending_rev.get('source_id', '?')} ({int(rev_age)}s ago) — "
+                                   f"skipping cooldown, score +15")
+                        del self.pending_reverses[symbol]
+                    else:
+                        logger.info(f"  REVERSE_EXPIRED: {symbol} reverse was {int(rev_age)}s ago (>600s), ignoring")
+                        del self.pending_reverses[symbol]
+                except Exception as e:
+                    logger.warning(f"  REVERSE_CHECK_ERR: {symbol} — {e}")
+
             # Re-entry cooldown check (10 min after exit)
+            # v10.1: Reverse signals bypass cooldown entirely
             now = datetime.now()
             in_cooldown = False
-            for eh in self.exit_history:
-                if eh['symbol'] == symbol and eh['direction'] == new_direction:
-                    cooldown_remaining = REENTRY_COOLDOWN_SECONDS - (now - eh['time']).total_seconds()
-                    if cooldown_remaining > 0:
-                        logger.info(f"  COOLDOWN: {symbol} {new_direction} — {cooldown_remaining:.0f}s remaining")
-                        in_cooldown = True
-                        break
+            if not is_reverse_signal:
+                for eh in self.exit_history:
+                    if eh['symbol'] == symbol and eh['direction'] == new_direction:
+                        cooldown_remaining = REENTRY_COOLDOWN_SECONDS - (now - eh['time']).total_seconds()
+                        if cooldown_remaining > 0:
+                            logger.info(f"  COOLDOWN: {symbol} {new_direction} — {cooldown_remaining:.0f}s remaining")
+                            in_cooldown = True
+                            break
+            else:
+                logger.info(f"  REVERSE_COOLDOWN_BYPASS: {symbol} {new_direction} — reverse signal, skipping cooldown")
             if in_cooldown:
                 skipped += 1
                 continue
@@ -3012,6 +3035,10 @@ class StockPaperTrader:
                         continue
                     logger.info(f"  DIR_PASS: {symbol} {signal_type} -- {dir_reason}")
                     score = max(0, min(100, score + dir_adj))
+                    # v10.1: Reverse signal score boost (+15)
+                    if is_reverse_signal:
+                        score = min(100, score + 15)
+                        logger.info(f"  REVERSE_BOOST: {symbol} score {score-15} → {score}")
                     sig['quality_score'] = score
 
             # Get spot and determine strike

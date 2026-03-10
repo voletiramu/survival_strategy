@@ -2568,30 +2568,53 @@ class CommodityPaperTrader:
             logger.info(f"  STRAT_USAGE: {strat_name} using Rs {strat_used:,.0f} "
                        f"(target {strat_target_pct:.0f}% of Rs {COMMODITY_CAPITAL:,.0f} pool)")
 
+            # ---- v10.1: Pending reverse check (breakout failure → opposite direction fast entry) ----
+            is_reverse_signal = False
+            pending_rev = self.pending_reverses.get(sig['commodity'])
+            if pending_rev and pending_rev.get('opt_type') == sig_opt_type:
+                try:
+                    rev_ts = datetime.fromisoformat(pending_rev['timestamp'])
+                    rev_age = (datetime.now() - rev_ts).total_seconds()
+                    if rev_age <= 600:  # 10 min
+                        is_reverse_signal = True
+                        logger.info(f"  REVERSE_MATCH: {sig['commodity']} BUY_{sig_opt_type} matches pending reverse "
+                                   f"from {pending_rev.get('source_id', '?')} ({int(rev_age)}s ago) — "
+                                   f"skipping cooldown, score +15")
+                        del self.pending_reverses[sig['commodity']]
+                    else:
+                        logger.info(f"  REVERSE_EXPIRED: {sig['commodity']} reverse was {int(rev_age)}s ago (>600s), ignoring")
+                        del self.pending_reverses[sig['commodity']]
+                except Exception as e:
+                    logger.warning(f"  REVERSE_CHECK_ERR: {sig['commodity']} — {e}")
+
             # ---- v2.3: Re-entry cooldown check (v9.5: escalating) ----
+            # v10.1: Reverse signals bypass cooldown entirely
+            if is_reverse_signal:
+                logger.info(f"  REVERSE_COOLDOWN_BYPASS: {sig['commodity']} {sig_opt_type} — reverse signal, skipping cooldown")
             now = datetime.now()
             cooldown_hit = False
 
             # v9.5: Escalating cooldown — count today's same-direction losses
-            today_str_cd = datetime.now().strftime('%Y-%m-%d')
-            dir_losses = sum(1 for t in self.portfolio.closed_trades
-                if t.get('exit_time', '').startswith(today_str_cd)
-                and t.get('commodity') == sig['commodity']
-                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type
-                and (t.get('net_pnl', 0) < 0 or
-                     (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
-            escalated_cooldown = MCX_REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
+            if not is_reverse_signal:
+                today_str_cd = datetime.now().strftime('%Y-%m-%d')
+                dir_losses = sum(1 for t in self.portfolio.closed_trades
+                    if t.get('exit_time', '').startswith(today_str_cd)
+                    and t.get('commodity') == sig['commodity']
+                    and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type
+                    and (t.get('net_pnl', 0) < 0 or
+                         (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
+                escalated_cooldown = MCX_REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
 
-            for eh in self.exit_history:
-                if eh['commodity'] == sig['commodity'] and eh['direction'] == sig_opt_type:
-                    elapsed = (now - eh['time']).total_seconds()
-                    if elapsed < escalated_cooldown:
-                        cd_label = "SKIP_ESCALATED_COOLDOWN" if dir_losses > 0 else "SKIP_COOLDOWN"
-                        logger.info(f"  {cd_label}: {sig['commodity']} {sig_opt_type} exited {int(elapsed)}s ago "
-                                   f"(need {int(escalated_cooldown)}s, {dir_losses} prior losses)")
-                        skipped += 1
-                        cooldown_hit = True
-                        break
+                for eh in self.exit_history:
+                    if eh['commodity'] == sig['commodity'] and eh['direction'] == sig_opt_type:
+                        elapsed = (now - eh['time']).total_seconds()
+                        if elapsed < escalated_cooldown:
+                            cd_label = "SKIP_ESCALATED_COOLDOWN" if dir_losses > 0 else "SKIP_COOLDOWN"
+                            logger.info(f"  {cd_label}: {sig['commodity']} {sig_opt_type} exited {int(elapsed)}s ago "
+                                       f"(need {int(escalated_cooldown)}s, {dir_losses} prior losses)")
+                            skipped += 1
+                            cooldown_hit = True
+                            break
             if cooldown_hit:
                 continue
 
@@ -2650,6 +2673,10 @@ class CommodityPaperTrader:
                          {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
             if indicators:
                 score = mcx_compute_signal_score(sig, sig['spot'], indicators, self.current_vix)
+                # v10.1: Reverse signal score boost (+15)
+                if is_reverse_signal:
+                    score = min(100, score + 15)
+                    logger.info(f"  REVERSE_BOOST: {sig['commodity']} score {score-15} → {score}")
                 sig['quality_score'] = score
                 if score < min_score_required:
                     logger.info(f"  SKIP_QUALITY: {sig['commodity']} {sig['type']} score={score} < {min_score_required}"

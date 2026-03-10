@@ -3157,40 +3157,64 @@ class PaperTrader:
             logger.info(f"  STRAT_USAGE: {strat_name} using Rs {strat_used:,.0f} "
                        f"(target {strat_target_pct:.0f}% of Rs {EQUITY_CAPITAL:,.0f} pool)")
 
+            # ---- v10.1: Pending reverse check (breakout failure → opposite direction fast entry) ----
+            is_reverse_signal = False
+            pending_rev = self.pending_reverses.get(sig['symbol'])
+            if pending_rev and pending_rev.get('opt_type') == sig_opt_type:
+                # Check staleness — expire reverses older than 10 min
+                try:
+                    rev_ts = datetime.fromisoformat(pending_rev['timestamp'])
+                    rev_age = (datetime.now() - rev_ts).total_seconds()
+                    if rev_age <= 600:  # 10 min
+                        is_reverse_signal = True
+                        logger.info(f"  REVERSE_MATCH: {sig['symbol']} BUY_{sig_opt_type} matches pending reverse "
+                                   f"from {pending_rev.get('source_id', '?')} ({int(rev_age)}s ago) — "
+                                   f"skipping cooldown, score +15")
+                        del self.pending_reverses[sig['symbol']]
+                    else:
+                        logger.info(f"  REVERSE_EXPIRED: {sig['symbol']} reverse was {int(rev_age)}s ago (>600s), ignoring")
+                        del self.pending_reverses[sig['symbol']]
+                except Exception as e:
+                    logger.warning(f"  REVERSE_CHECK_ERR: {sig['symbol']} — {e}")
+
             # ---- v2.3: Re-entry cooldown check (v9.5: escalating + elif fix) ----
+            # v10.1: Reverse signals bypass cooldown entirely
+            if is_reverse_signal:
+                logger.info(f"  REVERSE_COOLDOWN_BYPASS: {sig['symbol']} {sig_opt_type} — reverse signal, skipping cooldown")
             now = datetime.now()
             cooldown_hit = False
 
             # v9.5: Escalating cooldown — count today's same-direction losses
-            today_str_cd = datetime.now().strftime('%Y-%m-%d')
-            dir_losses = sum(1 for t in self.portfolio.closed_trades
-                if t.get('exit_time', '').startswith(today_str_cd)
-                and t.get('symbol') == sig['symbol']
-                and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type
-                and (t.get('net_pnl', 0) < 0 or
-                     (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
-            escalated_cooldown = REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
+            if not is_reverse_signal:
+                today_str_cd = datetime.now().strftime('%Y-%m-%d')
+                dir_losses = sum(1 for t in self.portfolio.closed_trades
+                    if t.get('exit_time', '').startswith(today_str_cd)
+                    and t.get('symbol') == sig['symbol']
+                    and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type
+                    and (t.get('net_pnl', 0) < 0 or
+                         (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
+                escalated_cooldown = REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
 
-            for eh in self.exit_history:
-                if eh['symbol'] == sig['symbol']:
-                    elapsed = (now - eh['time']).total_seconds()
-                    # v9.5 fix: Two independent checks (was elif — bug where expired FLIP blocked nothing)
-                    # DIRECTION_FLIP exits block ANY direction re-entry for 15 min
-                    if eh.get('reason') == 'DIRECTION_FLIP' and elapsed < DIRECTION_FLIP_COOLDOWN_SECONDS:
-                        logger.info(f"  SKIP_FLIP_COOLDOWN: {sig['symbol']} {sig_opt_type} — "
-                                   f"DIRECTION_FLIP exit {int(elapsed)}s ago "
-                                   f"(need {DIRECTION_FLIP_COOLDOWN_SECONDS}s any direction)")
-                        skipped += 1
-                        cooldown_hit = True
-                        break
-                    # Same-direction cooldown with escalation based on losses
-                    if eh['direction'] == sig_opt_type and elapsed < escalated_cooldown:
-                        cd_label = "SKIP_ESCALATED_COOLDOWN" if dir_losses > 0 else "SKIP_COOLDOWN"
-                        logger.info(f"  {cd_label}: {sig['symbol']} {sig_opt_type} exited {int(elapsed)}s ago "
-                                   f"(need {int(escalated_cooldown)}s, {dir_losses} prior losses)")
-                        skipped += 1
-                        cooldown_hit = True
-                        break
+                for eh in self.exit_history:
+                    if eh['symbol'] == sig['symbol']:
+                        elapsed = (now - eh['time']).total_seconds()
+                        # v9.5 fix: Two independent checks (was elif — bug where expired FLIP blocked nothing)
+                        # DIRECTION_FLIP exits block ANY direction re-entry for 15 min
+                        if eh.get('reason') == 'DIRECTION_FLIP' and elapsed < DIRECTION_FLIP_COOLDOWN_SECONDS:
+                            logger.info(f"  SKIP_FLIP_COOLDOWN: {sig['symbol']} {sig_opt_type} — "
+                                       f"DIRECTION_FLIP exit {int(elapsed)}s ago "
+                                       f"(need {DIRECTION_FLIP_COOLDOWN_SECONDS}s any direction)")
+                            skipped += 1
+                            cooldown_hit = True
+                            break
+                        # Same-direction cooldown with escalation based on losses
+                        if eh['direction'] == sig_opt_type and elapsed < escalated_cooldown:
+                            cd_label = "SKIP_ESCALATED_COOLDOWN" if dir_losses > 0 else "SKIP_COOLDOWN"
+                            logger.info(f"  {cd_label}: {sig['symbol']} {sig_opt_type} exited {int(elapsed)}s ago "
+                                       f"(need {int(escalated_cooldown)}s, {dir_losses} prior losses)")
+                            skipped += 1
+                            cooldown_hit = True
+                            break
             if cooldown_hit:
                 continue
 
@@ -3252,6 +3276,10 @@ class PaperTrader:
             if indicators:
                 score = compute_signal_score(sig, sig['spot'], indicators, self.current_vix)
                 score = max(0, min(100, score + dir_adj))  # v10.1: direction adjustment
+                # v10.1: Reverse signal score boost (+15)
+                if is_reverse_signal:
+                    score = min(100, score + 15)
+                    logger.info(f"  REVERSE_BOOST: {sig['symbol']} score {score-15} → {score}")
                 sig['quality_score'] = score
                 if score < min_score_required:
                     logger.info(f"  SKIP_QUALITY: {sig['symbol']} {sig['type']} score={score} < {min_score_required}"
