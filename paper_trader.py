@@ -1353,6 +1353,7 @@ class StrategyEngine:
         self.angel = angel
         self.portfolio = portfolio
         self.historical_data = {}  # symbol -> DataFrame
+        self.market_pipeline = None  # v9.6d: Set by PaperTrader if available
 
     def load_historical(self, symbol):
         """Load historical data for indicators. Auto-download if missing/stale."""
@@ -1363,12 +1364,13 @@ class StrategyEngine:
         }
         fpath = os.path.join(OPTIONS_DIR, angel_map.get(symbol, ''))
 
-        # Check if file needs downloading (missing or stale >7 days)
+        # v9.6d: Check if file needs downloading (missing or stale >1 day)
+        # Changed from 7 days to 1 day — CPR needs yesterday's OHLC to be accurate
         needs_download = False
         if os.path.exists(fpath):
             mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
             age_days = (datetime.now() - mod_time).days
-            if age_days >= 7:
+            if age_days >= 1:
                 needs_download = True
                 logger.info(f"Historical data for {symbol} is stale ({age_days}d old), refreshing...")
         else:
@@ -2339,6 +2341,7 @@ class PaperTrader:
         self._running = False
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         self.market_pipeline = market_pipeline  # v9: Real-time NSE/BSE option chain pipeline
+        self.engine.market_pipeline = market_pipeline  # v9.6d: Share pipeline with engine
         self._index_tokens = {
             'NIFTY': {'exchange': 'NSE', 'token': '99926000'},
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},

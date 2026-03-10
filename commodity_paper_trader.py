@@ -811,12 +811,13 @@ class CommodityStrategyEngine:
         spec = COMMODITIES[commodity]
         fpath = os.path.join(DATA_DIR, spec['file'])
 
-        # Check if file needs downloading (missing or stale >7 days)
+        # v9.6d: Check if file needs downloading (missing or stale >1 day)
+        # Changed from 7 days to 1 day — CPR needs yesterday's OHLC to be accurate
         needs_download = False
         if os.path.exists(fpath):
             mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
             age_days = (datetime.now() - mod_time).days
-            if age_days >= 7:
+            if age_days >= 1:
                 needs_download = True
                 logger.info(f"Historical data for {commodity} is stale ({age_days}d old), refreshing...")
         else:

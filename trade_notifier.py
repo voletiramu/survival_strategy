@@ -483,6 +483,10 @@ def notify_reversal(market, original_type, reverse_type, symbol, strike, premium
 
 def notify_scan_failure(market, error_msg, thread_name=''):
     """v7.2: Notify when a scan cycle throws an exception."""
+    # v9.6d: Add cooldown to prevent Telegram spam on repeated crashes
+    key = f"scan_failure_{market}_{thread_name}"
+    if not _should_alert(key):
+        return False
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     msg = (
         f"<b>🔴 SCAN FAILURE</b>\n"
