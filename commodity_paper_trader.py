@@ -96,9 +96,10 @@ COMMODITIES = {
 }
 
 # For paper trading with Rs 3L, focus on affordable mini contracts
-# v2.5.2: Removed SILVERM — premium Rs 18K × lot 5 × mult 5 = Rs 450K+ per trade,
-# far exceeds Rs 75K per-trade limit. Needs Rs 15L+ capital to trade.
-PAPER_TRADE_COMMODITIES = ['GOLDM', 'CRUDEOILM']
+# v10.2: Re-enabled SILVERM — old calc was wrong (used lot=5 but config has lot_size=1).
+# Actual cost: premium × 1 × 5. OTM/ATM premiums Rs 2K-10K → Rs 10K-50K per trade.
+# Well within Rs 75K per-trade limit. Deep ITM (>Rs 15K) auto-skipped by RISK_LIMIT.
+PAPER_TRADE_COMMODITIES = ['GOLDM', 'SILVERM', 'CRUDEOILM']
 
 # ====================================================================
 # CAPITAL & RISK MANAGEMENT FOR COMMODITY TRADING
@@ -2652,9 +2653,30 @@ class CommodityPaperTrader:
                 dir_valid, dir_reason, dir_adj = validate_signal_direction(
                     sig['type'], sig['spot'], dir_ohlc, dir_indicators)
                 if not dir_valid:
-                    logger.info(f"  DIR_REJECT: {sig['commodity']} {sig['type']} -- {dir_reason}")
-                    skipped += 1; continue
-                logger.info(f"  DIR_PASS: {sig['commodity']} {sig['type']} -- {dir_reason}")
+                    # v10.2: Direction Flip — trade correct direction instead of just blocking
+                    orig_type = sig['type']
+                    flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
+                    flip_valid, flip_reason, flip_adj = validate_signal_direction(
+                        flipped_type, sig['spot'], dir_ohlc, dir_indicators)
+                    if flip_valid:
+                        flipped_opt = 'CE' if 'CE' in flipped_type else 'PE'
+                        existing_flipped = [p for p in self.positions
+                            if p['commodity'] == sig['commodity']
+                            and ('CE' if 'CE' in p['signal_type'] else 'PE') == flipped_opt]
+                        if existing_flipped:
+                            logger.info(f"  DIR_REJECT: {sig['commodity']} {orig_type} -- {dir_reason} "
+                                       f"(flip to {flipped_type} blocked: already holding {flipped_opt})")
+                            skipped += 1; continue
+                        logger.info(f"  DIR_FLIP: {sig['commodity']} {orig_type} -> {flipped_type} "
+                                   f"-- {dir_reason} | flipped: {flip_reason}")
+                        sig['type'] = flipped_type
+                        dir_adj = flip_adj
+                    else:
+                        logger.info(f"  DIR_REJECT: {sig['commodity']} {orig_type} -- {dir_reason} "
+                                   f"(flip {flipped_type}: {flip_reason})")
+                        skipped += 1; continue
+                else:
+                    logger.info(f"  DIR_PASS: {sig['commodity']} {sig['type']} -- {dir_reason}")
             else:
                 dir_adj = 0
 

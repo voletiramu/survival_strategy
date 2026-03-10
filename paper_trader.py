@@ -3263,10 +3263,31 @@ class PaperTrader:
                 dir_valid, dir_reason, dir_adj = validate_signal_direction(
                     sig['type'], sig['spot'], dir_ohlc, dir_indicators)
                 if not dir_valid:
-                    logger.info(f"  DIR_REJECT: {sig['symbol']} {sig['type']} -- {dir_reason}")
-                    skipped += 1
-                    continue
-                logger.info(f"  DIR_PASS: {sig['symbol']} {sig['type']} -- {dir_reason}")
+                    # v10.2: Direction Flip — trade correct direction instead of just blocking
+                    orig_type = sig['type']
+                    flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
+                    flip_valid, flip_reason, flip_adj = validate_signal_direction(
+                        flipped_type, sig['spot'], dir_ohlc, dir_indicators)
+                    if flip_valid:
+                        # Safety: check no existing position in flipped direction
+                        flipped_opt = 'CE' if 'CE' in flipped_type else 'PE'
+                        existing_flipped = [p for p in self.portfolio.positions
+                            if p['symbol'] == sig['symbol']
+                            and ('CE' if 'CE' in p['signal_type'] else 'PE') == flipped_opt]
+                        if existing_flipped:
+                            logger.info(f"  DIR_REJECT: {sig['symbol']} {orig_type} -- {dir_reason} "
+                                       f"(flip to {flipped_type} blocked: already holding {flipped_opt})")
+                            skipped += 1; continue
+                        logger.info(f"  DIR_FLIP: {sig['symbol']} {orig_type} -> {flipped_type} "
+                                   f"-- {dir_reason} | flipped: {flip_reason}")
+                        sig['type'] = flipped_type
+                        dir_adj = flip_adj
+                    else:
+                        logger.info(f"  DIR_REJECT: {sig['symbol']} {orig_type} -- {dir_reason} "
+                                   f"(flip {flipped_type}: {flip_reason})")
+                        skipped += 1; continue
+                else:
+                    logger.info(f"  DIR_PASS: {sig['symbol']} {sig['type']} -- {dir_reason}")
             else:
                 dir_adj = 0
 
