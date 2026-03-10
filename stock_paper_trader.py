@@ -2558,6 +2558,8 @@ class StockPaperTrader:
 
         all_signals = []
         scan_data = {}  # v10: Collect indicator data for dashboard live display
+        spots_ok = 0
+        spots_fail = 0
 
         for stock_info in watchlist:
             symbol = stock_info['symbol']
@@ -2567,15 +2569,17 @@ class StockPaperTrader:
             # Get current spot
             spot = self.get_stock_spot(symbol)
             if not spot:
+                spots_fail += 1
                 logger.debug(f"  {symbol}: No spot price available")
                 continue
+            spots_ok += 1
 
             # Compute indicators
             indicators = stock_info.get('indicators')
             if not indicators:
                 indicators = self.engine.compute_indicators(symbol)
             if not indicators:
-                logger.debug(f"  {symbol}: No indicators available")
+                logger.info(f"  {symbol}: No indicators available (skipping)")
                 continue
 
             # Compute DTE for monthly expiry
@@ -2642,12 +2646,22 @@ class StockPaperTrader:
             pcr_signals = self.engine.check_pcr_vwap_signals(symbol, spot, indicators, config)
             all_signals.extend(pcr_signals)
 
+        # v9.6: Diagnostic logging — spot/indicator summary
+        if spots_fail > 0:
+            logger.info(f"  [SPOT] OK={spots_ok} FAIL={spots_fail} Raw_signals={len(all_signals)}")
+        elif datetime.now().minute % 5 == 0:
+            logger.info(f"  [SPOT] OK={spots_ok} Raw_signals={len(all_signals)}")
+
+        # v9.6: Build indicators lookup from watchlist (signals don't carry indicators)
+        ind_lookup = {si['symbol']: si.get('indicators', {}) for si in watchlist}
+
         # Score all signals
         scored_signals = []
+        rejected_scores = []
         for sig in all_signals:
             symbol = sig.get('symbol', '')
             spot = self.get_stock_spot(symbol) or 0
-            indicators = sig.get('indicators', {})
+            indicators = ind_lookup.get(symbol, {})
             score = self.engine.score_signal(sig, spot, indicators, self.current_vix)
 
             # Apply ORB overlay
@@ -2658,6 +2672,13 @@ class StockPaperTrader:
             sig['quality_score'] = max(0, min(100, score))
             if sig['quality_score'] >= MIN_SIGNAL_SCORE:
                 scored_signals.append(sig)
+            else:
+                rejected_scores.append(f"{symbol}:{sig.get('type','')}={sig['quality_score']}")
+
+        # v9.6: Log rejected signals for diagnosis
+        if rejected_scores and not scored_signals:
+            logger.info(f"  [SCORE] All {len(rejected_scores)} signals rejected (below {MIN_SIGNAL_SCORE}): "
+                       f"{', '.join(rejected_scores[:5])}")
 
         # Sort by score descending
         scored_signals.sort(key=lambda s: s.get('quality_score', 0), reverse=True)
@@ -2734,12 +2755,20 @@ class StockPaperTrader:
                 skipped += 1
                 continue
 
-            # Direction flip check: existing position in opposite direction
+            # Direction check: existing positions for this stock
             existing_directions = set()
             for p in self.portfolio.positions:
                 if p.get('stock_symbol') == symbol or p.get('symbol') == symbol:
                     existing_directions.add('CE' if 'CE' in p['signal_type'] else 'PE')
             new_direction = 'CE' if 'CE' in signal_type else 'PE'
+
+            # v9.6: Same-direction duplicate check — skip if already holding same direction
+            if new_direction in existing_directions:
+                logger.info(f"  SKIP_SAME_DIR: {symbol} already has {new_direction} position open")
+                skipped += 1
+                continue
+
+            # Direction flip check: opposite direction needs higher score
             if existing_directions and new_direction not in existing_directions:
                 if score < DIRECTION_FLIP_MIN_SCORE:
                     logger.info(f"  SKIP: {symbol} direction flip needs score >= {DIRECTION_FLIP_MIN_SCORE} "
@@ -3010,6 +3039,13 @@ class StockPaperTrader:
         if now > LAST_ENTRY_TIME:
             logger.info(f"  Past last entry time ({LAST_ENTRY_TIME}), exits only")
             return
+
+        # v9.6: Diagnostic logging — positions + watchlist size
+        pos_count = len(self.portfolio.positions)
+        wl_count = len(self._todays_watchlist)
+        if pos_count > 0 or now.minute % 5 == 0:
+            logger.info(f"  [SCAN] Watchlist={wl_count} Positions={pos_count} "
+                       f"Trades={self.daily_trade_count}")
 
         # Scan for new signals
         signals = self.scan_all_strategies()
