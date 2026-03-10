@@ -161,6 +161,18 @@ TSL_TRAIL_DISTANCE_PCT = 30      # Phase 2 trail: 30% below peak profit
 TSL_TIGHT_GAIN_PCT = 40          # Phase 3: Tight trail when premium gains 40%+
 TSL_TIGHT_DISTANCE_PCT = 20      # Phase 3 trail: 20% below peak profit
 
+# v10.1: Trailing Target (replaces hard TARGET_HIT exit)
+TARGET_TRAIL_ENABLED = True
+TARGET_TRAIL_EXTEND_PCT = 20          # Extend target by 20% of current premium when hit
+TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
+TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
+
+# v10.1: Breakout Failure Detection
+BREAKOUT_FAIL_CHECK_MINUTES = 5
+BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
+BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
+BREAKOUT_FAIL_REVERSE_ENABLED = True
+
 # v3.1: Strategy weights from Angel One backtest (PnL + risk-adjusted)
 # Survivor highest PnL (Rs 36.5M avg, 257% annual), Gamma Blast best risk-adjusted (Sharpe 4.42)
 STRATEGY_WEIGHTS = {
@@ -290,6 +302,80 @@ def passes_profit_filter(premium, lot_size, target_multiplier, is_sell=False):
         expected_profit = premium * lot_size * (target_multiplier - 1)
     passes = expected_profit >= (total_cost * MIN_PROFIT_TO_COST_RATIO)
     return passes, round(expected_profit, 2), round(total_cost, 2)
+
+
+def validate_signal_direction(signal_type, spot, ohlc, indicators):
+    """v10.1: Multi-factor direction validation — THE PRIMARY GATE for all signals.
+
+    CE (bullish) requires majority of: spot>VWAP, spot>prev_close, spot>open,
+    EMA(9)>EMA(20), positive 3-bar trend.
+    PE (bearish) requires the opposite.
+
+    Returns (is_valid, reason_str, score_adjustment).
+    Must pass at least 3 of 5 checks for entry.
+    """
+    is_ce = 'CE' in signal_type
+    is_sell = 'SELL' in signal_type
+    if is_sell:
+        return True, "SELL_EXEMPT", 0  # Sell strategies have their own direction logic
+
+    vwap = indicators.get('vwap', 0)
+    prev_close = indicators.get('prev_close', spot)
+    ema_9 = indicators.get('ema_9', 0)
+    ema_20 = indicators.get('ema_20', 0)
+    three_bar = indicators.get('three_bar_trend', 0)
+    open_price = ohlc.get('open', spot) if ohlc else spot
+
+    checks = []
+    passed = 0
+
+    # Check 1: VWAP alignment (spot vs 5-day VWAP)
+    if vwap and vwap > 0:
+        if (is_ce and spot > vwap) or (not is_ce and spot < vwap):
+            passed += 1
+            checks.append('VWAP+')
+        else:
+            checks.append('VWAP-')
+
+    # Check 2: Day trend (spot vs prev close)
+    body = spot - prev_close
+    if (is_ce and body > 0) or (not is_ce and body < 0):
+        passed += 1
+        checks.append('TREND+')
+    else:
+        checks.append('TREND-')
+
+    # Check 3: Intraday direction (spot vs today's open)
+    intraday = spot - open_price
+    if (is_ce and intraday > 0) or (not is_ce and intraday < 0):
+        passed += 1
+        checks.append('INTRA+')
+    else:
+        checks.append('INTRA-')
+
+    # Check 4: EMA trend (9 vs 20)
+    if ema_9 > 0 and ema_20 > 0:
+        if (is_ce and ema_9 > ema_20) or (not is_ce and ema_9 < ema_20):
+            passed += 1
+            checks.append('EMA+')
+        else:
+            checks.append('EMA-')
+
+    # Check 5: Multi-bar momentum (3-bar trend)
+    if (is_ce and three_bar >= 2) or (not is_ce and three_bar <= -2):
+        passed += 1
+        checks.append('MOM+')
+    elif three_bar == 0:
+        checks.append('MOM~')  # Neutral, don't penalize
+    else:
+        checks.append('MOM-')
+
+    # MUST pass at least 3 of 5 checks
+    is_valid = passed >= 3
+    score_adj = (passed - 3) * 5  # +5 per extra check, 0 at threshold
+
+    reason = f"DIR({passed}/5: {' '.join(checks)})"
+    return is_valid, reason, score_adj
 
 
 def compute_signal_score(signal, spot, indicators, vix=None):
@@ -1588,6 +1674,21 @@ class StrategyEngine:
             logger.error(f"4H zone fetch error for {symbol}: {e}")
             return [], []
 
+    def _get_prev_trading_day(self, df, symbol=''):
+        """v10.1: Get previous trading day OHLC for CPR. Validates data freshness."""
+        if len(df) < 2:
+            return df.iloc[-1], "only_row"
+        today = pd.Timestamp.now().normalize()
+        prev_idx = df.index[-2]
+        prev_date = pd.Timestamp(prev_idx).normalize()
+        gap_days = (today - prev_date).days
+        if gap_days <= 4:  # Normal: yesterday or weekend gap (Fri→Mon = 3)
+            return df.iloc[-2], f"prev({prev_date.strftime('%Y-%m-%d')},gap={gap_days}d)"
+        else:
+            last_date = pd.Timestamp(df.index[-1]).normalize()
+            logger.warning(f"  CPR_STALE: {symbol} prev bar {gap_days}d old ({prev_date.date()}), using last bar")
+            return df.iloc[-1], f"fallback({last_date.strftime('%Y-%m-%d')},stale={gap_days}d)"
+
     def compute_indicators(self, symbol, current_ohlc=None):
         """Compute all indicators needed for strategies."""
         df = self.historical_data.get(symbol)
@@ -1652,12 +1753,21 @@ class StrategyEngine:
         pcr_proxy = 1 + (close_chg.tail(5).mean() * 10)
         pcr_proxy = max(0.5, min(2.0, pcr_proxy))
 
-        # CPR from previous day
-        prev = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+        # v10.1: EMA trend indicators for direction validation
+        ema_9 = df['Close'].ewm(span=9).mean().iloc[-1] if len(df) >= 9 else df['Close'].iloc[-1]
+        ema_20 = df['Close'].ewm(span=20).mean().iloc[-1] if len(df) >= 20 else df['Close'].iloc[-1]
+        n_bars = min(3, len(df) - 1)
+        three_bar_trend = sum(1 if df['Close'].iloc[-(n_bars - i)] > df['Close'].iloc[-(n_bars - i + 1)] else -1
+                              for i in range(n_bars)) if n_bars > 0 else 0
+
+        # v10.1: CPR from previous trading day — validated for freshness
+        prev, cpr_source = self._get_prev_trading_day(df, symbol)
         pivot = (prev['High'] + prev['Low'] + prev['Close']) / 3
         bc = (prev['High'] + prev['Low']) / 2
         tc = 2 * pivot - bc
         cpr_width = abs(tc - bc) / prev['Close'] * 100
+
+        logger.debug(f"  CPR_SOURCE: {symbol} {cpr_source} pivot={pivot:.0f} BC={bc:.0f} TC={tc:.0f}")
 
         # Camarilla
         h_range = prev['High'] - prev['Low']
@@ -1780,6 +1890,10 @@ class StrategyEngine:
             'prev_low': prev['Low'],
             'prev_close': prev['Close'],
             'prev_range': (prev['High'] - prev['Low']) / max(atr, 1),
+            # v10.1: Direction indicators
+            'ema_9': ema_9,
+            'ema_20': ema_20,
+            'three_bar_trend': three_bar_trend,
         }
 
     def _get_strike_from_chain(self, symbol, spot, opt_type, dte):
@@ -1899,39 +2013,53 @@ class StrategyEngine:
         # ---- BUY BREAKOUT: All CPR widths ----
         # Spot above TC → Bullish breakout → Buy CE
         if spot > ind['tc']:
-            ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-            use_iv = chain_iv if chain_iv > 0 else ind['iv']
-            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-            premium = chain_ltp if chain_ltp > 0 else g['price']
-            if premium > MIN_PREMIUM_BUY:
-                signals.append({
-                    'type': 'BUY_CE_CPR',
-                    'strike': ce_strike,
-                    'premium': premium,
-                    'greeks': g,
-                    'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
-                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                    'target': premium * target_hit_mult if ohlc['high'] > ind['cam_r3'] else premium * target_base_mult,
-                    'sl': premium * sl_mult,
-                })
+            # v10.1: Direction confirmation — skip CE if intraday bearish AND below VWAP
+            intraday_body = spot - ohlc['open']
+            vwap = ind.get('vwap', spot)
+            if intraday_body < 0 and vwap > 0 and spot < vwap:
+                logger.info(f"  CPR_DIR_SKIP: {symbol} CE above TC but bearish intraday "
+                           f"(body={intraday_body:.0f}, spot={spot:.0f}<VWAP={vwap:.0f})")
+            else:
+                ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
+                    signals.append({
+                        'type': 'BUY_CE_CPR',
+                        'strike': ce_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * target_hit_mult if ohlc['high'] > ind['cam_r3'] else premium * target_base_mult,
+                        'sl': premium * sl_mult,
+                    })
 
         # Spot below BC → Bearish breakdown → Buy PE
         elif spot < ind['bc']:
-            pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-            use_iv = chain_iv if chain_iv > 0 else ind['iv']
-            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-            premium = chain_ltp if chain_ltp > 0 else g['price']
-            if premium > MIN_PREMIUM_BUY:
-                signals.append({
-                    'type': 'BUY_PE_CPR',
-                    'strike': pe_strike,
-                    'premium': premium,
-                    'greeks': g,
-                    'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
-                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                    'target': premium * target_hit_mult if ohlc['low'] < ind['cam_s3'] else premium * target_base_mult,
-                    'sl': premium * sl_mult,
-                })
+            # v10.1: Direction confirmation — skip PE if intraday bullish AND above VWAP
+            intraday_body = spot - ohlc['open']
+            vwap = ind.get('vwap', spot)
+            if intraday_body > 0 and vwap > 0 and spot > vwap:
+                logger.info(f"  CPR_DIR_SKIP: {symbol} PE below BC but bullish intraday "
+                           f"(body={intraday_body:+.0f}, spot={spot:.0f}>VWAP={vwap:.0f})")
+            else:
+                pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
+                    signals.append({
+                        'type': 'BUY_PE_CPR',
+                        'strike': pe_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
+                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                        'target': premium * target_hit_mult if ohlc['low'] < ind['cam_s3'] else premium * target_base_mult,
+                        'sl': premium * sl_mult,
+                    })
 
         # ---- SELL MEAN REVERSION: Only for very wide CPR (> 0.6%) with margin ----
         if cpr_w > 0.6:
@@ -2016,40 +2144,49 @@ class StrategyEngine:
         day_label = "EXPIRY" if is_expiry_day else f"{days_to_expiry}DTE"
 
         if abs(body) > atr * 0.15:
+            vwap = ind.get('vwap', 0)
             if body > 0:  # Up breakout
-                ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
-                if premium > MIN_PREMIUM_BUY:
-                    signals.append({
-                        'type': 'BUY_CE_GAMMA',
-                        'strike': ce_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
-                                  f"ATR={atr:.0f} range={day_range:.2f}x"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                        'target': premium * target_mult,
-                        'sl': premium * sl_mult,
-                    })
+                # v10.1: VWAP confirmation for Gamma Blast CE
+                if vwap > 0 and spot < vwap:
+                    logger.info(f"  GAMMA_DIR_SKIP: {symbol} CE up body={body:.0f} but spot={spot:.0f}<VWAP={vwap:.0f}")
+                else:
+                    ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+                    use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                    g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                    premium = chain_ltp if chain_ltp > 0 else g['price']
+                    if premium > MIN_PREMIUM_BUY:
+                        signals.append({
+                            'type': 'BUY_CE_GAMMA',
+                            'strike': ce_strike,
+                            'premium': premium,
+                            'greeks': g,
+                            'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
+                                      f"ATR={atr:.0f} range={day_range:.2f}x"
+                                      f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                            'target': premium * target_mult,
+                            'sl': premium * sl_mult,
+                        })
             else:  # Down breakout
-                pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
-                if premium > MIN_PREMIUM_BUY:
-                    signals.append({
-                        'type': 'BUY_PE_GAMMA',
-                        'strike': pe_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
-                                  f"ATR={atr:.0f} range={day_range:.2f}x"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
-                        'target': premium * target_mult,
-                        'sl': premium * sl_mult,
-                    })
+                # v10.1: VWAP confirmation for Gamma Blast PE
+                if vwap > 0 and spot > vwap:
+                    logger.info(f"  GAMMA_DIR_SKIP: {symbol} PE down body={body:.0f} but spot={spot:.0f}>VWAP={vwap:.0f}")
+                else:
+                    pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+                    use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                    g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                    premium = chain_ltp if chain_ltp > 0 else g['price']
+                    if premium > MIN_PREMIUM_BUY:
+                        signals.append({
+                            'type': 'BUY_PE_GAMMA',
+                            'strike': pe_strike,
+                            'premium': premium,
+                            'greeks': g,
+                            'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
+                                      f"ATR={atr:.0f} range={day_range:.2f}x"
+                                      f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                            'target': premium * target_mult,
+                            'sl': premium * sl_mult,
+                        })
 
         return signals
 
@@ -2244,7 +2381,8 @@ class StrategyEngine:
         pcr = ind['pcr']
 
         # BUY CE: PCR > 1.05 (bullish), near VWAP
-        if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot >= vwap * 0.995:
+        # v10.1: Fixed direction bug — CE requires spot > VWAP (was 0.995x allowing below)
+        if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
             ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
             use_iv = chain_iv if chain_iv > 0 else ind['iv']
             g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
@@ -2262,7 +2400,8 @@ class StrategyEngine:
                 })
 
         # BUY PE: PCR < 0.95 (bearish), near VWAP
-        elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot <= vwap * 1.005:
+        # v10.1: Fixed direction bug — PE requires spot < VWAP (was 1.005x allowing above)
+        elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
             pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
             use_iv = chain_iv if chain_iv > 0 else ind['iv']
             g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
@@ -2387,6 +2526,7 @@ class PaperTrader:
             logger.info(f"  RESTART_SAFE: Recovered daily_trade_count={self.daily_trade_count} from portfolio state")
         self.exit_history = []          # [{symbol, direction, time}] for re-entry cooldown
         self.ghost_zone_losses = {}     # {(symbol, 'CE'/'PE'): datetime}
+        self.pending_reverses = {}      # v10.1: {symbol: {opt_type, spot, ...}} for breakout failure reversal
         self._vix_cache = {'value': None, 'time': None}
         self.current_vix = None
 
@@ -3091,13 +3231,27 @@ class PaperTrader:
                             skipped += 1
                             continue
 
+            # ---- v10.1: DIRECTION VALIDATION — the primary filter ----
+            dir_ohlc = self.get_intraday_ohlc(sig['symbol']) or {
+                'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0}
+            dir_indicators = self.engine.compute_indicators(sig['symbol'], dir_ohlc)
+            if dir_indicators:
+                dir_valid, dir_reason, dir_adj = validate_signal_direction(
+                    sig['type'], sig['spot'], dir_ohlc, dir_indicators)
+                if not dir_valid:
+                    logger.info(f"  DIR_REJECT: {sig['symbol']} {sig['type']} -- {dir_reason}")
+                    skipped += 1
+                    continue
+                logger.info(f"  DIR_PASS: {sig['symbol']} {sig['type']} -- {dir_reason}")
+            else:
+                dir_adj = 0
+
             # ---- v9.5: Signal quality score check (MANDATORY — no bypass) ----
             min_score_required = sig.get('_escalated_min_score', MIN_SIGNAL_SCORE)
-            indicators = self.engine.compute_indicators(sig['symbol'],
-                         self.get_intraday_ohlc(sig['symbol']) or
-                         {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
+            indicators = dir_indicators or self.engine.compute_indicators(sig['symbol'], dir_ohlc)
             if indicators:
                 score = compute_signal_score(sig, sig['spot'], indicators, self.current_vix)
+                score = max(0, min(100, score + dir_adj))  # v10.1: direction adjustment
                 sig['quality_score'] = score
                 if score < min_score_required:
                     logger.info(f"  SKIP_QUALITY: {sig['symbol']} {sig['type']} score={score} < {min_score_required}"
@@ -3840,11 +3994,70 @@ class PaperTrader:
                             pass
                         continue
 
+            # ---- v10.1: BREAKOUT FAILURE DETECTION ----
+            # If premium never moved above entry or drops fast, exit early (+ optional reverse)
+            if BREAKOUT_FAIL_REVERSE_ENABLED and GRACE_PERIOD_SECONDS < elapsed_secs <= BREAKOUT_FAIL_CHECK_MINUTES * 60:
+                entry_prem_bf = pos['entry_premium']
+                if entry_prem_bf > 0:
+                    if not pos['is_sell']:
+                        peak_bf = pos.get('peak_premium', entry_prem_bf)
+                        gain_bf = (peak_bf - entry_prem_bf) / entry_prem_bf * 100
+                        drop_bf = (entry_prem_bf - current_premium) / entry_prem_bf * 100
+                    else:
+                        peak_bf = pos.get('trough_premium', entry_prem_bf)
+                        gain_bf = (entry_prem_bf - peak_bf) / entry_prem_bf * 100
+                        drop_bf = (current_premium - entry_prem_bf) / entry_prem_bf * 100
+
+                    # Rapid drop: exit + queue reverse
+                    if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
+                        logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s")
+                        self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL_REVERSE')
+                        self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
+                        rev_type = 'PE' if 'CE' in pos['signal_type'] else 'CE'
+                        self.pending_reverses[pos['symbol']] = {
+                            'opt_type': rev_type, 'spot': spot,
+                            'source_id': pos['id'], 'timestamp': datetime.now().isoformat()
+                        }
+                        logger.info(f"  REVERSE_QUEUED: {pos['symbol']} BUY_{rev_type}")
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = LOT_SIZES.get(symbol, 50)
+                            cap = MARGIN_PER_LOT.get(symbol, 120000) if pos['is_sell'] else entry_prem_bf * lot_size
+                            notify_trade_exit(market="EQUITY", strategy=pos['strategy'],
+                                symbol=symbol, signal_type=pos['signal_type'],
+                                strike=pos['strike'], entry_price=entry_prem_bf,
+                                exit_price=current_premium, entry_time=pos['timestamp'],
+                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                                exit_reason='BREAKOUT_FAIL_REVERSE')
+                        except Exception:
+                            pass
+                        continue
+
+                    # Near 5-min mark: no movement — exit (no reverse)
+                    if elapsed_secs >= (BREAKOUT_FAIL_CHECK_MINUTES * 60 - 15) and gain_bf < BREAKOUT_FAIL_MIN_GAIN_PCT:
+                        logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {BREAKOUT_FAIL_MIN_GAIN_PCT}% in {int(elapsed_secs)}s")
+                        self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL')
+                        self._track_exit(pos, 'BREAKOUT_FAIL')
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = LOT_SIZES.get(symbol, 50)
+                            cap = MARGIN_PER_LOT.get(symbol, 120000) if pos['is_sell'] else entry_prem_bf * lot_size
+                            notify_trade_exit(market="EQUITY", strategy=pos['strategy'],
+                                symbol=symbol, signal_type=pos['signal_type'],
+                                strike=pos['strike'], entry_price=entry_prem_bf,
+                                exit_price=current_premium, entry_time=pos['timestamp'],
+                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                                exit_reason='BREAKOUT_FAIL')
+                        except Exception:
+                            pass
+                        continue
+
             # ---- v7.5: TRAILING STOP LOSS — Premium Gain % Based ----
             # Old: TSL thresholds tied to target distance → with 2.5x targets, never triggered
             # New: TSL triggers on actual premium gain % from entry
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
-            target = details.get('target', pos['entry_premium'] * 1.5)
+            # v10.1: Use dynamically updated target (from trailing target) if available
+            target = pos.get('target', details.get('target', pos['entry_premium'] * 1.5))
             sl = details.get('sl', pos['entry_premium'] * 0.5)
 
             if not pos['is_sell']:
@@ -4076,20 +4289,46 @@ class PaperTrader:
 
             exit_reason = None
 
-            if pos['is_sell']:
-                if current_premium <= target:
-                    exit_reason = 'TARGET_HIT'
-                elif current_premium >= sl:
+            if not pos['is_sell']:
+                # BUY positions
+                if current_premium <= sl:
                     exit_reason = 'SL_HIT'
                 elif pos['dte'] <= 0:
                     exit_reason = 'EXPIRY'
+                elif current_premium >= target:
+                    # v10.1: Trailing target — extend instead of hard exit
+                    if TARGET_TRAIL_ENABLED and pos.get('target_extensions', 0) < TARGET_TRAIL_MAX_EXTENSIONS:
+                        gain_pct = (current_premium - pos['entry_premium']) / pos['entry_premium'] * 100 if pos['entry_premium'] > 0 else 0
+                        new_target = round(current_premium * (1 + TARGET_TRAIL_EXTEND_PCT / 100), 2)
+                        new_tsl = round(pos.get('peak_premium', current_premium) * (1 - TARGET_TRAIL_TSL_DISTANCE_PCT / 100), 2)
+                        new_tsl = max(new_tsl, pos.get('trailing_sl') or 0)
+                        pos['target_extensions'] = pos.get('target_extensions', 0) + 1
+                        pos['target'] = new_target
+                        pos['trailing_sl'] = new_tsl
+                        logger.info(f"  TARGET_TRAIL: {pos['id']} BUY ext#{pos['target_extensions']} "
+                                   f"gain={gain_pct:.0f}% -> target Rs {new_target:.2f}, TSL Rs {new_tsl:.2f}")
+                    else:
+                        exit_reason = 'TARGET_HIT'
             else:
-                if current_premium >= target:
-                    exit_reason = 'TARGET_HIT'
-                elif current_premium <= sl:
+                # SELL positions
+                if current_premium >= sl:
                     exit_reason = 'SL_HIT'
                 elif pos['dte'] <= 0:
                     exit_reason = 'EXPIRY'
+                elif current_premium <= target:
+                    # v10.1: Trailing target for SELL
+                    if TARGET_TRAIL_ENABLED and pos.get('target_extensions', 0) < TARGET_TRAIL_MAX_EXTENSIONS:
+                        gain_pct = (pos['entry_premium'] - current_premium) / pos['entry_premium'] * 100 if pos['entry_premium'] > 0 else 0
+                        new_target = round(current_premium * (1 - TARGET_TRAIL_EXTEND_PCT / 100), 2)
+                        new_tsl = round(pos.get('trough_premium', current_premium) * (1 + TARGET_TRAIL_TSL_DISTANCE_PCT / 100), 2)
+                        new_tsl = min(new_tsl, pos.get('trailing_sl') or float('inf'))
+                        pos['target_extensions'] = pos.get('target_extensions', 0) + 1
+                        pos['target'] = new_target
+                        pos['trailing_sl'] = new_tsl
+                        logger.info(f"  TARGET_TRAIL: {pos['id']} SELL ext#{pos['target_extensions']} "
+                                   f"gain={gain_pct:.0f}% -> target Rs {new_target:.2f}, TSL Rs {new_tsl:.2f}")
+                    else:
+                        exit_reason = 'TARGET_HIT'
 
             if exit_reason:
                 self.portfolio.close_position(pos['id'], current_premium, exit_reason)

@@ -225,6 +225,14 @@ def compute_all_indicators(df, current_ohlc=None):
     # Previous range normalized by ATR
     prev_range = (prev['High'] - prev['Low']) / max(atr, 1)
 
+    # v10.1: EMA trend indicators for direction validation
+    ema_9 = df['Close'].ewm(span=9).mean().iloc[-1] if len(df) >= 9 else df['Close'].iloc[-1]
+    ema_20 = df['Close'].ewm(span=20).mean().iloc[-1] if len(df) >= 20 else df['Close'].iloc[-1]
+    # 3-bar trend: +3=strong bull, -3=strong bear
+    n_bars = min(3, len(df) - 1)
+    three_bar_trend = sum(1 if df['Close'].iloc[-(n_bars - i)] > df['Close'].iloc[-(n_bars - i + 1)] else -1
+                          for i in range(n_bars)) if n_bars > 0 else 0
+
     return {
         # Core indicators
         'atr': atr,
@@ -250,4 +258,8 @@ def compute_all_indicators(df, current_ohlc=None):
         'prev_low': prev['Low'],
         'prev_close': prev['Close'],
         'prev_range': prev_range,
+        # v10.1: Direction indicators
+        'ema_9': ema_9,
+        'ema_20': ema_20,
+        'three_bar_trend': three_bar_trend,
     }

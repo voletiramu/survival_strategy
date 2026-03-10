@@ -84,6 +84,18 @@ TSL_TRAIL_DISTANCE_PCT = 30    # Phase 2: 30% below peak profit
 TSL_TIGHT_GAIN_PCT = 40        # Phase 3: Tight trail at +40%
 TSL_TIGHT_DISTANCE_PCT = 20    # Phase 3: 20% below peak profit
 
+# v10.1: Trailing Target (replaces hard TARGET_HIT exit)
+TARGET_TRAIL_ENABLED = True
+TARGET_TRAIL_EXTEND_PCT = 20          # Extend target by 20% of current premium when hit
+TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
+TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
+
+# v10.1: Breakout Failure Detection
+BREAKOUT_FAIL_CHECK_MINUTES = 5
+BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
+BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
+BREAKOUT_FAIL_REVERSE_ENABLED = True
+
 # OI/IV exit thresholds
 OI_SURGE_FIRST_HOUR_PCT = 50
 OI_SURGE_MID_DAY_PCT = 35
@@ -149,6 +161,73 @@ from strategies.signal_scoring import compute_signal_score
 from strategies.hold_scoring import compute_hold_score
 from strategies.indicators import compute_all_indicators
 from stock_fno_config import StockFnOConfig, TIER1_STOCKS, TIER2_STOCKS, TIER3_STOCKS
+
+
+def validate_signal_direction(signal_type, spot, ohlc, indicators):
+    """v10.1: Multi-factor direction validation — THE PRIMARY GATE for all signals.
+
+    CE (bullish) requires majority of: spot>VWAP, spot>prev_close, spot>open,
+    EMA(9)>EMA(20), positive 3-bar trend.
+    PE (bearish) requires the opposite.
+
+    Returns (is_valid, reason_str, score_adjustment).
+    Must pass at least 3 of 5 checks for entry.
+    """
+    is_ce = 'CE' in signal_type
+    is_sell = 'SELL' in signal_type
+    if is_sell:
+        return True, "SELL_EXEMPT", 0
+
+    vwap = indicators.get('vwap', 0)
+    prev_close = indicators.get('prev_close', spot)
+    ema_9 = indicators.get('ema_9', 0)
+    ema_20 = indicators.get('ema_20', 0)
+    three_bar = indicators.get('three_bar_trend', 0)
+    open_price = ohlc.get('open', spot) if ohlc else spot
+
+    checks = []
+    passed = 0
+
+    # Check 1: VWAP alignment (spot vs 5-day VWAP)
+    if vwap and vwap > 0:
+        if (is_ce and spot > vwap) or (not is_ce and spot < vwap):
+            passed += 1; checks.append('VWAP+')
+        else:
+            checks.append('VWAP-')
+
+    # Check 2: Day trend (spot vs prev close)
+    body = spot - prev_close
+    if (is_ce and body > 0) or (not is_ce and body < 0):
+        passed += 1; checks.append('TREND+')
+    else:
+        checks.append('TREND-')
+
+    # Check 3: Intraday direction (spot vs today's open)
+    intraday = spot - open_price
+    if (is_ce and intraday > 0) or (not is_ce and intraday < 0):
+        passed += 1; checks.append('INTRA+')
+    else:
+        checks.append('INTRA-')
+
+    # Check 4: EMA trend (9 vs 20)
+    if ema_9 > 0 and ema_20 > 0:
+        if (is_ce and ema_9 > ema_20) or (not is_ce and ema_9 < ema_20):
+            passed += 1; checks.append('EMA+')
+        else:
+            checks.append('EMA-')
+
+    # Check 5: Multi-bar momentum (3-bar trend)
+    if (is_ce and three_bar >= 2) or (not is_ce and three_bar <= -2):
+        passed += 1; checks.append('MOM+')
+    elif three_bar == 0:
+        checks.append('MOM~')
+    else:
+        checks.append('MOM-')
+
+    is_valid = passed >= 3
+    score_adj = (passed - 3) * 5
+    reason = f"DIR({passed}/5: {' '.join(checks)})"
+    return is_valid, reason, score_adj
 
 
 # ====================================================================
@@ -310,6 +389,14 @@ class StockCPRScanner:
         df = self._load_stock_historical(symbol)
         if df is None or len(df) < 15:
             return None
+
+        # v10.1: CPR freshness check
+        if len(df) >= 2:
+            today = pd.Timestamp.now().normalize()
+            prev_date = pd.Timestamp(df.index[-1]).normalize()
+            gap_days = (today - prev_date).days
+            if gap_days > 4:
+                logger.warning(f"  CPR_STALE: {symbol} historical data is {gap_days}d old")
 
         # v9.6b: Use last complete bar = yesterday's OHLC (for next-day CPR)
         # Historical data is ONE_DAY interval; last row IS yesterday's complete candle
@@ -1485,12 +1572,30 @@ class StockStrategyEngine:
         """
         try:
             signals = check_cpr_breakout(spot, ohlc, indicators, config)
-            # Tag signals with stock-specific metadata
+            # v10.1: VWAP direction filtering for CPR signals
+            vwap = indicators.get('vwap', 0)
+            filtered = []
             for sig in signals:
                 sig['symbol'] = symbol
                 sig['strategy'] = 'CPR'
                 sig['lot_size'] = config.get('lot_size', 1)
-            return signals
+                sig['spot'] = spot
+                # Direction confirmation — skip CE if intraday bearish AND below VWAP
+                if 'BUY_CE' in sig.get('type', ''):
+                    intraday_body = spot - ohlc.get('open', spot)
+                    if intraday_body < 0 and vwap > 0 and spot < vwap:
+                        logger.info(f"  CPR_DIR_SKIP: {symbol} CE above TC but bearish intraday "
+                                   f"(body={intraday_body:.0f}, spot={spot:.0f}<VWAP={vwap:.0f})")
+                        continue
+                # Direction confirmation — skip PE if intraday bullish AND above VWAP
+                elif 'BUY_PE' in sig.get('type', ''):
+                    intraday_body = spot - ohlc.get('open', spot)
+                    if intraday_body > 0 and vwap > 0 and spot > vwap:
+                        logger.info(f"  CPR_DIR_SKIP: {symbol} PE below BC but bullish intraday "
+                                   f"(body={intraday_body:+.0f}, spot={spot:.0f}>VWAP={vwap:.0f})")
+                        continue
+                filtered.append(sig)
+            return filtered
         except Exception as e:
             logger.error(f"CPR signal error for {symbol}: {e}")
             return []
@@ -1512,11 +1617,24 @@ class StockStrategyEngine:
         """
         try:
             signals = check_gamma_blast(spot, ohlc, indicators, config)
+            # v10.1: VWAP direction filtering for Gamma Blast signals
+            vwap = indicators.get('vwap', 0)
+            filtered = []
             for sig in signals:
                 sig['symbol'] = symbol
                 sig['strategy'] = 'Gamma Blast'
                 sig['lot_size'] = config.get('lot_size', 1)
-            return signals
+                sig['spot'] = spot
+                # VWAP confirmation for Gamma Blast CE
+                if 'BUY_CE' in sig.get('type', '') and vwap > 0 and spot < vwap:
+                    logger.info(f"  GAMMA_DIR_SKIP: {symbol} CE up but spot={spot:.0f}<VWAP={vwap:.0f}")
+                    continue
+                # VWAP confirmation for Gamma Blast PE
+                elif 'BUY_PE' in sig.get('type', '') and vwap > 0 and spot > vwap:
+                    logger.info(f"  GAMMA_DIR_SKIP: {symbol} PE down but spot={spot:.0f}>VWAP={vwap:.0f}")
+                    continue
+                filtered.append(sig)
+            return filtered
         except Exception as e:
             logger.error(f"Gamma Blast signal error for {symbol}: {e}")
             return []
@@ -1651,6 +1769,7 @@ class StockPaperTrader:
         # Exit tracking
         self.exit_history = []
         self.ghost_zone_losses = {}
+        self.pending_reverses = {}      # v10.1: {symbol: {opt_type, spot, ...}} for breakout failure reversal
         self.daily_trade_count = 0
         self.current_vix = None
 
@@ -2253,9 +2372,68 @@ class StockPaperTrader:
                             pass
                         continue
 
+            # ---- v10.1: BREAKOUT FAILURE DETECTION ----
+            # If premium never moved above entry or drops fast, exit early (+ optional reverse)
+            if BREAKOUT_FAIL_REVERSE_ENABLED and GRACE_PERIOD_SECONDS < elapsed_secs <= BREAKOUT_FAIL_CHECK_MINUTES * 60:
+                entry_prem_bf = pos['entry_premium']
+                if entry_prem_bf > 0:
+                    if not pos['is_sell']:
+                        peak_bf = pos.get('peak_premium', entry_prem_bf)
+                        gain_bf = (peak_bf - entry_prem_bf) / entry_prem_bf * 100
+                        drop_bf = (entry_prem_bf - current_premium) / entry_prem_bf * 100
+                    else:
+                        peak_bf = pos.get('trough_premium', entry_prem_bf)
+                        gain_bf = (entry_prem_bf - peak_bf) / entry_prem_bf * 100
+                        drop_bf = (current_premium - entry_prem_bf) / entry_prem_bf * 100
+
+                    # Rapid drop: exit + queue reverse
+                    if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
+                        logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s")
+                        self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL_REVERSE')
+                        self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
+                        rev_type = 'PE' if 'CE' in pos['signal_type'] else 'CE'
+                        self.pending_reverses[symbol] = {
+                            'opt_type': rev_type, 'spot': spot,
+                            'source_id': pos['id'], 'timestamp': datetime.now().isoformat()
+                        }
+                        logger.info(f"  REVERSE_QUEUED: {symbol} BUY_{rev_type}")
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = pos.get('lot_size', 1)
+                            cap = pos.get('margin_required', entry_prem_bf * lot_size * 3) if pos['is_sell'] else entry_prem_bf * lot_size
+                            notify_trade_exit(market="STOCKS", strategy=pos['strategy'],
+                                symbol=symbol, signal_type=pos['signal_type'],
+                                strike=pos['strike'], entry_price=entry_prem_bf,
+                                exit_price=current_premium, entry_time=pos['timestamp'],
+                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                                exit_reason='BREAKOUT_FAIL_REVERSE')
+                        except Exception:
+                            pass
+                        continue
+
+                    # Near 5-min mark: no movement — exit (no reverse)
+                    if elapsed_secs >= (BREAKOUT_FAIL_CHECK_MINUTES * 60 - 15) and gain_bf < BREAKOUT_FAIL_MIN_GAIN_PCT:
+                        logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {BREAKOUT_FAIL_MIN_GAIN_PCT}% in {int(elapsed_secs)}s")
+                        self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL')
+                        self._track_exit(pos, 'BREAKOUT_FAIL')
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = pos.get('lot_size', 1)
+                            cap = pos.get('margin_required', entry_prem_bf * lot_size * 3) if pos['is_sell'] else entry_prem_bf * lot_size
+                            notify_trade_exit(market="STOCKS", strategy=pos['strategy'],
+                                symbol=symbol, signal_type=pos['signal_type'],
+                                strike=pos['strike'], entry_price=entry_prem_bf,
+                                exit_price=current_premium, entry_time=pos['timestamp'],
+                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                                exit_reason='BREAKOUT_FAIL')
+                        except Exception:
+                            pass
+                        continue
+
             # ---- TRAILING STOP LOSS — 3-Phase System ----
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
-            target = details.get('target', pos['entry_premium'] * 1.5)
+            # v10.1: Use dynamically updated target (from trailing target) if available
+            target = pos.get('target', details.get('target', pos['entry_premium'] * 1.5))
             sl = details.get('sl', pos['entry_premium'] * 0.5)
 
             if not pos['is_sell']:
@@ -2486,20 +2664,46 @@ class StockPaperTrader:
 
             exit_reason = None
 
-            if pos['is_sell']:
-                if current_premium <= target:
-                    exit_reason = 'TARGET_HIT'
-                elif current_premium >= sl:
+            if not pos['is_sell']:
+                # BUY positions
+                if current_premium <= sl:
                     exit_reason = 'SL_HIT'
                 elif pos.get('dte', 30) <= 0:
                     exit_reason = 'EXPIRY'
+                elif current_premium >= target:
+                    # v10.1: Trailing target — extend instead of hard exit
+                    if TARGET_TRAIL_ENABLED and pos.get('target_extensions', 0) < TARGET_TRAIL_MAX_EXTENSIONS:
+                        gain_pct = (current_premium - pos['entry_premium']) / pos['entry_premium'] * 100 if pos['entry_premium'] > 0 else 0
+                        new_target = round(current_premium * (1 + TARGET_TRAIL_EXTEND_PCT / 100), 2)
+                        new_tsl = round(pos.get('peak_premium', current_premium) * (1 - TARGET_TRAIL_TSL_DISTANCE_PCT / 100), 2)
+                        new_tsl = max(new_tsl, pos.get('trailing_sl') or 0)
+                        pos['target_extensions'] = pos.get('target_extensions', 0) + 1
+                        pos['target'] = new_target
+                        pos['trailing_sl'] = new_tsl
+                        logger.info(f"  TARGET_TRAIL: {pos['id']} BUY ext#{pos['target_extensions']} "
+                                   f"gain={gain_pct:.0f}% -> target Rs {new_target:.2f}, TSL Rs {new_tsl:.2f}")
+                    else:
+                        exit_reason = 'TARGET_HIT'
             else:
-                if current_premium >= target:
-                    exit_reason = 'TARGET_HIT'
-                elif current_premium <= sl:
+                # SELL positions
+                if current_premium >= sl:
                     exit_reason = 'SL_HIT'
                 elif pos.get('dte', 30) <= 0:
                     exit_reason = 'EXPIRY'
+                elif current_premium <= target:
+                    # v10.1: Trailing target for SELL
+                    if TARGET_TRAIL_ENABLED and pos.get('target_extensions', 0) < TARGET_TRAIL_MAX_EXTENSIONS:
+                        gain_pct = (pos['entry_premium'] - current_premium) / pos['entry_premium'] * 100 if pos['entry_premium'] > 0 else 0
+                        new_target = round(current_premium * (1 - TARGET_TRAIL_EXTEND_PCT / 100), 2)
+                        new_tsl = round(pos.get('trough_premium', current_premium) * (1 + TARGET_TRAIL_TSL_DISTANCE_PCT / 100), 2)
+                        new_tsl = min(new_tsl, pos.get('trailing_sl') or float('inf'))
+                        pos['target_extensions'] = pos.get('target_extensions', 0) + 1
+                        pos['target'] = new_target
+                        pos['trailing_sl'] = new_tsl
+                        logger.info(f"  TARGET_TRAIL: {pos['id']} SELL ext#{pos['target_extensions']} "
+                                   f"gain={gain_pct:.0f}% -> target Rs {new_target:.2f}, TSL Rs {new_tsl:.2f}")
+                    else:
+                        exit_reason = 'TARGET_HIT'
 
             if exit_reason:
                 self.portfolio.close_position(pos['id'], current_premium, exit_reason)
@@ -2783,6 +2987,32 @@ class StockPaperTrader:
             if in_cooldown:
                 skipped += 1
                 continue
+
+            # ---- v10.1: DIRECTION VALIDATION — the primary filter ----
+            dir_spot = self.get_stock_spot(symbol) or sig.get('spot', 0)
+            if dir_spot:
+                intra = self.engine.intraday_data.get(symbol)
+                if intra is not None and len(intra) > 0:
+                    dir_ohlc = {
+                        'open': intra.iloc[0].get('open', dir_spot),
+                        'high': intra['high'].max() if 'high' in intra.columns else dir_spot,
+                        'low': intra['low'].min() if 'low' in intra.columns else dir_spot,
+                        'close': dir_spot, 'volume': 0,
+                    }
+                else:
+                    dir_ohlc = {'open': dir_spot, 'high': dir_spot, 'low': dir_spot,
+                                'close': dir_spot, 'volume': 0}
+                dir_indicators = self.engine.compute_indicators(symbol, dir_ohlc)
+                if dir_indicators:
+                    dir_valid, dir_reason, dir_adj = validate_signal_direction(
+                        signal_type, dir_spot, dir_ohlc, dir_indicators)
+                    if not dir_valid:
+                        logger.info(f"  DIR_REJECT: {symbol} {signal_type} -- {dir_reason}")
+                        skipped += 1
+                        continue
+                    logger.info(f"  DIR_PASS: {symbol} {signal_type} -- {dir_reason}")
+                    score = max(0, min(100, score + dir_adj))
+                    sig['quality_score'] = score
 
             # Get spot and determine strike
             spot = self.get_stock_spot(symbol)

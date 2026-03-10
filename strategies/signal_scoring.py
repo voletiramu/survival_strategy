@@ -88,16 +88,16 @@ def compute_signal_score(signal, spot, indicators, vix=None):
         else:
             score += 2
 
-    # ---- 4. MOMENTUM (0-20): body direction matches signal ----
+    # ---- 4. MOMENTUM (0-25): direction match — v10.1 INCREASED WEIGHT ----
     prev_close = indicators.get('prev_close', spot)
     body = spot - prev_close
     if is_buy:
         if (is_ce and body > 0) or (not is_ce and body < 0):
-            score += 20
+            score += 25          # Perfect direction match (was 20)
         elif abs(body) < atr * 0.1:
-            score += 10
+            score += 10          # Near-flat (acceptable)
         else:
-            score += 3
+            score -= 10          # v10.1: AGAINST direction = PENALTY (was +3!)
     else:
         # SELL prefers flat/range-bound
         if abs(body) < atr * 0.2:

@@ -83,7 +83,8 @@ def check_pcr_vwap(spot, indicators, config):
     pcr_bear = config.get('pcr_bear_threshold', 0.95)
 
     # ---- BUY CE: Bullish PCR, spot near/above VWAP ----
-    if pcr > pcr_bull and abs(spot - vwap) < tolerance * 2 and spot >= vwap * 0.995:
+    # v10.1: Fixed direction bug — CE requires spot > VWAP (was 0.995x allowing below)
+    if pcr > pcr_bull and abs(spot - vwap) < tolerance * 2 and spot > vwap:
         chain_ltp = config.get('chain_ltp_ce', 0)
         chain_iv = config.get('chain_iv_ce', 0)
         chain_strike = config.get('chain_strike_ce', 0)
@@ -106,7 +107,8 @@ def check_pcr_vwap(spot, indicators, config):
             })
 
     # ---- BUY PE: Bearish PCR, spot near/below VWAP ----
-    elif pcr < pcr_bear and abs(spot - vwap) < tolerance * 2 and spot <= vwap * 1.005:
+    # v10.1: Fixed direction bug — PE requires spot < VWAP (was 1.005x allowing above)
+    elif pcr < pcr_bear and abs(spot - vwap) < tolerance * 2 and spot < vwap:
         chain_ltp = config.get('chain_ltp_pe', 0)
         chain_iv = config.get('chain_iv_pe', 0)
         chain_strike = config.get('chain_strike_pe', 0)
