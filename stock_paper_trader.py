@@ -311,8 +311,9 @@ class StockCPRScanner:
         if df is None or len(df) < 15:
             return None
 
-        # Previous day OHLC (for CPR calculation)
-        prev = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+        # v9.6b: Use last complete bar = yesterday's OHLC (for next-day CPR)
+        # Historical data is ONE_DAY interval; last row IS yesterday's complete candle
+        prev = df.iloc[-1]
         pivot = (prev['High'] + prev['Low'] + prev['Close']) / 3
         bc = (prev['High'] + prev['Low']) / 2
         tc = 2 * pivot - bc
@@ -376,10 +377,10 @@ class StockCPRScanner:
         }
 
     def scan_all_stocks(self, max_stocks=5, cpr_threshold=0.5):
-        """Scan all F&O stocks and return top candidates by narrow CPR.
+        """v9.6b: Scan ALL F&O stocks (not just tiers) for narrow CPR.
 
-        Scans TIER1 first, then TIER2, then TIER3. Stops early if enough
-        narrow-CPR candidates found.
+        Scans the full universe of ~207 F&O stocks from instruments master.
+        Scores by CPR narrowness + liquidity. Returns top candidates.
 
         Args:
             max_stocks: Maximum stocks to return (default 5).
@@ -389,38 +390,34 @@ class StockCPRScanner:
             List of dicts: [{symbol, cpr_width, tier, indicators, score}].
         """
         logger.info("=" * 60)
-        logger.info("STOCK CPR SCANNER: Scanning F&O stocks for narrow CPR...")
+        logger.info("STOCK CPR SCANNER: Scanning ALL F&O stocks for narrow CPR...")
         logger.info("=" * 60)
 
+        all_symbols = self.fno_config.get_all_fno_symbols()
+        logger.info(f"  Total F&O stocks to scan: {len(all_symbols)}")
+
         candidates = []
+        scanned = 0
+        no_data = 0
 
-        # Scan tiers in order
-        tier_groups = [
-            (1, TIER1_STOCKS),
-            (2, TIER2_STOCKS),
-            (3, TIER3_STOCKS),
-        ]
+        for symbol in all_symbols:
+            indicators = self.compute_stock_cpr(symbol)
+            if indicators is None:
+                no_data += 1
+                continue
+            scanned += 1
 
-        for tier_num, tier_stocks in tier_groups:
-            logger.info(f"\n  Scanning TIER {tier_num} ({len(tier_stocks)} stocks)...")
-            tier_candidates = []
+            cpr_w = indicators['cpr_width']
+            stock_info = self.fno_config.stocks.get(symbol, {})
+            liquidity = stock_info.get('liquidity', 'LOW')
+            tier_num = stock_info.get('tier', 4)
 
-            for symbol in tier_stocks:
-                indicators = self.compute_stock_cpr(symbol)
-                if indicators is None:
-                    logger.debug(f"    {symbol}: No data")
-                    continue
+            # Score: lower CPR = better, higher liquidity = better
+            liq_bonus = {'VERY_HIGH': 20, 'HIGH': 15, 'MEDIUM': 10, 'LOW': 5}.get(liquidity, 5)
+            cpr_score = max(0, 100 - cpr_w * 200)  # 0% CPR = 100, 0.5% = 0
+            total_score = cpr_score + liq_bonus
 
-                cpr_w = indicators['cpr_width']
-                stock_info = self.fno_config.stocks.get(symbol, {})
-                liquidity = stock_info.get('liquidity', 'LOW')
-
-                # Score: lower CPR = better, higher liquidity = better, lower tier = better
-                liq_bonus = {'VERY_HIGH': 20, 'HIGH': 15, 'MEDIUM': 10, 'LOW': 5}.get(liquidity, 5)
-                tier_bonus = {1: 15, 2: 10, 3: 5}.get(tier_num, 0)
-                cpr_score = max(0, 100 - cpr_w * 200)  # 0% CPR = 100, 0.5% = 0
-                total_score = cpr_score + liq_bonus + tier_bonus
-
+            if cpr_w <= cpr_threshold:
                 entry = {
                     'symbol': symbol,
                     'cpr_width': cpr_w,
@@ -432,26 +429,21 @@ class StockCPRScanner:
                     'strike_interval': stock_info.get('strike_interval', 0),
                     'sector': stock_info.get('sector', 'UNKNOWN'),
                 }
+                candidates.append(entry)
 
-                if cpr_w <= cpr_threshold:
-                    tier_candidates.append(entry)
-                    cpr_label = 'NARROW' if cpr_w < 0.3 else 'MODERATE'
-                    logger.info(f"    {symbol:12s} CPR={cpr_w:.3f}% [{cpr_label}] "
-                                f"ATR={indicators['atr']:.1f} Score={total_score:.0f} "
-                                f"[{liquidity}]")
-                else:
-                    logger.debug(f"    {symbol}: CPR={cpr_w:.3f}% > {cpr_threshold}% (skip)")
+        logger.info(f"  Scanned: {scanned} | No data: {no_data} | Narrow CPR candidates: {len(candidates)}")
 
-            candidates.extend(tier_candidates)
-
-            # If TIER1 + TIER2 gave enough candidates, skip TIER3 scan
-            if tier_num == 2 and len(candidates) >= max_stocks:
-                logger.info(f"  Found {len(candidates)} candidates from TIER1+TIER2, skipping TIER3")
-                break
+        # Log top narrow CPR stocks
+        candidates.sort(key=lambda x: x['cpr_width'])
+        for c in candidates[:20]:
+            cpr_label = 'NARROW' if c['cpr_width'] < 0.3 else 'MODERATE'
+            logger.info(f"    {c['symbol']:12s} CPR={c['cpr_width']:.3f}% [{cpr_label}] "
+                        f"ATR={c['indicators']['atr']:.1f} Score={c['score']:.0f} "
+                        f"[{c['liquidity']}]")
 
         # Sort by score (highest first) and take top N
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        top = candidates[:max_stocks]
+        top = candidates[:max_stocks * 2]  # Take extra for diversification
 
         # Sector diversification: max 2 stocks from same sector
         diversified = []
@@ -461,6 +453,8 @@ class StockCPRScanner:
             if sector_count.get(sec, 0) < 2:
                 diversified.append(c)
                 sector_count[sec] = sector_count.get(sec, 0) + 1
+            if len(diversified) >= max_stocks:
+                break
 
         self._scan_results = diversified
         self._scan_date = datetime.now().strftime('%Y-%m-%d')
