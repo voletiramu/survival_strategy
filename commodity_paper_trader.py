@@ -188,6 +188,12 @@ MCX_MAX_SAME_DIRECTION_PER_COMMODITY = 5  # v9.5: Max BUY_CE or BUY_PE per commo
 MCX_SCORE_ESCALATION_PER_REENTRY = 15    # v9.5: Each re-entry same strat+dir needs +15 score
 MCX_MIN_OI_EXIT_PNL = 50              # Min Rs 50 PnL to allow OI/IV exit (covers 2x MCX brokerage)
 
+# v9.6: VIX adaptation (ported from equity — same VIX affects commodity sentiment)
+MCX_VIX_LOW_THRESHOLD = 14            # Below 14 = low vol regime → stricter filters 1.5x
+MCX_VIX_HIGH_THRESHOLD = 20           # Above 20 = high vol regime → relax filters 0.8x
+MCX_VIX_LOW_MULTIPLIER = 1.5
+MCX_VIX_HIGH_MULTIPLIER = 0.8
+
 # MCX Trading costs
 MCX_BROKERAGE = 20
 MCX_CTT = 0.0001
@@ -446,7 +452,16 @@ def mcx_compute_signal_score(signal, spot, indicators, vix=None):
         else:
             score += 8
 
-    return min(score, 100)
+    # v9.6: DATA QUALITY PENALTY — penalize when critical market data is missing
+    data_quality = indicators.get('_data_quality', {})
+    if not data_quality.get('has_iv', True):
+        score -= 15  # No IV data = blind entry, heavy penalty
+    if not data_quality.get('has_pcr', True):
+        score -= 10  # No PCR = no sentiment confirmation
+    if not data_quality.get('has_vwap', True):
+        score -= 5   # Missing VWAP is less critical
+
+    return max(min(score, 100), 0)
 
 
 def mcx_compute_hold_score(pos, spot, indicators, current_oi=None, current_iv=None):
@@ -961,21 +976,45 @@ class CommodityStrategyEngine:
         strike_int = spec['strike_interval']
         iv = ind['iv']
         T = dte / 365
+        cpr_w = ind['cpr_width']
 
-        if ind['cpr_width'] < 0.4:
+        # v9.6: Multi-tier CPR targets (ported from equity)
+        # Narrow (<0.3%): strong breakout → highest targets
+        # Moderate (0.3-0.6%): directional trade → standard targets
+        # Wide (>0.6%): mean reversion → SELL only (conservative targets)
+        if cpr_w < 0.3:
+            cpr_label = "Narrow"
+            target_hit_mult = 1.5    # 50% gain (Camarilla confirmed)
+            target_base_mult = 1.3   # 30% gain (no Camarilla confirmation)
+            sl_mult = 0.5
+        elif cpr_w <= 0.6:
+            cpr_label = "Moderate"
+            target_hit_mult = 1.4    # 40% gain
+            target_base_mult = 1.25  # 25% gain
+            sl_mult = 0.5
+        else:
+            cpr_label = "Wide"
+            target_hit_mult = 1.3    # 30% gain
+            target_base_mult = 1.2   # 20% gain
+            sl_mult = 0.5
+
+        # BUY breakout for Narrow + Moderate CPR (cpr_w <= 0.6)
+        if cpr_w <= 0.6:
             if spot > ind['tc']:
                 # v9.5: Greeks-based strike selection (best delta + highest gamma)
                 opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
                 ce_strike = opt['strike']
                 g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
-                    logger.info(f"  GREEKS_STRIKE: {commodity} CE ATM={round(spot/strike_int)*strike_int} "
+                    # v9.6: Camarilla confirmation — higher target if R3 already breached
+                    use_target = target_hit_mult if ohlc['high'] > ind['cam_r3'] else target_base_mult
+                    logger.info(f"  GREEKS_STRIKE: {commodity} CE {cpr_label} CPR ATM={round(spot/strike_int)*strike_int} "
                                f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
                     signals.append({
                         'type': 'BUY_CE_CPR', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
-                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bullish breakout",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
+                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout",
+                        'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
                     })
             elif spot < ind['bc']:
                 # v9.5: Greeks-based strike selection (best delta + highest gamma)
@@ -983,16 +1022,19 @@ class CommodityStrategyEngine:
                 pe_strike = opt['strike']
                 g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
-                    logger.info(f"  GREEKS_STRIKE: {commodity} PE ATM={round(spot/strike_int)*strike_int} "
+                    # v9.6: Camarilla confirmation — higher target if S3 already breached
+                    use_target = target_hit_mult if ohlc['low'] < ind['cam_s3'] else target_base_mult
+                    logger.info(f"  GREEKS_STRIKE: {commodity} PE {cpr_label} CPR ATM={round(spot/strike_int)*strike_int} "
                                f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
                     signals.append({
                         'type': 'BUY_PE_CPR', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
-                        'reason': f"Narrow CPR ({ind['cpr_width']:.3f}%) bearish breakout",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
+                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout",
+                        'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
                     })
 
-        elif ind['cpr_width'] > 0.6:
+        # SELL mean reversion: Wide CPR only (> 0.6%) — unchanged from v9.5
+        if cpr_w > 0.6:
             margin_ok = self.portfolio.capital >= spec['margin']
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_int) * strike_int
@@ -1017,12 +1059,33 @@ class CommodityStrategyEngine:
         return signals
 
     def check_gamma_blast_signals(self, commodity, spot, ohlc, ind, dow, dte):
+        """Gamma Blast — fires on ALL trading days with DTE-aware parameters.
+        v9.6: IV multiplier and targets scale based on DTE (MCX monthly expiry).
+        """
         signals = []
         spec = COMMODITIES[commodity]
         strike_int = spec['strike_interval']
         iv = ind['iv']
         atr = ind['atr']
-        T = max(3, dte) / 365
+
+        # v9.6: DTE-aware parameter scaling (runs ALL days, adjusts targets/IV)
+        # MCX has monthly expiry — DTE ranges 5-15 (from formula max(5, 15-(day%28)))
+        actual_dte = max(1, dte)
+        T = actual_dte / 365
+
+        # IV multiplier: higher when closer to expiry (gamma spike)
+        if actual_dte <= 3:
+            iv_mult = 1.3      # Near expiry: gamma spike
+            target_mult = 1.6  # 60% gain target
+            sl_mult = 0.4      # Wider SL for gamma moves
+        elif actual_dte <= 7:
+            iv_mult = 1.2
+            target_mult = 1.5  # 50% gain
+            sl_mult = 0.5
+        else:
+            iv_mult = max(1.0, 1.3 - actual_dte * 0.02)   # Gradually decrease
+            target_mult = max(1.3, 1.5 - actual_dte * 0.01)  # 30-50% gain
+            sl_mult = 0.5
 
         if ind['prev_range'] > 1.2:
             return signals
@@ -1035,31 +1098,33 @@ class CommodityStrategyEngine:
         if abs(body) > atr * 0.2:
             if body > 0:
                 # v9.5: Greeks-based strike selection (best delta + highest gamma)
-                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * 1.2, 'CE', MCX_MIN_PREMIUM_BUY)
+                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'CE', MCX_MIN_PREMIUM_BUY)
                 ce_strike = opt['strike']
                 g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
                     logger.info(f"  GREEKS_STRIKE: {commodity} CE(Gamma) ATM={round(spot/strike_int)*strike_int} "
-                               f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
+                               f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
+                               f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
                     signals.append({
                         'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
                         'premium': g['price'], 'greeks': g,
-                        'reason': f"Gamma Blast: Up breakout body={body:.1f}",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
+                        'reason': f"Gamma Blast: Up breakout body={body:.1f} DTE={actual_dte}",
+                        'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
                     })
             else:
                 # v9.5: Greeks-based strike selection (best delta + highest gamma)
-                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * 1.2, 'PE', MCX_MIN_PREMIUM_BUY)
+                opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'PE', MCX_MIN_PREMIUM_BUY)
                 pe_strike = opt['strike']
                 g = opt['greeks']
                 if g['price'] > MCX_MIN_PREMIUM_BUY:
                     logger.info(f"  GREEKS_STRIKE: {commodity} PE(Gamma) ATM={round(spot/strike_int)*strike_int} "
-                               f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
+                               f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
+                               f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
                     signals.append({
                         'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
                         'premium': g['price'], 'greeks': g,
-                        'reason': f"Gamma Blast: Down breakout body={body:.1f}",
-                        'target': g['price'] * 1.5, 'sl': g['price'] * 0.5,
+                        'reason': f"Gamma Blast: Down breakout body={body:.1f} DTE={actual_dte}",
+                        'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
                     })
         return signals
 
@@ -1552,8 +1617,11 @@ class CommodityPaperTrader:
         self.daily_trade_count += len(self.portfolio.positions)
         if self.daily_trade_count > 0:
             logger.info(f"  MCX_RESTART_SAFE: Recovered daily_trade_count={self.daily_trade_count} from portfolio state")
-        self.exit_history = []          # [{commodity, direction, time}] for re-entry cooldown
+        self.exit_history = []          # [{commodity, direction, time, reason}] for re-entry cooldown
         self.ghost_zone_losses = {}     # {(commodity, 'CE'/'PE'): datetime}
+        # v9.6: VIX infrastructure (ported from equity)
+        self.current_vix = None
+        self._vix_cache = {'value': None, 'time': None}
 
     def connect(self):
         connected = self.angel.connect()
@@ -1561,6 +1629,46 @@ class CommodityPaperTrader:
         if connected and self.ws_feed and self.angel._futures_tokens:
             self.ws_feed.set_mcx_tokens(self.angel._futures_tokens)
         return connected
+
+    def _fetch_india_vix(self):
+        """v9.6: Fetch India VIX. Cached 120s. Same VIX affects commodity sentiment.
+        Uses Angel API with NSE VIX tokens (same API, different exchange segment).
+        """
+        cached = self._vix_cache
+        if cached['value'] and cached['time'] and (datetime.now() - cached['time']).total_seconds() < 120:
+            return cached['value']
+        for token in ['26017', '99926004']:
+            try:
+                ltp = self.angel.get_ltp('NSE', token)
+                if ltp and ltp > 0:
+                    vix = ltp
+                    # Normalize: Angel may return VIX x100 or x1000
+                    if vix > 1000:
+                        vix = vix / 1000
+                    elif vix > 100:
+                        vix = vix / 100
+                    if 5 < vix < 80:
+                        self._vix_cache = {'value': vix, 'time': datetime.now()}
+                        self.current_vix = vix
+                        return vix
+            except Exception:
+                pass
+        return self.current_vix  # Return last known or None
+
+    def get_vix_multiplier(self):
+        """v9.6: Return threshold multiplier based on VIX level.
+        Low VIX (<14): 1.5x (harder to enter, wider exits)
+        Normal (14-20): 1.0x
+        High VIX (>20): 0.8x (easier to enter)
+        """
+        vix = self.current_vix
+        if vix is None:
+            return 1.0
+        if vix < MCX_VIX_LOW_THRESHOLD:
+            return MCX_VIX_LOW_MULTIPLIER
+        elif vix > MCX_VIX_HIGH_THRESHOLD:
+            return MCX_VIX_HIGH_MULTIPLIER
+        return 1.0
 
     def get_spot(self, commodity):
         """Get current spot price for commodity.
@@ -1830,12 +1938,18 @@ class CommodityPaperTrader:
         # v2.5.2: Get unrealized PnL for loss-only exits
         unrealized_pnl = pos.get('unrealized_pnl', 0)
 
+        # v9.6: Dynamic OI loss threshold (ported from equity)
+        # Fixed -200 was too tight for expensive options, too loose for cheap ones
+        spec = COMMODITIES.get(pos.get('commodity', ''), {})
+        trade_value = pos.get('entry_premium', 0) * spec.get('lot_size', 1) * spec.get('multiplier', 1)
+        oi_loss_threshold = max(-(trade_value * 0.15), -1500)  # 15% of trade value, capped at -1500
+
         # v8.0: OI/IV signals TIGHTEN SL instead of forcing exit
         # Rule 1: OI surge (time-adaptive) — v8.0: tighten SL, never force exit
         if oi_change > oi_threshold:
-            if unrealized_pnl >= -200:
+            if unrealized_pnl >= oi_loss_threshold:
                 logger.info(f"  MCX_OI_HOLD: {pos['id']} OI={oi_change:.1f}% > {oi_threshold:.0f}% "
-                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+                           f"but PnL Rs {unrealized_pnl:.0f} >= {oi_loss_threshold:.0f} (dynamic). Holding.")
             else:
                 logger.info(f"  MCX_OI_SL_TIGHTEN: {pos['id']} OI changed {oi_change:.1f}% > {oi_threshold:.0f}% "
                            f"PnL Rs {unrealized_pnl:.0f} (LOSING). "
@@ -1859,9 +1973,9 @@ class CommodityPaperTrader:
                 logger.info(f"  MCX_IV_FAVORABLE: {pos['id']} IV changed {iv_raw_change:+.1f}% "
                            f"({'DROP' if iv_raw_change < 0 else 'RISE'}) — favorable for "
                            f"{'SELL' if is_sell else 'BUY'} position. Holding.")
-            elif unrealized_pnl >= -200:
+            elif unrealized_pnl >= oi_loss_threshold:
                 logger.info(f"  MCX_IV_HOLD: {pos['id']} IV={iv_change:.1f}% > {iv_threshold:.0f}% "
-                           f"but PnL Rs {unrealized_pnl:.0f} >= -200. Holding.")
+                           f"but PnL Rs {unrealized_pnl:.0f} >= {oi_loss_threshold:.0f} (dynamic). Holding.")
             else:
                 logger.info(f"  MCX_IV_SL_TIGHTEN: {pos['id']} IV changed {iv_raw_change:+.1f}% > {iv_threshold:.0f}% "
                            f"PnL Rs {unrealized_pnl:.0f} — hurting {'SELL' if is_sell else 'BUY'} position. "
@@ -2135,6 +2249,43 @@ class CommodityPaperTrader:
             return
 
         logger.info(f"\n  {len(signals)} COMMODITY SIGNALS (PAPER):")
+
+        # v9.6: PRE-FILTER — suppress weaker direction in CE vs PE conflicts (ported from equity)
+        by_commodity = {}
+        for sig in signals:
+            comm = sig['commodity']
+            direction = 'CE' if 'CE' in sig['type'] else 'PE'
+            by_commodity.setdefault(comm, {}).setdefault(direction, []).append(sig)
+
+        suppressed = set()
+        for comm, directions in by_commodity.items():
+            if 'CE' in directions and 'PE' in directions:
+                best_ce = max(directions['CE'], key=lambda s: s.get('quality_score', 0))
+                best_pe = max(directions['PE'], key=lambda s: s.get('quality_score', 0))
+                ce_score = best_ce.get('quality_score', 0)
+                pe_score = best_pe.get('quality_score', 0)
+                if ce_score > pe_score:
+                    for s in directions['PE']:
+                        suppressed.add(id(s))
+                    logger.info(f"  MCX_CONFLICT_FILTER: {comm} CE(score={ce_score}) > PE(score={pe_score}) "
+                               f"— suppressing {len(directions['PE'])} PE signals")
+                elif pe_score > ce_score:
+                    for s in directions['CE']:
+                        suppressed.add(id(s))
+                    logger.info(f"  MCX_CONFLICT_FILTER: {comm} PE(score={pe_score}) > CE(score={ce_score}) "
+                               f"— suppressing {len(directions['CE'])} CE signals")
+                # Equal scores: keep both (let other filters decide)
+
+        signals = [s for s in signals if id(s) not in suppressed]
+        if suppressed:
+            logger.info(f"  {len(suppressed)} conflicting commodity signals suppressed, {len(signals)} remaining")
+
+        # v9.6: Fetch VIX for threshold adjustment (ported from equity)
+        self._fetch_india_vix()
+        vix_mult = self.get_vix_multiplier()
+        if self.current_vix:
+            logger.info(f"  MCX_VIX: {self.current_vix:.1f} (multiplier={vix_mult:.1f}x)")
+
         executed = 0
         skipped = 0
         for sig in signals:
@@ -2304,12 +2455,37 @@ class CommodityPaperTrader:
                         skipped += 1
                         continue
 
+            # ---- v9.6: Stale CPR pivot validation (ported from equity) ----
+            if 'CPR' in sig.get('strategy', '') or 'CPR' in sig.get('type', ''):
+                sig_indicators = self.engine.compute_indicators(sig['commodity'],
+                                 self.get_intraday_ohlc(sig['commodity']) or
+                                 {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'],
+                                  'close': sig['spot'], 'volume': 0})
+                if sig_indicators:
+                    pivot = sig_indicators.get('pivot', 0)
+                    if pivot > 0:
+                        distance_pct = abs(sig['spot'] - pivot) / pivot * 100
+                        if distance_pct > 3.0:
+                            logger.info(f"  MCX_SKIP_STALE_CPR: {sig['commodity']} {sig['type']} "
+                                       f"spot={sig['spot']:.0f} is {distance_pct:.1f}% from pivot={pivot:.0f} (max 3%)")
+                            skipped += 1
+                            continue
+
+            # ---- v9.6: VIX-adjusted minimum premium check (ported from equity) ----
+            is_sell = 'SELL' in sig['type']
+            min_prem = (MCX_MIN_PREMIUM_SELL if is_sell else MCX_MIN_PREMIUM_BUY) * vix_mult
+            if sig['premium'] < min_prem:
+                logger.info(f"  MCX_SKIP_PREMIUM: {sig['commodity']} {sig['type']} Rs {sig['premium']:.2f} "
+                           f"< VIX-adjusted min Rs {min_prem:.2f} (VIX mult={vix_mult}x)")
+                skipped += 1
+                continue
+
             # ---- v9.5: Signal quality score check (MANDATORY — no bypass) ----
             min_score_required = sig.get('_escalated_min_score', MCX_MIN_SIGNAL_SCORE)
             indicators = self.engine.compute_indicators(sig['commodity'],
                          {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
             if indicators:
-                score = mcx_compute_signal_score(sig, sig['spot'], indicators)
+                score = mcx_compute_signal_score(sig, sig['spot'], indicators, self.current_vix)
                 sig['quality_score'] = score
                 if score < min_score_required:
                     logger.info(f"  SKIP_QUALITY: {sig['commodity']} {sig['type']} score={score} < {min_score_required}"

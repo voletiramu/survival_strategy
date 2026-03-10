@@ -627,6 +627,35 @@ class OIPaperTrader:
         if now_time > LAST_ENTRY_TIME:
             return
 
+        # v9.6: PRE-FILTER — suppress weaker direction in CE vs PE conflicts (ported from equity)
+        by_symbol = {}
+        for sig in signals:
+            sym = sig['symbol']
+            direction = 'CE' if 'CE' in sig.get('signal_type', '') else 'PE'
+            by_symbol.setdefault(sym, {}).setdefault(direction, []).append(sig)
+
+        suppressed = set()
+        for sym, directions in by_symbol.items():
+            if 'CE' in directions and 'PE' in directions:
+                best_ce = max(directions['CE'], key=lambda s: s.get('quality_score', 0))
+                best_pe = max(directions['PE'], key=lambda s: s.get('quality_score', 0))
+                ce_score = best_ce.get('quality_score', 0)
+                pe_score = best_pe.get('quality_score', 0)
+                if ce_score > pe_score:
+                    for s in directions['PE']:
+                        suppressed.add(id(s))
+                    logger.info(f"  OI_CONFLICT_FILTER: {sym} CE(score={ce_score}) > PE(score={pe_score}) "
+                               f"— suppressing {len(directions['PE'])} PE signals")
+                elif pe_score > ce_score:
+                    for s in directions['CE']:
+                        suppressed.add(id(s))
+                    logger.info(f"  OI_CONFLICT_FILTER: {sym} PE(score={pe_score}) > CE(score={ce_score}) "
+                               f"— suppressing {len(directions['CE'])} CE signals")
+
+        signals = [s for s in signals if id(s) not in suppressed]
+        if suppressed:
+            logger.info(f"  {len(suppressed)} conflicting OI signals suppressed, {len(signals)} remaining")
+
         skipped = 0
         for sig in signals:
             if self.daily_trade_count >= MAX_TRADES_PER_DAY:
