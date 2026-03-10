@@ -1596,6 +1596,27 @@ class StrategyEngine:
         if df is None:
             return None
 
+        # v9.6d: Force refresh if data is stale and angel is connected
+        # (load_historical at startup runs before connect(), so download is skipped)
+        if df is not None and len(df) > 0 and self.angel and self.angel._connected:
+            last_date = df.index[-1]
+            if hasattr(last_date, 'date'):
+                last_date = last_date.date()
+            days_old = (datetime.now().date() - last_date).days
+            if days_old > 1:
+                logger.info(f"Historical data for {symbol} last date={last_date}, {days_old}d old — refreshing...")
+                angel_map = {
+                    'NIFTY': 'NIFTY_spot_one_day_2000d.csv',
+                    'BANKNIFTY': 'BANKNIFTY_spot_one_day_2000d.csv',
+                    'SENSEX': 'SENSEX_spot_one_day_2000d.csv',
+                }
+                fpath = os.path.join(OPTIONS_DIR, angel_map.get(symbol, ''))
+                if fpath:
+                    self._download_historical_equity(symbol, fpath)
+                    refreshed = self.load_historical(symbol)
+                    if refreshed is not None:
+                        df = refreshed
+
         # If we have live OHLC, append it
         if current_ohlc:
             today = pd.Timestamp.now().normalize()

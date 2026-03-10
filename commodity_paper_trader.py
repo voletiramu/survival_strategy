@@ -905,6 +905,22 @@ class CommodityStrategyEngine:
         if df is None:
             return None
 
+        # v9.6d: Force refresh if data is stale and angel is connected
+        # (load_historical at startup runs before connect(), so download is skipped)
+        if df is not None and len(df) > 0 and self.angel and self.angel._connected:
+            last_date = df.index[-1]
+            if hasattr(last_date, 'date'):
+                last_date = last_date.date()
+            days_old = (datetime.now().date() - last_date).days
+            if days_old > 1:  # Data is more than 1 day old
+                logger.info(f"Historical data for {commodity} last date={last_date}, {days_old}d old — refreshing...")
+                spec = COMMODITIES[commodity]
+                fpath = os.path.join(DATA_DIR, spec['file'])
+                self._download_historical_commodity(commodity, fpath)
+                refreshed = self.load_historical(commodity)
+                if refreshed is not None:
+                    df = refreshed
+
         spec = COMMODITIES[commodity]
 
         if current_ohlc:
