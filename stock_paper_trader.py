@@ -1071,6 +1071,13 @@ class StockAngelConnection:
                     "name": name,
                     "expirydate": expiry_date,
                 })
+                # v10.2f: Diagnostic logging for strike selection debugging
+                if not data or not data.get('data'):
+                    logger.warning(f"  OPTGREEK_EMPTY: {name} expiry={expiry_date} — "
+                                  f"API returned no data (response={str(data)[:200]})")
+                else:
+                    logger.debug(f"  OPTGREEK_OK: {name} expiry={expiry_date} — "
+                                f"{len(data['data'])} strikes returned, candidates={candidates}")
                 if data and data.get('data'):
                     for strike_data in data['data']:
                         sd_type = strike_data.get('optionType', '')
@@ -3107,18 +3114,15 @@ class StockPaperTrader:
                 entry_iv = strike_data.get('iv', 0)
                 option_token = strike_data.get('token', '')
             else:
-                # Fallback: mathematical estimate
-                strike = round(spot / strike_interval) * strike_interval
-                # Estimate premium using BS model
-                from strategies.greeks import bs_greeks
-                dte = get_dte_monthly()
-                T = max(dte, 1) / 365
-                iv_est = stock_info.get('iv_estimate', 0.25)
-                g = bs_greeks(spot, strike, T, RISK_FREE_RATE, iv_est, opt_type)
-                entry_premium = max(g.get('price', spot * 0.02), MIN_PREMIUM_BUY)
-                entry_oi = 0
-                entry_iv = iv_est
-                option_token = ''
+                # v10.2f: SKIP_NO_LTP — Do NOT trade with Black-Scholes phantom pricing.
+                # Same safeguard as equity bot (paper_trader.py line ~3402).
+                # Without real chain LTP, entry/exit premiums are unreliable.
+                logger.info(f"  SKIP_NO_LTP: {symbol} {opt_type} — no real chain data "
+                            f"(expiry={'found' if expiry_ddmon else 'MISSING'}, "
+                            f"strike_data={'partial' if strike_data else 'None'}). "
+                            f"Black-Scholes fallback DISABLED for stock trades.")
+                skipped += 1
+                continue
 
             # Premium filter
             is_sell = 'SELL' in signal_type
@@ -3345,6 +3349,77 @@ class StockPaperTrader:
         # Execute top signals
         if signals:
             self.execute_paper_signals(signals)
+
+        # v10.2f: Save ALL signals to CSV for backtesting & debugging
+        self.save_signals_log(signals)
+
+    # ================================================================
+    # SAVE SIGNALS LOG — Record all signals for backtesting
+    # ================================================================
+    def save_signals_log(self, signals):
+        """Save ALL scored signals to CSV for future backtests & debugging.
+        v10.2f: Added to stock bot — mirrors equity bot signal logging.
+        Columns: timestamp, strategy, symbol, type, strike, premium, spot,
+                 dte, delta, gamma, theta, vega, iv, oi, quality_score,
+                 target, sl, reason, executed, data_source.
+        """
+        if not signals:
+            return
+        try:
+            today = datetime.now().strftime('%Y%m%d')
+            log_file = os.path.join(STOCK_PAPER_DIR, f'stock_signals_{today}.csv')
+
+            # Build set of executed signal keys for status tracking
+            executed_ids = set()
+            for p in self.portfolio.positions:
+                key = f"{p.get('strategy', '')}_{p.get('symbol', p.get('stock_symbol', ''))}_{p.get('strike', 0)}"
+                executed_ids.add(key)
+
+            rows = []
+            for sig in signals:
+                greeks = sig.get('greeks', {})
+                symbol = sig.get('symbol', '')
+                sig_key = f"{sig.get('strategy', '')}_{symbol}_{sig.get('strike', 0)}"
+
+                # Determine data source (real chain vs Black-Scholes)
+                oi_val = sig.get('oi', 0)
+                data_source = 'REAL_CHAIN' if oi_val and oi_val > 0 else 'BLACK_SCHOLES'
+
+                rows.append({
+                    'timestamp': datetime.now().isoformat(),
+                    'strategy': sig.get('strategy', ''),
+                    'symbol': symbol,
+                    'type': sig.get('type', ''),
+                    'strike': sig.get('strike', 0),
+                    'premium': sig.get('premium', 0),
+                    'spot': sig.get('spot', 0),
+                    'dte': sig.get('dte', 0),
+                    # Greeks
+                    'delta': greeks.get('delta', 0),
+                    'gamma': greeks.get('gamma', 0),
+                    'theta': greeks.get('theta', 0),
+                    'vega': greeks.get('vega', 0),
+                    'iv': greeks.get('iv', sig.get('iv', 0)),
+                    # Market data
+                    'oi': oi_val,
+                    'quality_score': sig.get('quality_score', 0),
+                    # Trade params
+                    'target': sig.get('target', 0),
+                    'sl': sig.get('sl', 0),
+                    'reason': sig.get('reason', ''),
+                    # Execution status & data source
+                    'executed': sig_key in executed_ids,
+                    'data_source': data_source,
+                })
+
+            df = pd.DataFrame(rows)
+            if os.path.exists(log_file):
+                existing = pd.read_csv(log_file)
+                df = pd.concat([existing, df], ignore_index=True)
+            df.to_csv(log_file, index=False)
+            logger.info(f"  Stock signals logged ({len(rows)} rows): {log_file}")
+        except Exception as e:
+            logger.error(f"  Signal logging error: {e}")
 
     # ================================================================
     # RUN CONTINUOUS — Main trading loop

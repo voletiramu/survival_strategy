@@ -2819,6 +2819,17 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
+            # v10.2f: Minimum OI filter — reject illiquid/phantom strikes
+            # GOLDM had trades on strikes with OI=0 (Vol=0 on TradingView)
+            # Angel API returns theoretical LTP even for zero-volume options
+            MIN_ENTRY_OI = 500  # Minimum OI to consider a strike tradeable
+            if entry_oi < MIN_ENTRY_OI:
+                logger.warning(f"  MCX_SKIP_LOW_OI: {sig['commodity']} {sig['strike']}{opt_type} "
+                              f"OI={entry_oi} < {MIN_ENTRY_OI} — illiquid strike rejected. "
+                              f"LTP was Rs {real_ltp:.2f}")
+                skipped += 1
+                continue
+
             if real_ltp and real_ltp > 0:
                 # Preserve target/SL ratios from strategy, apply to real premium
                 if bs_premium > 0:
