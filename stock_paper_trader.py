@@ -1091,10 +1091,21 @@ class StockAngelConnection:
                         ltp = float(strike_data.get('ltp', 0) or 0)
                         iv = float(strike_data.get('impliedVolatility', 0) or 0)
                         volume = float(strike_data.get('tradeVolume', 0) or 0)
+                        # v10.3: Extract delta + gamma from API (was ignored before!)
+                        delta = abs(float(strike_data.get('delta', 0) or 0))
+                        gamma = float(strike_data.get('gamma', 0) or 0)
 
-                        distance = abs(sd_strike - atm_strike) / max(strike_interval, 1)
-                        proximity_score = max(0, 1 - distance * 0.3)
-                        score = (oi * 0.6) + (volume * 0.2) + (proximity_score * 1000 * 0.2)
+                        # v10.3: Delta+Gamma optimized scoring (was OI-only)
+                        delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                        gamma_score = min(gamma * 10000, 5.0)
+                        oi_norm = min(oi / 100000, 1.0)
+                        vol_norm = min(volume / 10000, 1.0)
+                        # Weighted: Delta(35%) + Gamma(25%) + OI(25%) + Volume(15%)
+                        score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+
+                        # FILTER: Skip strikes outside delta range 0.20-0.70
+                        if delta > 0 and (delta < 0.20 or delta > 0.70):
+                            continue
 
                         if score > best_score and ltp > 0:
                             best_score = score
@@ -1104,6 +1115,8 @@ class StockAngelConnection:
                                 'oi': oi,
                                 'iv': iv / 100 if iv > 1 else iv,
                                 'volume': volume,
+                                'delta': delta,    # v10.3: store greeks
+                                'gamma': gamma,
                             }
 
                     if best:
@@ -1112,7 +1125,8 @@ class StockAngelConnection:
                             best['token'] = str(token_info.get('token', ''))
                             best['symbol'] = token_info.get('symbol', '')
                         logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
-                                    f"Selected={best['strike']} OI={best['oi']:,.0f} "
+                                    f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
+                                    f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "
                                     f"LTP={best['ltp']:.2f} IV={best.get('iv', 0)*100:.1f}%")
                         return best
 

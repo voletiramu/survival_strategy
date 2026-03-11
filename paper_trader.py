@@ -173,6 +173,9 @@ BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
 BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
 BREAKOUT_FAIL_REVERSE_ENABLED = True
 
+# v10.3: Import regime-aware parameter function
+from market_regime import get_regime_params  # noqa: E402
+
 # v3.1: Strategy weights from Angel One backtest (PnL + risk-adjusted)
 # Survivor highest PnL (Rs 36.5M avg, 257% annual), Gamma Blast best risk-adjusted (Sharpe 4.42)
 STRATEGY_WEIGHTS = {
@@ -1014,11 +1017,25 @@ class AngelConnection:
                         ltp = float(strike_data.get('ltp', 0) or 0)
                         iv = float(strike_data.get('impliedVolatility', 0) or 0)
                         volume = float(strike_data.get('tradeVolume', 0) or 0)
+                        # v10.3: Extract delta + gamma from API (was ignored before!)
+                        delta = abs(float(strike_data.get('delta', 0) or 0))
+                        gamma = float(strike_data.get('gamma', 0) or 0)
 
-                        # Score: OI (60%) + volume (20%) + proximity to ATM (20%)
-                        distance = abs(sd_strike - atm_strike) / strike_interval
-                        proximity_score = max(0, 1 - distance * 0.3)  # Closer = higher
-                        score = (oi * 0.6) + (volume * 0.2) + (proximity_score * 1000 * 0.2)
+                        # v10.3: Delta+Gamma optimized scoring (was OI-only)
+                        # Delta score: peak at 0.50, drops to 0 at ~0.20/0.80
+                        delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                        # Gamma score: higher gamma = faster premium acceleration
+                        gamma_score = min(gamma * 10000, 5.0)
+                        # OI score: liquidity, normalized
+                        oi_norm = min(oi / 100000, 1.0)
+                        # Volume score: activity, normalized
+                        vol_norm = min(volume / 10000, 1.0)
+                        # Weighted: Delta(35%) + Gamma(25%) + OI(25%) + Volume(15%)
+                        score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+
+                        # FILTER: Skip strikes outside delta range 0.20-0.70
+                        if delta > 0 and (delta < 0.20 or delta > 0.70):
+                            continue
 
                         if score > best_score and ltp > 0:
                             best_score = score
@@ -1028,6 +1045,8 @@ class AngelConnection:
                                 'oi': oi,
                                 'iv': iv / 100 if iv > 1 else iv,  # Normalize to decimal
                                 'volume': volume,
+                                'delta': delta,    # v10.3: store greeks
+                                'gamma': gamma,
                             }
 
                     if best:
@@ -1037,7 +1056,8 @@ class AngelConnection:
                             best['token'] = str(token_info.get('token', ''))
                             best['symbol'] = token_info.get('symbol', '')
                         logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
-                                   f"Selected={best['strike']} OI={best['oi']:,.0f} "
+                                   f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
+                                   f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "
                                    f"LTP={best['ltp']:.2f} IV={best.get('iv', 0)*100:.1f}%")
                         return best
 
@@ -1046,12 +1066,21 @@ class AngelConnection:
 
         # v7.4: BFO/SENSEX fallback — optionGreek API doesn't support BFO
         # Use find_option_tokens + get_market_data per strike to get real LTP
+        # v10.3: Added delta+gamma scoring via bs_greeks calculation
         if name == 'SENSEX' or best is None:
             try:
                 expiry = self._get_nearest_expiry(name) if not expiry_date else expiry_date
                 if expiry:
-                    best_ltp = 0
+                    best_fallback_score = -1
                     best_strike_info = None
+                    # Estimate DTE for greeks calculation
+                    try:
+                        exp_dt = datetime.strptime(expiry, '%d%b%Y')
+                        dte = max((exp_dt.date() - datetime.now().date()).days, 1)
+                    except Exception:
+                        dte = 7
+                    T_fallback = dte / 365
+                    iv_estimate = 0.15  # Conservative default IV for BFO
                     for cand_strike in candidates:
                         token_info = self.find_option_tokens(name, None, cand_strike, opt_type)
                         if token_info:
@@ -1062,23 +1091,35 @@ class AngelConnection:
                                 ltp = float(mkt.get('ltp', 0) or 0)
                                 oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
                                 if ltp > 0:
-                                    distance = abs(cand_strike - atm_strike) / strike_interval
-                                    proximity_score = max(0, 1 - distance * 0.3)
-                                    score = (oi * 0.6) + (proximity_score * 1000 * 0.4)
-                                    if score > best_ltp or best_strike_info is None:
-                                        best_ltp = score
+                                    # v10.3: Calculate delta+gamma via BS model
+                                    g = bs_greeks(spot, cand_strike, T_fallback, RISK_FREE_RATE, iv_estimate, opt_type)
+                                    delta = abs(g['delta'])
+                                    gamma = g['gamma']
+                                    # Same scoring as primary path
+                                    delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                                    gamma_score = min(gamma * 10000, 5.0)
+                                    oi_norm = min(oi / 100000, 1.0)
+                                    score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (0.5 * 15)
+                                    # Filter delta range
+                                    if delta < 0.20 or delta > 0.70:
+                                        continue
+                                    if score > best_fallback_score:
+                                        best_fallback_score = score
                                         best_strike_info = {
                                             'strike': cand_strike,
                                             'ltp': ltp,
                                             'oi': oi,
-                                            'iv': 0,
+                                            'iv': iv_estimate,
                                             'volume': 0,
+                                            'delta': delta,
+                                            'gamma': gamma,
                                             'token': str(token_info.get('token', '')),
                                             'symbol': token_info.get('symbol', ''),
                                         }
                     if best_strike_info and best_strike_info['ltp'] > 0:
                         logger.info(f"  BFO_FALLBACK_STRIKE: {name} {opt_type} ATM={atm_strike} "
-                                   f"Selected={best_strike_info['strike']} OI={best_strike_info['oi']:,.0f} "
+                                   f"Selected={best_strike_info['strike']} Delta={best_strike_info.get('delta',0):.3f} "
+                                   f"Gamma={best_strike_info.get('gamma',0):.6f} OI={best_strike_info['oi']:,.0f} "
                                    f"LTP={best_strike_info['ltp']:.2f}")
                         return best_strike_info
             except Exception as e:
@@ -2530,6 +2571,10 @@ class PaperTrader:
         self._vix_cache = {'value': None, 'time': None}
         self.current_vix = None
         self.data_logger = None  # v10.2e: Live data logger for backtesting
+        # v10.3: Market regime detection
+        from market_regime import RegimeDetector
+        self.regime_detector = RegimeDetector()
+        self._last_logged_regime = {}
 
     def connect(self):
         """Connect to Angel API."""
@@ -2808,6 +2853,16 @@ class PaperTrader:
             # v10.2e: Log spot tick for backtesting
             if self.data_logger and spot:
                 self.data_logger.log_spot_tick(symbol, spot)
+
+            # v10.3: Update regime detector with latest spot + VIX
+            self.regime_detector.update(symbol, spot, vix)
+            regime = self.regime_detector.get_regime(symbol)
+            regime_params = get_regime_params(regime)
+            if self._last_logged_regime.get(symbol) != regime:
+                logger.info(f"  REGIME: {symbol} → {regime.value} "
+                           f"(TSL trail={regime_params['tsl_trail_distance_pct']}%, "
+                           f"BKOUT_FAIL={'OFF' if not regime_params['breakout_fail_enabled'] else 'ON'})")
+                self._last_logged_regime[symbol] = regime
 
             ohlc = self.get_intraday_ohlc(symbol)
             if not ohlc:
@@ -4064,8 +4119,10 @@ class PaperTrader:
                         continue
 
             # ---- v10.1: BREAKOUT FAILURE DETECTION ----
-            # If premium never moved above entry or drops fast, exit early (+ optional reverse)
-            if BREAKOUT_FAIL_REVERSE_ENABLED and GRACE_PERIOD_SECONDS < elapsed_secs <= BREAKOUT_FAIL_CHECK_MINUTES * 60:
+            # v10.3: Regime-aware — disabled on TRENDING days to let winners run
+            regime = self.regime_detector.get_regime(symbol)
+            regime_params = get_regime_params(regime)
+            if regime_params['breakout_fail_enabled'] and GRACE_PERIOD_SECONDS < elapsed_secs <= BREAKOUT_FAIL_CHECK_MINUTES * 60:
                 entry_prem_bf = pos['entry_premium']
                 if entry_prem_bf > 0:
                     if not pos['is_sell']:
@@ -4103,8 +4160,10 @@ class PaperTrader:
                         continue
 
                     # Near 5-min mark: no movement — exit (no reverse)
-                    if elapsed_secs >= (BREAKOUT_FAIL_CHECK_MINUTES * 60 - 15) and gain_bf < BREAKOUT_FAIL_MIN_GAIN_PCT:
-                        logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {BREAKOUT_FAIL_MIN_GAIN_PCT}% in {int(elapsed_secs)}s")
+                    # v10.3: Use regime-aware min gain threshold
+                    bf_min_gain = regime_params['breakout_fail_min_gain_pct']
+                    if elapsed_secs >= (BREAKOUT_FAIL_CHECK_MINUTES * 60 - 15) and gain_bf < bf_min_gain:
+                        logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {bf_min_gain}% in {int(elapsed_secs)}s (regime={regime.value})")
                         self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL')
                         self._track_exit(pos, 'BREAKOUT_FAIL')
                         try:
@@ -4150,18 +4209,24 @@ class PaperTrader:
                     pos['trailing_sl'] = round(entry_prem * 1.03, 2)  # entry + 3% buffer
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} gained {peak_gain_pct:.0f}% → locked SL at Rs {pos['trailing_sl']:.2f}")
 
-                # Phase 3: Tight trail when premium gained 40%+ (20% below peak profit)
+                # v10.3: Regime-aware TSL distances
+                regime = self.regime_detector.get_regime(symbol)
+                regime_params = get_regime_params(regime)
+                r_trail_dist = regime_params['tsl_trail_distance_pct']
+                r_tight_dist = regime_params['tsl_tight_distance_pct']
+
+                # Phase 3: Tight trail when premium gained 40%+ (regime-aware distance)
                 if peak_gain_pct >= TSL_TIGHT_GAIN_PCT:
-                    new_trailing_sl = round(peak - (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
+                    new_trailing_sl = round(peak - (profit_from_entry * r_tight_dist / 100), 2)
                     new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
                     if new_trailing_sl > (pos.get('trailing_sl') or 0):
                         pos['trailing_sl'] = new_trailing_sl
                         logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
-                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%, phase3)")
+                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%, phase3, trail={r_tight_dist}%)")
 
-                # Phase 2: Trail when premium gained 25%+ (30% below peak profit)
+                # Phase 2: Trail when premium gained 25%+ (regime-aware distance)
                 elif peak_gain_pct >= TSL_TRAIL_GAIN_PCT:
-                    new_trailing_sl = round(peak - (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
+                    new_trailing_sl = round(peak - (profit_from_entry * r_trail_dist / 100), 2)
                     new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
                     if new_trailing_sl > (pos.get('trailing_sl') or 0):
                         pos['trailing_sl'] = new_trailing_sl
@@ -4222,16 +4287,20 @@ class PaperTrader:
                     pos['trailing_sl'] = round(entry_prem * 0.97, 2)  # entry - 3% buffer
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} SELL gained {trough_gain_pct:.0f}% → locked SL at Rs {pos['trailing_sl']:.2f}")
 
-                # Phase 3: Tight trail when premium dropped 40%+ (20% above trough profit)
+                # v10.3: Regime-aware TSL for SELL
+                regime_sell = self.regime_detector.get_regime(symbol)
+                rp_sell = get_regime_params(regime_sell)
+
+                # Phase 3: Tight trail when premium dropped 40%+ (regime-aware distance)
                 if trough_gain_pct >= TSL_TIGHT_GAIN_PCT:
-                    new_trailing_sl = round(trough + (profit_from_entry * TSL_TIGHT_DISTANCE_PCT / 100), 2)
+                    new_trailing_sl = round(trough + (profit_from_entry * rp_sell['tsl_tight_distance_pct'] / 100), 2)
                     if pos.get('trailing_sl') is None or new_trailing_sl < pos['trailing_sl']:
                         pos['trailing_sl'] = new_trailing_sl
                         logger.info(f"  TSL_TIGHT: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} "
                                    f"(trough={trough:.2f} -{trough_gain_pct:.0f}%, phase3)")
-                # Phase 2: Trail when premium dropped 25%+ (30% above trough profit)
+                # Phase 2: Trail when premium dropped 25%+ (regime-aware distance)
                 elif trough_gain_pct >= TSL_TRAIL_GAIN_PCT:
-                    new_trailing_sl = round(trough + (profit_from_entry * TSL_TRAIL_DISTANCE_PCT / 100), 2)
+                    new_trailing_sl = round(trough + (profit_from_entry * rp_sell['tsl_trail_distance_pct'] / 100), 2)
                     if pos.get('trailing_sl') is None or new_trailing_sl < pos['trailing_sl']:
                         pos['trailing_sl'] = new_trailing_sl
                         logger.info(f"  TSL_TRAIL: {pos['id']} SELL SL→Rs {pos['trailing_sl']:.2f} "

@@ -156,6 +156,20 @@ def parse_closed_trades(data, market='equity'):
         details = t.get('details', {}) if isinstance(t.get('details'), dict) else {}
         pnl = t.get('pnl', 0)
 
+        # v10.3: Filter out invalid/phantom trades
+        entry_prem_check = t.get('entry_premium', 0)
+        entry_oi_check = t.get('entry_oi', details.get('entry_oi', -1))
+        data_source = details.get('data_source', '')
+        # Skip Black-Scholes phantom trades (stock bot with no real data)
+        if data_source == 'BLACK_SCHOLES':
+            continue
+        # Skip trades with zero entry premium (broken data)
+        if entry_prem_check is not None and entry_prem_check <= 0:
+            continue
+        # Skip commodity trades with zero OI (illiquid phantom strikes)
+        if market == 'commodity' and entry_oi_check == 0:
+            continue
+
         # Compute hold duration
         try:
             entry_dt = datetime.fromisoformat(ts)
@@ -236,6 +250,20 @@ def parse_closed_trades(data, market='equity'):
         for t in trades:
             running += t['pnl']
             t['capital_after'] = round(running, 2)
+
+    # v10.3: Mark duplicate-strategy trades (same symbol+strike+entry_time, different strategy)
+    seen = {}
+    for t in trades:
+        key = f"{t['symbol']}_{t['strike']}_{t['entry_time'][:16]}"
+        if key in seen:
+            t['is_grouped'] = True
+            t['group_id'] = key
+            seen[key]['is_grouped'] = True
+            seen[key]['group_id'] = key
+        else:
+            t['is_grouped'] = False
+            t['group_id'] = ''
+            seen[key] = t
 
     return trades
 
