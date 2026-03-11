@@ -376,6 +376,11 @@
         .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--radius); border: 1px solid var(--border); }
         .tag-exit { background: rgba(122,139,158,0.1); color: var(--text-secondary); font-size: 10px; padding: 2px 6px; border-radius: 3px; }
 
+        /* v10.3: Multi-strategy grouped trades */
+        .trades-table tr.grouped-trade { background: rgba(30,45,61,0.25); }
+        .trades-table tr.grouped-trade td:first-child { padding-left: 24px; }
+        .tag-multi { background: rgba(99,179,237,0.15); color: #63b3ed; font-size: 9px; padding: 1px 5px; border-radius: 3px; margin-left: 4px; }
+
         /* ====== DETAIL MODAL ====== */
         .modal-overlay {
             display: none;
@@ -1335,9 +1340,14 @@
             }
             trades.sort((a, b) => (b.exit_time || '').localeCompare(a.exit_time || ''));
 
-            tbody.innerHTML = trades.map(t => `
-                <tr>
-                    <td><b>${t.symbol}</b> <span style="font-size:10px;color:var(--text-muted)">${t.market.toUpperCase()}</span></td>
+            // v10.3: Visual grouping for multi-strategy trades on same strike
+            tbody.innerHTML = trades.map(t => {
+                const isGrouped = t.is_grouped || false;
+                const rowClass = isGrouped ? ' class="grouped-trade"' : '';
+                const multiTag = isGrouped ? '<span class="tag-multi">Multi</span>' : '';
+                return `
+                <tr${rowClass}>
+                    <td><b>${t.symbol}</b> <span style="font-size:10px;color:var(--text-muted)">${t.market.toUpperCase()}</span>${multiTag}</td>
                     <td>${t.strategy}</td>
                     <td>${typeTag(t.type)}</td>
                     <td>${t.num_lots || 1}</td>
@@ -1353,16 +1363,18 @@
                     <td style="font-size:11px">${fmtDateTime(t.exit_time)}</td>
                     <td><span class="tag-exit">${t.exit_reason}</span></td>
                     <td>${t.hold_duration}</td>
-                </tr>
-            `).join('');
+                </tr>`;
+            }).join('');
 
             // Mobile cards
             if (window.innerWidth <= 768) {
                 cards.style.display = 'block';
-                cards.innerHTML = trades.map(t => `
-                    <div class="pos-card" style="cursor:default">
+                cards.innerHTML = trades.map(t => {
+                    const multiTag = t.is_grouped ? '<span class="tag-multi">Multi</span>' : '';
+                    return `
+                    <div class="pos-card" style="cursor:default${t.is_grouped ? ';border-left:2px solid #63b3ed' : ''}">
                         <div class="pos-header">
-                            <div><span class="pos-symbol">${t.symbol}</span> ${typeTag(t.type)}</div>
+                            <div><span class="pos-symbol">${t.symbol}</span> ${typeTag(t.type)}${multiTag}</div>
                             <div class="pos-pnl"><div class="pos-pnl-value ${pnlClass(t.pnl)}">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)} (${fmtPct(t.pnl_pct)})</div></div>
                         </div>
                         <div class="pos-prices">
@@ -1380,8 +1392,8 @@
                             <span><span class="pp-label">Out:</span> <span class="pp-value">${fmtDateTime(t.exit_time)}</span></span>
                             <span class="tag-exit">${t.exit_reason}</span>
                         </div>
-                    </div>
-                `).join('');
+                    </div>`;
+                }).join('');
             }
         }
 

@@ -1064,78 +1064,107 @@ class StockAngelConnection:
         best = None
         best_score = -1
 
+        # v10.3: Try NFO first, then BFO if optionGreek returns empty
+        # Some stocks (SUNPHARMA, LAURUSLABS) return empty from NFO API
+        exchanges_to_try = ['NFO']
+        if not expiry_date:
+            # If no expiry provided, try to get one from NFO first, then BFO
+            expiry_date = self._get_nearest_expiry(name, exchange='NFO')
+            if not expiry_date:
+                expiry_date = self._get_nearest_expiry(name, exchange='BFO')
+                if expiry_date:
+                    exchanges_to_try = ['BFO']
+
+        option_data = None
+        used_exchange = 'NFO'
+
         try:
-            if expiry_date:
-                self._throttle()
-                data = self.obj.optionGreek({
-                    "name": name,
-                    "expirydate": expiry_date,
-                })
-                # v10.2f: Diagnostic logging for strike selection debugging
-                if not data or not data.get('data'):
-                    logger.warning(f"  OPTGREEK_EMPTY: {name} expiry={expiry_date} — "
-                                  f"API returned no data (response={str(data)[:200]})")
-                else:
-                    logger.debug(f"  OPTGREEK_OK: {name} expiry={expiry_date} — "
-                                f"{len(data['data'])} strikes returned, candidates={candidates}")
-                if data and data.get('data'):
-                    for strike_data in data['data']:
-                        sd_type = strike_data.get('optionType', '')
-                        if sd_type != opt_type:
-                            continue
-                        sd_strike = float(strike_data.get('strikePrice', 0) or 0)
-                        if sd_strike not in candidates:
-                            continue
+            for exch in exchanges_to_try:
+                try:
+                    exch_expiry = self._get_nearest_expiry(name, exchange=exch)
+                    if not exch_expiry:
+                        logger.debug(f"  OPTGREEK_SKIP: {name} no expiry found for {exch}")
+                        continue
 
-                        oi = float(strike_data.get('opnInterest', 0) or 0)
-                        ltp = float(strike_data.get('ltp', 0) or 0)
-                        iv = float(strike_data.get('impliedVolatility', 0) or 0)
-                        volume = float(strike_data.get('tradeVolume', 0) or 0)
-                        # v10.3: Extract delta + gamma from API (was ignored before!)
-                        delta = abs(float(strike_data.get('delta', 0) or 0))
-                        gamma = float(strike_data.get('gamma', 0) or 0)
+                    self._throttle()
+                    data = self.obj.optionGreek({
+                        "name": name,
+                        "expirydate": exch_expiry,
+                    })
 
-                        # v10.3: Delta+Gamma optimized scoring (was OI-only)
-                        delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                        gamma_score = min(gamma * 10000, 5.0)
-                        oi_norm = min(oi / 100000, 1.0)
-                        vol_norm = min(volume / 10000, 1.0)
-                        # Weighted: Delta(35%) + Gamma(25%) + OI(25%) + Volume(15%)
-                        score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+                    if data and data.get('data') and len(data['data']) > 0:
+                        logger.info(f"  OPTGREEK_OK: {name} via {exch} expiry={exch_expiry} — "
+                                    f"{len(data['data'])} strikes")
+                        option_data = data['data']
+                        used_exchange = exch
+                        break
+                    else:
+                        logger.warning(f"  OPTGREEK_EMPTY: {name} {exch} expiry={exch_expiry} — "
+                                      f"trying next exchange (response={str(data)[:200]})")
+                except Exception as e:
+                    logger.warning(f"  OPTGREEK_ERR: {name} {exch} — {e}")
 
-                        # FILTER: Skip strikes outside delta range 0.20-0.70
-                        if delta > 0 and (delta < 0.20 or delta > 0.70):
-                            continue
+            if option_data:
+                for strike_data in option_data:
+                    sd_type = strike_data.get('optionType', '')
+                    if sd_type != opt_type:
+                        continue
+                    sd_strike = float(strike_data.get('strikePrice', 0) or 0)
+                    if sd_strike not in candidates:
+                        continue
 
-                        if score > best_score and ltp > 0:
-                            best_score = score
-                            best = {
-                                'strike': sd_strike,
-                                'ltp': ltp,
-                                'oi': oi,
-                                'iv': iv / 100 if iv > 1 else iv,
-                                'volume': volume,
-                                'delta': delta,    # v10.3: store greeks
-                                'gamma': gamma,
-                            }
+                    oi = float(strike_data.get('opnInterest', 0) or 0)
+                    ltp = float(strike_data.get('ltp', 0) or 0)
+                    iv = float(strike_data.get('impliedVolatility', 0) or 0)
+                    volume = float(strike_data.get('tradeVolume', 0) or 0)
+                    # v10.3: Extract delta + gamma from API (was ignored before!)
+                    delta = abs(float(strike_data.get('delta', 0) or 0))
+                    gamma = float(strike_data.get('gamma', 0) or 0)
 
-                    if best:
-                        token_info = self.find_option_tokens(name, None, best['strike'], opt_type)
-                        if token_info:
-                            best['token'] = str(token_info.get('token', ''))
-                            best['symbol'] = token_info.get('symbol', '')
-                        logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
-                                    f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
-                                    f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "
-                                    f"LTP={best['ltp']:.2f} IV={best.get('iv', 0)*100:.1f}%")
-                        return best
+                    # v10.3: Delta+Gamma optimized scoring (was OI-only)
+                    delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                    gamma_score = min(gamma * 10000, 5.0)
+                    oi_norm = min(oi / 100000, 1.0)
+                    vol_norm = min(volume / 10000, 1.0)
+                    # Weighted: Delta(35%) + Gamma(25%) + OI(25%) + Volume(15%)
+                    score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+
+                    # FILTER: Skip strikes outside delta range 0.20-0.70
+                    if delta > 0 and (delta < 0.20 or delta > 0.70):
+                        continue
+
+                    if score > best_score and ltp > 0:
+                        best_score = score
+                        best = {
+                            'strike': sd_strike,
+                            'ltp': ltp,
+                            'oi': oi,
+                            'iv': iv / 100 if iv > 1 else iv,
+                            'volume': volume,
+                            'delta': delta,    # v10.3: store greeks
+                            'gamma': gamma,
+                        }
+
+                if best:
+                    token_info = self.find_option_tokens(name, None, best['strike'], opt_type)
+                    if token_info:
+                        best['token'] = str(token_info.get('token', ''))
+                        best['symbol'] = token_info.get('symbol', '')
+                    logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
+                                f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
+                                f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "
+                                f"LTP={best['ltp']:.2f} IV={best.get('iv', 0)*100:.1f}% "
+                                f"via={used_exchange}")
+                    return best
 
         except Exception as e:
             logger.error(f"Option chain strike selection error for {name}: {e}")
 
-        # Fallback: mathematical derivation
-        logger.info(f"  FALLBACK_STRIKE: {name} {opt_type} using ATM={atm_strike}")
-        return {'strike': atm_strike, 'ltp': 0, 'oi': 0, 'iv': 0, 'volume': 0}
+        # v10.3: No live data available — SKIP this stock (NO Black-Scholes fallback)
+        # RULE: Only live signal data from Angel/BSE/NSE
+        logger.warning(f"  SKIP_NO_LIVE_DATA: {name} {opt_type} ATM={atm_strike} — "
+                       f"no live option data from any exchange, skipping")
+        return None
 
 
 # ====================================================================
@@ -1890,14 +1919,16 @@ class StockPaperTrader:
             return VIX_HIGH_MULTIPLIER
         return 1.0
 
-    def _get_nearest_expiry(self, symbol):
+    def _get_nearest_expiry(self, symbol, exchange='NFO'):
         """Get nearest monthly expiry for stock options.
 
         Stock options have monthly expiry (last Thursday of month).
         Uses instruments master to find exact expiry dates.
+        v10.3: Added exchange parameter to support BFO fallback.
 
         Args:
             symbol: Stock symbol.
+            exchange: Exchange to search ('NFO' or 'BFO'). Default 'NFO'.
 
         Returns:
             str: Expiry in 'ddMONyyyy' format (e.g. '27MAR2026') or None.
@@ -1905,9 +1936,11 @@ class StockPaperTrader:
         if self.angel.instruments is None:
             return None
 
+        # v10.3: Support both NFO (OPTSTK) and BFO (OPTSTK) instrument types
+        inst_type = 'OPTSTK'
         mask = ((self.angel.instruments['name'] == symbol) &
-                (self.angel.instruments['exch_seg'] == 'NFO') &
-                (self.angel.instruments['instrumenttype'] == 'OPTSTK'))
+                (self.angel.instruments['exch_seg'] == exchange) &
+                (self.angel.instruments['instrumenttype'] == inst_type))
         matches = self.angel.instruments[mask]
         if len(matches) == 0:
             return None
