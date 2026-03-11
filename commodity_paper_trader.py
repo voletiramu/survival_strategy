@@ -930,6 +930,9 @@ class CommodityStrategyEngine:
         """Download daily OHLC data from Angel SmartAPI for MCX commodity.
         v2.5.2: If current-month futures token has no data (just rolled),
         try next-month token from instrument master as fallback.
+        v10.2c: MERGE new data with existing CSV instead of overwriting.
+        MCX futures roll monthly, so each contract token only has ~30 days.
+        Without merge, CRUDEOILM gets only 5 days after contract roll.
         """
         try:
             token = self.angel._futures_tokens.get(commodity)
@@ -952,6 +955,15 @@ class CommodityStrategyEngine:
                                     tokens_to_try.append(t)
             except Exception:
                 pass
+
+            # v10.2c: Load existing data first for merge
+            existing_df = None
+            if os.path.exists(save_path):
+                try:
+                    existing_df = pd.read_csv(save_path, parse_dates=['DateTime'])
+                    logger.info(f"Existing data for {commodity}: {len(existing_df)} rows")
+                except Exception:
+                    existing_df = None
 
             all_data = []
             for try_token in tokens_to_try:
@@ -976,10 +988,25 @@ class CommodityStrategyEngine:
                     logger.info(f"Token {try_token} returned no data, trying next...")
 
             if all_data:
-                df = pd.DataFrame(all_data, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                new_df = pd.DataFrame(all_data, columns=['DateTime', 'Open', 'High', 'Low', 'Close', 'Volume'])
+
+                # v10.2c: Merge with existing data instead of overwriting
+                if existing_df is not None and len(existing_df) > 0:
+                    merged = pd.concat([existing_df, new_df], ignore_index=True)
+                    # Parse DateTime for dedup
+                    merged['DateTime'] = pd.to_datetime(merged['DateTime'])
+                    merged['date_key'] = merged['DateTime'].dt.normalize()
+                    # Keep latest data for each date (new data overrides old)
+                    merged = merged.drop_duplicates(subset='date_key', keep='last')
+                    merged = merged.drop(columns='date_key').sort_values('DateTime').reset_index(drop=True)
+                    logger.info(f"Merged {commodity}: {len(existing_df)} old + {len(new_df)} new → {len(merged)} total")
+                    df = merged
+                else:
+                    df = new_df
+
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 df.to_csv(save_path, index=False)
-                logger.info(f"Downloaded {len(df)} days for {commodity} → {save_path}")
+                logger.info(f"Saved {len(df)} days for {commodity} → {save_path}")
             else:
                 logger.warning(f"No data returned from Angel API for {commodity} (tried {len(tokens_to_try)} tokens)")
         except Exception as e:
@@ -1005,6 +1032,13 @@ class CommodityStrategyEngine:
         if df is None:
             df = self.load_historical(commodity)
         if df is None:
+            return None
+
+        # v10.2c: Minimum data guard — need at least 14 days for reliable ATR/EMA/CPR
+        MIN_HISTORY_DAYS = 14
+        if len(df) < MIN_HISTORY_DAYS:
+            logger.warning(f"  INSUFFICIENT_DATA: {commodity} has only {len(df)} days "
+                          f"(need {MIN_HISTORY_DAYS}). Skipping signal generation.")
             return None
 
         # v9.6d: Force refresh if data is stale and angel is connected
@@ -1069,7 +1103,7 @@ class CommodityStrategyEngine:
             tp = (df['High'] + df['Low'] + df['Close']) / 3
             vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
         else:
-            vwap = (df['High'].tail(5) + df['Low'].tail(5) + df['Close'].tail(5)).mean() / 3
+            vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()  # v10.2c: Fixed VWAP fallback formula
 
         # v10.1: EMA trend indicators for direction validation
         ema_9 = df['Close'].ewm(span=9).mean().iloc[-1] if len(df) >= 9 else df['Close'].iloc[-1]

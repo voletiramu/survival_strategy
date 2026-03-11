@@ -439,7 +439,7 @@ class StockCPRScanner:
             tp = (df['High'] + df['Low'] + df['Close']) / 3
             vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
         else:
-            vwap = df['Close'].tail(5).mean()
+            vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()  # v10.2c: Fixed VWAP fallback
 
         return {
             'pivot': pivot,

@@ -1746,7 +1746,7 @@ class StrategyEngine:
             tp = (df['High'] + df['Low'] + df['Close']) / 3
             vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
         else:
-            vwap = (df['High'].tail(5) + df['Low'].tail(5) + df['Close'].tail(5)).mean() / 3
+            vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()  # v10.2c: Fixed VWAP fallback formula
 
         # PCR proxy
         close_chg = df['Close'].pct_change()
