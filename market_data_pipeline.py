@@ -154,6 +154,9 @@ class MarketDataPipeline:
         # Fetch cycle count
         self._cycle_count = 0
 
+        # v10.2e: Live data logger (set externally)
+        self.data_logger = None
+
         logger.info("[Pipeline] MarketDataPipeline initialized")
 
     # ============================================================
@@ -208,6 +211,9 @@ class MarketDataPipeline:
                     # Fetch all feeds (errors in one don't block others)
                     self._fetch_all()
 
+                    # v10.2e: Save live data to CSV for backtesting
+                    self._log_live_data()
+
                     # Log summary
                     self._log_summary()
                 else:
@@ -236,6 +242,31 @@ class MarketDataPipeline:
             time.sleep(NSE_FETCH_INTERVAL)
 
         logger.info("[Pipeline] Fetch loop exited")
+
+    def _log_live_data(self):
+        """v10.2e: Save option chain + market indicators to CSV for backtesting."""
+        if not self.data_logger:
+            return
+        try:
+            with self._lock:
+                symbols = list(self._option_chains.keys())
+
+            for symbol in symbols:
+                # Log option chain snapshot
+                chain = self.get_option_chain(symbol)
+                spot = self.get_spot(symbol)
+                if chain and spot:
+                    expiry = chain.get('expiry', '')
+                    self.data_logger.log_option_chain(symbol, chain, spot, expiry)
+
+                # Log market indicators
+                pcr = self.get_pcr(symbol)
+                vix = self.get_vix()
+                oi = self.get_oi_data(symbol)
+                if spot:
+                    self.data_logger.log_market_indicators(symbol, spot, pcr, vix, oi)
+        except Exception as e:
+            logger.error(f"[Pipeline] Live data logging error: {e}")
 
     def _fetch_all(self):
         """Fetch all data feeds. Each feed is independent — errors don't cascade."""

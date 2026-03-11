@@ -157,6 +157,14 @@ def stock_loop(interval_sec=30, stop_event=None):
 
     trader = StockPaperTrader()
 
+    # v10.2e: Live data logger for backtesting
+    try:
+        from live_data_logger import LiveDataLogger
+        trader.data_logger = LiveDataLogger()
+        logger.info("[StockLoop] LiveDataLogger ACTIVE — saving stock data to data/live/")
+    except Exception as e:
+        logger.warning(f"[StockLoop] LiveDataLogger failed: {e} — data logging disabled")
+
     # Initialize (connect to Angel API, load instruments)
     if not trader.initialize():
         logger.error("[StockLoop] Initialization failed!")

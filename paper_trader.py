@@ -2529,6 +2529,7 @@ class PaperTrader:
         self.pending_reverses = {}      # v10.1: {symbol: {opt_type, spot, ...}} for breakout failure reversal
         self._vix_cache = {'value': None, 'time': None}
         self.current_vix = None
+        self.data_logger = None  # v10.2e: Live data logger for backtesting
 
     def connect(self):
         """Connect to Angel API."""
@@ -2803,6 +2804,10 @@ class PaperTrader:
             if not spot:
                 logger.warning(f"  No spot data for {symbol}")
                 continue
+
+            # v10.2e: Log spot tick for backtesting
+            if self.data_logger and spot:
+                self.data_logger.log_spot_tick(symbol, spot)
 
             ohlc = self.get_intraday_ohlc(symbol)
             if not ohlc:

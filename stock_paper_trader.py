@@ -1784,6 +1784,7 @@ class StockPaperTrader:
         # State
         self._running = False
         self._initialized = False
+        self.data_logger = None  # v10.2e: Live data logger for backtesting
 
     def initialize(self):
         """Connect to Angel API and load instruments.
@@ -2771,6 +2772,10 @@ class StockPaperTrader:
                 logger.debug(f"  {symbol}: No spot price available")
                 continue
             spots_ok += 1
+
+            # v10.2e: Log spot tick for backtesting
+            if self.data_logger and spot:
+                self.data_logger.log_spot_tick(symbol, spot)
 
             # Compute indicators
             indicators = stock_info.get('indicators')

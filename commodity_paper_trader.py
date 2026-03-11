@@ -1807,6 +1807,7 @@ class CommodityPaperTrader:
         # v9.6: VIX infrastructure (ported from equity)
         self.current_vix = None
         self._vix_cache = {'value': None, 'time': None}
+        self.data_logger = None  # v10.2e: Live data logger for backtesting
 
     def connect(self):
         connected = self.angel.connect()
@@ -2336,6 +2337,10 @@ class CommodityPaperTrader:
             if not spot:
                 logger.warning(f"  No spot data for {commodity}")
                 continue
+
+            # v10.2e: Log spot tick for backtesting
+            if self.data_logger and spot:
+                self.data_logger.log_spot_tick(commodity, spot)
 
             # v2.5.2: Fetch real intraday OHLC (enables Gamma Blast signals)
             ohlc = self.get_intraday_ohlc(commodity)

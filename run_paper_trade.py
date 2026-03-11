@@ -209,7 +209,7 @@ def run_commodity_scan(offline=False):
 # Shared dict for passing trader references from threads to main (for EOD report)
 _trader_refs = {}
 
-def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, market_pipeline=None):
+def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, market_pipeline=None, data_logger=None):
     """Equity scanning thread: NIFTY, BANKNIFTY, SENSEX every 15 seconds.
     Creates ONE PaperTrader instance and reuses it across scans.
     Uses WebSocket feed for real-time LTP (falls back to REST if WS unavailable).
@@ -222,6 +222,7 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
         from paper_trader import PaperTrader
 
         trader = PaperTrader(ws_feed=ws_feed, market_pipeline=market_pipeline)
+        trader.data_logger = data_logger  # v10.2e: Live data logging
         _trader_refs['equity'] = trader  # Share for EOD report
         for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
             trader.engine.load_historical(symbol)
@@ -338,7 +339,7 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
     logger.info(f"[EquityThread] Exited after {scan_count if 'scan_count' in dir() else 0} scans")
 
 
-def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None):
+def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None, data_logger=None):
     """Commodity scanning thread: GOLDM, SILVERM, CRUDEOILM every 10 seconds.
     Creates ONE CommodityPaperTrader instance and reuses it across scans.
     Uses WebSocket feed for real-time LTP (falls back to REST if WS unavailable).
@@ -350,6 +351,7 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
         from commodity_paper_trader import CommodityPaperTrader, PAPER_TRADE_COMMODITIES
 
         trader = CommodityPaperTrader(ws_feed=ws_feed)
+        trader.data_logger = data_logger  # v10.2e: Live data logging
         _trader_refs['commodity'] = trader  # Share for EOD report
         for comm in PAPER_TRADE_COMMODITIES:
             trader.engine.load_historical(comm)
@@ -598,6 +600,17 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
             logger.warning(f"[MAIN] MarketDataPipeline failed to start: {e} — using Angel API fallback")
             market_pipeline = None
 
+    # ---- v10.2e: Live data logger for backtesting ----
+    data_logger = None
+    try:
+        from live_data_logger import LiveDataLogger
+        data_logger = LiveDataLogger()
+        if market_pipeline:
+            market_pipeline.data_logger = data_logger
+        logger.info("[MAIN] LiveDataLogger ACTIVE — saving market data to data/live/")
+    except Exception as e:
+        logger.warning(f"[MAIN] LiveDataLogger failed to start: {e} — data logging disabled")
+
     # v7.2: Detect auto-restart (if lock file existed, this is a restart, not first start)
     instance_label = get_instance_label(instance_id)
     is_restart = os.path.exists(os.path.join(LOCK_DIR, 'last_shutdown.flag'))
@@ -633,10 +646,11 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
     logger.info(f"  Press Ctrl+C to stop")
     logger.info("=" * 70 + "\n")
 
-    # Create threads (pass ws_feed + market_pipeline to equity, ws_feed to commodity)
+    # Create threads (pass ws_feed + market_pipeline + data_logger to equity/commodity)
     t_equity = threading.Thread(
         target=equity_loop,
         args=(equity_interval, offline, stop_event, ws_feed, market_pipeline),
+        kwargs={'data_logger': data_logger},
         name="EquityThread",
         daemon=True
     )
@@ -644,6 +658,7 @@ def run_continuous(equity_interval=15, commodity_interval=10, crypto_interval=30
     t_commodity = threading.Thread(
         target=commodity_loop,
         args=(commodity_interval, offline, stop_event, ws_feed),
+        kwargs={'data_logger': data_logger},
         name="CommodityThread",
         daemon=True
     )
