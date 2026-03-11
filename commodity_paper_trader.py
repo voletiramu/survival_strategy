@@ -1016,15 +1016,15 @@ class CommodityStrategyEngine:
         """v10.1: Get previous trading day OHLC for CPR. Validates data freshness."""
         if len(df) < 2:
             return df.iloc[-1], "only_row"
-        today = pd.Timestamp.now().normalize()
+        today = datetime.now().date()
         prev_idx = df.index[-2]
-        prev_date = pd.Timestamp(prev_idx).normalize()
+        prev_date = pd.Timestamp(prev_idx).date()  # .date() strips timezone
         gap_days = (today - prev_date).days
         if gap_days <= 5:  # MCX holidays can be longer
             return df.iloc[-2], f"prev({prev_date.strftime('%Y-%m-%d')},gap={gap_days}d)"
         else:
-            last_date = pd.Timestamp(df.index[-1]).normalize()
-            logger.warning(f"  CPR_STALE: {symbol} prev bar {gap_days}d old ({prev_date.date()}), using last bar")
+            last_date = pd.Timestamp(df.index[-1]).date()  # .date() strips timezone
+            logger.warning(f"  CPR_STALE: {symbol} prev bar {gap_days}d old ({prev_date}), using last bar")
             return df.iloc[-1], f"fallback({last_date.strftime('%Y-%m-%d')},stale={gap_days}d)"
 
     def compute_indicators(self, commodity, current_ohlc=None):

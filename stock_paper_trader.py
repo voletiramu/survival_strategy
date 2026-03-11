@@ -392,8 +392,8 @@ class StockCPRScanner:
 
         # v10.1: CPR freshness check
         if len(df) >= 2:
-            today = pd.Timestamp.now().normalize()
-            prev_date = pd.Timestamp(df.index[-1]).normalize()
+            today = datetime.now().date()
+            prev_date = pd.Timestamp(df.index[-1]).date()  # .date() strips timezone
             gap_days = (today - prev_date).days
             if gap_days > 4:
                 logger.warning(f"  CPR_STALE: {symbol} historical data is {gap_days}d old")
