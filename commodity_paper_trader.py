@@ -910,7 +910,27 @@ class CommodityStrategyEngine:
         # --- Try live API greeks first ---
         if self.angel and self.angel._connected:
             try:
-                greeks_data = self.angel.get_option_greeks(commodity)
+                # v10.3d-3: Get nearest MCX expiry for API call (was missing → "Invalid expiry date")
+                expiry = None
+                if self.angel.instruments is not None:
+                    mask = (self.angel.instruments['name'] == commodity) & \
+                           (self.angel.instruments['exch_seg'] == 'MCX') & \
+                           (self.angel.instruments['instrumenttype'] == 'OPTFUT')
+                    matches = self.angel.instruments[mask]
+                    if len(matches) > 0:
+                        today = datetime.now().date()
+                        exp_dates = []
+                        for exp_str in matches['expiry'].unique():
+                            try:
+                                exp_date = pd.to_datetime(exp_str).date()
+                                if exp_date >= today:
+                                    exp_dates.append(exp_date)
+                            except Exception:
+                                continue
+                        if exp_dates:
+                            expiry = min(exp_dates).strftime('%d%b%Y').upper()
+
+                greeks_data = self.angel.get_option_greeks(commodity, expiry)
                 if greeks_data and len(greeks_data) > 0:
                     best_score = -1
                     best = None
