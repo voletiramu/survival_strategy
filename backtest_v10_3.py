@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-v10.3 Backtest — Replay signals through OLD vs NEW rules.
+v10.3d Backtest — EXIT STRATEGY REPLAY
 
-Compares:
-  OLD (v10.2): OI-only strike scoring, fixed TSL (30%), BREAKOUT_FAIL always ON
-  NEW (v10.3): Delta+Gamma scoring, regime-aware TSL, regime-aware BREAKOUT_FAIL,
-               delta filter 0.20-0.70, NO Black-Scholes
+Takes the ACTUAL bot's 15 equity entries from March 11 and replays them
+through OLD (v10.2) vs NEW (v10.3d) exit rules using spot price data from
+the signal CSV for premium estimation.
 
-Reads signal CSVs from VPS (all signals logged every cycle) and portfolio JSON
-(actual trades taken). Simulates trade entries/exits with both rule sets.
+This isolates the EXIT STRATEGY impact: same entries, different exit logic.
+
+Key differences being tested:
+  OLD: Fixed TSL (30/20%), BREAKOUT_FAIL always ON, hard TARGET_HIT
+  NEW: Regime-aware TSL (TRENDING=40/25%, FLAT=20/15%), regime-aware BF,
+       trailing target (extend 20%, TSL at 15% below peak)
+
+Premium estimation: delta*dS + 0.5*gamma*dS^2 - theta_decay
 
 Usage:
   python backtest_v10_3.py
@@ -25,90 +30,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'backtest_data', 'mar11')
 
 EQUITY_SIGNALS = os.path.join(DATA_DIR, 'equity_signals_20260311.csv')
-COMMODITY_SIGNALS = os.path.join(DATA_DIR, 'commodity_signals_20260311.csv')
 EQUITY_PORTFOLIO = os.path.join(DATA_DIR, 'equity_portfolio_mar11.json')
-COMMODITY_PORTFOLIO = os.path.join(DATA_DIR, 'commodity_portfolio_mar11.json')
 
-# Lot sizes
-LOT_SIZES = {
-    'NIFTY': 75, 'BANKNIFTY': 30, 'SENSEX': 20,
-    'GOLDM': 10, 'SILVERM': 100, 'CRUDEOILM': 100,
-}
-
-# ===================== RULE SETS =====================
-
-# OLD rules (v10.2 and before)
-OLD_RULES = {
-    'name': 'v10.2 (OLD)',
-    # Strike selection: OI-only scoring
-    'use_delta_gamma_scoring': False,
-    'delta_filter_min': 0,       # No delta filter
-    'delta_filter_max': 1.0,     # No delta filter
-    # TSL: fixed distances
-    'tsl_trail_pct': 30,         # Phase 2/3 trail distance
-    'tsl_tight_pct': 20,         # Phase 3 tight distance
-    # BREAKOUT_FAIL: always enabled
-    'breakout_fail_enabled': True,
-    'breakout_fail_min_gain_pct': 2.0,
-    'breakout_fail_reverse_pct': 15.0,
-    # Timing
-    'breakout_fail_cooldown_min': 10,
-}
-
-# NEW rules (v10.3) — we'll make these regime-aware
-NEW_RULES_TRENDING = {
-    'name': 'v10.3 TRENDING',
-    'use_delta_gamma_scoring': True,
-    'delta_filter_min': 0.20,
-    'delta_filter_max': 0.70,
-    'tsl_trail_pct': 20,         # Wider trail in trending
-    'tsl_tight_pct': 15,
-    'breakout_fail_enabled': False,  # DISABLED in trending
-    'breakout_fail_min_gain_pct': 5.0,
-    'breakout_fail_reverse_pct': 15.0,
-    'breakout_fail_cooldown_min': 5,
-}
-
-NEW_RULES_SIDEWAYS = {
-    'name': 'v10.3 SIDEWAYS',
-    'use_delta_gamma_scoring': True,
-    'delta_filter_min': 0.20,
-    'delta_filter_max': 0.70,
-    'tsl_trail_pct': 30,         # Default
-    'tsl_tight_pct': 20,
-    'breakout_fail_enabled': True,
-    'breakout_fail_min_gain_pct': 2.0,
-    'breakout_fail_reverse_pct': 15.0,
-    'breakout_fail_cooldown_min': 10,
-}
-
-NEW_RULES_FLAT = {
-    'name': 'v10.3 FLAT',
-    'use_delta_gamma_scoring': True,
-    'delta_filter_min': 0.20,
-    'delta_filter_max': 0.70,
-    'tsl_trail_pct': 40,         # Tighter trail in flat
-    'tsl_tight_pct': 25,
-    'breakout_fail_enabled': True,
-    'breakout_fail_min_gain_pct': 3.0,
-    'breakout_fail_reverse_pct': 15.0,
-    'breakout_fail_cooldown_min': 15,
-}
+# Correct lot sizes
+BASE_LOT_SIZES = {'NIFTY': 65, 'BANKNIFTY': 30, 'SENSEX': 20}
 
 
 # ===================== REGIME DETECTION =====================
 
 class BacktestRegimeDetector:
-    """Regime detector with hysteresis for backtest — matches v10.3c market_regime.py."""
+    """Regime detector with hysteresis — matches v10.3c."""
 
-    MIN_HOLD = 20  # Cycles before regime switch
+    MIN_HOLD = 10  # v10.3d: reduced from 20 for faster regime detection
 
     def __init__(self):
-        self.session_opens = {}   # {sym: first spot}
+        self.session_opens = {}
         self.history = defaultdict(list)
-        self.regime = {}          # {sym: str}
-        self.pending = {}         # {sym: str}
-        self.pending_count = {}   # {sym: int}
+        self.regime = {}
+        self.pending = {}
+        self.pending_count = {}
 
     def update(self, symbol, spot):
         if symbol not in self.session_opens:
@@ -124,7 +64,6 @@ class BacktestRegimeDetector:
             else:
                 self.pending[symbol] = candidate
                 self.pending_count[symbol] = 1
-
             if self.pending_count.get(symbol, 0) >= self.MIN_HOLD:
                 self.regime[symbol] = candidate
                 self.pending[symbol] = None
@@ -143,618 +82,511 @@ class BacktestRegimeDetector:
         prices = self.history[symbol]
         if len(prices) < 10:
             return 'SIDEWAYS'
-
         session_open = self.session_opens.get(symbol, prices[0])
         current = prices[-1]
         if session_open == 0:
             return 'SIDEWAYS'
-
         total_move_pct = abs(current - session_open) / session_open * 100
-
-        # Use last 60 readings for efficiency
         recent = prices[-min(60, len(prices)):]
-        abs_moves = sum(abs(recent[i] - recent[i-1]) for i in range(1, len(recent)))
+        abs_moves = sum(abs(recent[i] - recent[i - 1]) for i in range(1, len(recent)))
         net_move = abs(recent[-1] - recent[0])
         efficiency = net_move / abs_moves if abs_moves > 0 else 0
-
-        if total_move_pct >= 0.8 and efficiency >= 0.5:
+        # v10.3d: Lowered thresholds — 0.8% was too high, never triggered on Mar 11
+        if total_move_pct >= 0.4 and efficiency >= 0.4:
             return 'TRENDING'
-        elif total_move_pct < 0.3 and efficiency < 0.3:
+        elif total_move_pct < 0.15 and efficiency < 0.25:
             return 'FLAT'
         return 'SIDEWAYS'
 
 
-def get_new_rules_for_regime(regime):
-    """Return v10.3 rules based on detected regime."""
+def get_regime_params(regime):
+    """TSL/BF parameters — CORRECTED: TRENDING=wide, FLAT=tight."""
     if regime == 'TRENDING':
-        return NEW_RULES_TRENDING
-    elif regime == 'FLAT':
-        return NEW_RULES_FLAT
-    else:
-        return NEW_RULES_SIDEWAYS
-
-
-# ===================== STRIKE SCORING =====================
-
-def score_signal_old(sig):
-    """Old scoring: OI*0.6 + Volume*0.2 + Proximity*0.2 (no delta/gamma)."""
-    oi = sig.get('oi', 0)
-    volume = sig.get('volume', 0)
-    oi_norm = min(oi / 100000, 1.0)
-    vol_norm = min(volume / 10000, 1.0)
-    return oi_norm * 60 + vol_norm * 20 + 20  # proximity always 1 for ATM
-
-
-def score_signal_new(sig):
-    """
-    New scoring: Delta(35%) + Gamma(25%) + OI(25%) + Volume(15%).
-    Returns -1 if delta is outside 0.20-0.70 range (filtered out).
-    """
-    delta = abs(sig.get('delta', 0))
-    gamma = sig.get('gamma', 0)
-    oi = sig.get('oi', 0)
-    volume = sig.get('volume', 0)
-
-    # Delta filter
-    if delta > 0 and (delta < 0.20 or delta > 0.70):
-        return -1  # Filtered out
-
-    delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-    gamma_score = min(gamma * 10000, 5.0)
-    oi_norm = min(oi / 100000, 1.0)
-    vol_norm = min(volume / 10000, 1.0)
-
-    return (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
-
-
-# ===================== TRADE SIMULATOR =====================
-
-class TradeSimulator:
-    """Simulates trade entries and exits given a set of rules."""
-
-    def __init__(self, rules, capital, market='equity'):
-        self.rules = rules
-        self.initial_capital = capital
-        self.capital = capital
-        self.market = market
-        self.positions = []       # Open positions
-        self.closed_trades = []   # Closed trades
-        self.max_positions = 6
-        self.min_premium = 50     # Min premium to enter
-        self.max_premium = 2000   # Max premium for BUY
-        self.cooldown = {}        # {symbol: last_entry_time}
-        self.daily_trade_count = 0
-        self.max_daily_trades = 20
-
-        # TSL tracking
-        # Phase 1: 0-15% gain → SL at entry (no trail)
-        # Phase 2: 15-25% gain → trail at tsl_trail_pct of gains
-        # Phase 3: >25% gain → tighter trail at tsl_tight_pct
-        self.TSL_PHASE1_THRESHOLD = 15  # % gain to start trailing
-        self.TSL_PHASE2_THRESHOLD = 25  # % gain for tighter trail
-        self.TSL_INITIAL_SL_PCT = 40    # Initial SL % below entry
-
-    def can_enter(self, sig, timestamp):
-        """Check if we can enter a new position."""
-        if len(self.positions) >= self.max_positions:
-            return False, 'MAX_POSITIONS'
-        if self.daily_trade_count >= self.max_daily_trades:
-            return False, 'MAX_DAILY_TRADES'
-
-        symbol = sig.get('symbol', sig.get('commodity', ''))
-        premium = sig.get('premium', 0)
-
-        if premium < self.min_premium:
-            return False, 'LOW_PREMIUM'
-        if premium > self.max_premium:
-            return False, 'HIGH_PREMIUM'
-
-        # Cooldown check (5 min between same-symbol entries)
-        if symbol in self.cooldown:
-            diff = (timestamp - self.cooldown[symbol]).total_seconds()
-            if diff < 300:
-                return False, 'COOLDOWN'
-
-        # Capital check
-        lot_size = LOT_SIZES.get(symbol, 50)
-        capital_needed = premium * lot_size
-        if capital_needed > self.capital:
-            return False, 'NO_CAPITAL'
-
-        return True, 'OK'
-
-    def enter_trade(self, sig, timestamp):
-        """Enter a new trade."""
-        symbol = sig.get('symbol', sig.get('commodity', ''))
-        lot_size = LOT_SIZES.get(symbol, 50)
-        premium = sig['premium']
-
-        pos = {
-            'id': len(self.closed_trades) + len(self.positions) + 1,
-            'symbol': symbol,
-            'strategy': sig['strategy'],
-            'signal_type': sig['type'],
-            'strike': sig['strike'],
-            'entry_premium': premium,
-            'entry_time': timestamp,
-            'entry_spot': sig['spot'],
-            'lot_size': lot_size,
-            'delta': sig.get('delta', 0),
-            'gamma': sig.get('gamma', 0),
-            'high_premium': premium,  # Track highest premium for TSL
-            'unrealized_pnl': 0,
-        }
-        self.positions.append(pos)
-        self.capital -= premium * lot_size
-        self.cooldown[symbol] = timestamp
-        self.daily_trade_count += 1
-
-    def check_exits(self, current_prices, timestamp):
-        """
-        Check exit conditions for all open positions.
-        current_prices: {symbol: {spot: float, premiums: {strike: premium}}}
-        """
-        rules = self.rules
-        to_close = []
-
-        for pos in self.positions:
-            symbol = pos['symbol']
-            if symbol not in current_prices:
-                continue
-
-            spot = current_prices[symbol].get('spot', 0)
-            # Estimate current premium using delta approximation
-            spot_change = spot - pos['entry_spot']
-            delta = pos.get('delta', 0.5)
-            premium_change = abs(delta) * spot_change
-            if 'PE' in pos['signal_type']:
-                premium_change = -premium_change
-
-            current_premium = max(0.05, pos['entry_premium'] + premium_change)
-
-            # Update high watermark
-            if current_premium > pos['high_premium']:
-                pos['high_premium'] = current_premium
-
-            # Calculate gains
-            gain_pct = (current_premium - pos['entry_premium']) / pos['entry_premium'] * 100
-            from_high_pct = (pos['high_premium'] - current_premium) / pos['high_premium'] * 100 if pos['high_premium'] > 0 else 0
-
-            exit_reason = None
-
-            # 1. Fixed SL: -40% from entry
-            if gain_pct <= -self.TSL_INITIAL_SL_PCT:
-                exit_reason = 'SL_HIT'
-
-            # 2. TSL Phase 2: 15-25% gain, trail at tsl_trail_pct of gains
-            elif gain_pct >= self.TSL_PHASE1_THRESHOLD and gain_pct < self.TSL_PHASE2_THRESHOLD:
-                trail_distance = rules['tsl_trail_pct']
-                if from_high_pct >= trail_distance:
-                    exit_reason = 'TRAILING_SL_HIT'
-
-            # 3. TSL Phase 3: >25% gain, tighter trail
-            elif gain_pct >= self.TSL_PHASE2_THRESHOLD:
-                trail_distance = rules['tsl_tight_pct']
-                if from_high_pct >= trail_distance:
-                    exit_reason = 'TRAILING_SL_HIT'
-
-            # 4. BREAKOUT_FAIL: small gain then reversal within 5 min
-            if not exit_reason and rules['breakout_fail_enabled']:
-                time_held = (timestamp - pos['entry_time']).total_seconds() / 60
-                if time_held <= 5:
-                    if gain_pct >= rules['breakout_fail_min_gain_pct']:
-                        # Had a small gain, check if reversing
-                        if from_high_pct >= rules['breakout_fail_reverse_pct']:
-                            exit_reason = 'BREAKOUT_FAIL'
-                    elif gain_pct > 0 and from_high_pct >= rules['breakout_fail_reverse_pct']:
-                        exit_reason = 'BREAKOUT_FAIL'
-
-            # 5. Time exit: >2 hours with <2% gain
-            if not exit_reason:
-                time_held = (timestamp - pos['entry_time']).total_seconds() / 60
-                if time_held >= 120 and gain_pct < 2:
-                    exit_reason = 'TIME_EXIT_NO_PROGRESS'
-
-            if exit_reason:
-                pnl = (current_premium - pos['entry_premium']) * pos['lot_size']
-                pnl_pct = gain_pct
-                to_close.append((pos, current_premium, exit_reason, pnl, pnl_pct))
-
-        for pos, exit_prem, reason, pnl, pnl_pct in to_close:
-            self.positions.remove(pos)
-            self.capital += exit_prem * pos['lot_size']
-            self.closed_trades.append({
-                'symbol': pos['symbol'],
-                'strategy': pos['strategy'],
-                'signal_type': pos['signal_type'],
-                'strike': pos['strike'],
-                'entry_premium': pos['entry_premium'],
-                'exit_premium': exit_prem,
-                'entry_time': pos['entry_time'].isoformat(),
-                'exit_time': timestamp.isoformat(),
-                'pnl': round(pnl, 2),
-                'pnl_pct': round(pnl_pct, 2),
-                'exit_reason': reason,
-                'delta': pos.get('delta', 0),
-                'gamma': pos.get('gamma', 0),
-                'lot_size': pos['lot_size'],
-            })
-
-    def close_all(self, current_prices, timestamp):
-        """Force close all open positions (EOD)."""
-        for pos in list(self.positions):
-            symbol = pos['symbol']
-            spot = current_prices.get(symbol, {}).get('spot', pos['entry_spot'])
-            spot_change = spot - pos['entry_spot']
-            delta = pos.get('delta', 0.5)
-            premium_change = abs(delta) * spot_change
-            if 'PE' in pos['signal_type']:
-                premium_change = -premium_change
-            current_premium = max(0.05, pos['entry_premium'] + premium_change)
-
-            pnl = (current_premium - pos['entry_premium']) * pos['lot_size']
-            pnl_pct = (current_premium - pos['entry_premium']) / pos['entry_premium'] * 100
-
-            self.positions.remove(pos)
-            self.capital += current_premium * pos['lot_size']
-            self.closed_trades.append({
-                'symbol': pos['symbol'],
-                'strategy': pos['strategy'],
-                'signal_type': pos['signal_type'],
-                'strike': pos['strike'],
-                'entry_premium': pos['entry_premium'],
-                'exit_premium': round(current_premium, 2),
-                'entry_time': pos['entry_time'].isoformat(),
-                'exit_time': timestamp.isoformat(),
-                'pnl': round(pnl, 2),
-                'pnl_pct': round(pnl_pct, 2),
-                'exit_reason': 'EOD_CLOSE',
-                'delta': pos.get('delta', 0),
-                'gamma': pos.get('gamma', 0),
-                'lot_size': pos['lot_size'],
-            })
-
-    def summary(self):
-        """Return summary statistics."""
-        total_pnl = sum(t['pnl'] for t in self.closed_trades)
-        winners = [t for t in self.closed_trades if t['pnl'] > 0]
-        losers = [t for t in self.closed_trades if t['pnl'] < 0]
-        breakout_fails = [t for t in self.closed_trades if t['exit_reason'] == 'BREAKOUT_FAIL']
-        tsl_exits = [t for t in self.closed_trades if 'TRAILING_SL' in t['exit_reason']]
-        sl_hits = [t for t in self.closed_trades if t['exit_reason'] == 'SL_HIT']
-
         return {
-            'total_trades': len(self.closed_trades),
-            'total_pnl': round(total_pnl, 0),
-            'winners': len(winners),
-            'losers': len(losers),
-            'win_rate': round(len(winners) / len(self.closed_trades) * 100, 1) if self.closed_trades else 0,
-            'avg_win': round(sum(t['pnl'] for t in winners) / len(winners), 0) if winners else 0,
-            'avg_loss': round(sum(t['pnl'] for t in losers) / len(losers), 0) if losers else 0,
-            'largest_win': round(max((t['pnl'] for t in winners), default=0), 0),
-            'largest_loss': round(min((t['pnl'] for t in losers), default=0), 0),
-            'breakout_fail_count': len(breakout_fails),
-            'breakout_fail_pnl': round(sum(t['pnl'] for t in breakout_fails), 0),
-            'tsl_count': len(tsl_exits),
-            'tsl_pnl': round(sum(t['pnl'] for t in tsl_exits), 0),
-            'sl_hit_count': len(sl_hits),
-            'sl_hit_pnl': round(sum(t['pnl'] for t in sl_hits), 0),
-            'final_capital': round(self.capital, 0),
+            'tsl_trail_pct': 40,   # Wide trail — survive retracements
+            'tsl_tight_pct': 25,   # Wide tight
+            'bf_enabled': False,   # DISABLED
+        }
+    elif regime == 'FLAT':
+        return {
+            'tsl_trail_pct': 20,   # Tight trail — lock gains
+            'tsl_tight_pct': 15,
+            'bf_enabled': True,
+        }
+    else:  # SIDEWAYS
+        return {
+            'tsl_trail_pct': 30,
+            'tsl_tight_pct': 20,
+            'bf_enabled': True,
+        }
+
+
+# ===================== PREMIUM ESTIMATION =====================
+
+def estimate_premium(entry_premium, entry_spot, current_spot, delta, gamma, theta, hours_held):
+    """
+    Estimate current premium: delta*dS + 0.5*gamma*dS^2 - theta_decay
+    Uses SIGNED delta (negative for PE, positive for CE).
+    """
+    d_spot = current_spot - entry_spot
+    premium_change = delta * d_spot + 0.5 * abs(gamma) * d_spot ** 2
+    theta_decay = abs(theta) * hours_held / 24
+    return max(0.05, round(entry_premium + premium_change - theta_decay, 2))
+
+
+# ===================== EXIT STRATEGY SIMULATOR =====================
+
+class ExitSimulator:
+    """
+    Simulates exit logic for a single trade.
+    Matches paper_trader.py exit flow: BF -> TSL update -> TSL hit -> SL/Target
+    """
+
+    # TSL phases
+    TSL_BREAKEVEN_PCT = 15
+    TSL_TRAIL_PCT = 25
+    TSL_TIGHT_PCT = 40
+
+    # Trailing target
+    TARGET_TRAIL_ENABLED = True
+    TARGET_TRAIL_EXTEND_PCT = 20
+    TARGET_TRAIL_TSL_PCT = 15
+    TARGET_TRAIL_MAX_EXT = 5
+
+    # Breakout fail
+    GRACE_PERIOD = 180
+    BF_CHECK_END = 300
+    BF_MIN_GAIN_PCT = 2.0
+    BF_REVERSE_DROP_PCT = 15.0
+
+    def __init__(self, trade, mode='old'):
+        """
+        trade: dict from actual portfolio (closed_trades entry)
+        mode: 'old' (v10.2) or 'new' (v10.3d)
+        """
+        self.trade = trade
+        self.mode = mode
+
+        # State tracking
+        self.entry_premium = trade['entry_premium']
+        self.entry_spot = trade['entry_spot']
+        self.entry_time = datetime.fromisoformat(trade['timestamp'])
+        self.delta = trade.get('delta', -0.5)
+        self.gamma = trade.get('gamma', 0.0004)
+        self.theta = abs(trade.get('theta', 50))
+        self.lot_size = trade['lot_size']
+        self.target = trade['details']['target']
+        self.sl = trade['details']['sl']
+
+        self.peak_premium = self.entry_premium
+        self.trailing_sl = None
+        self.breakeven_locked = False
+        self.target_extensions = 0
+
+        self.exit_premium = None
+        self.exit_time = None
+        self.exit_reason = None
+        self.closed = False
+
+    def check_exit(self, spot, timestamp, regime='SIDEWAYS'):
+        """Check all exit conditions. Returns True if position should close."""
+        if self.closed:
+            return True
+
+        hours_held = (timestamp - self.entry_time).total_seconds() / 3600
+        elapsed_secs = (timestamp - self.entry_time).total_seconds()
+
+        # Skip if in grace period
+        if elapsed_secs < 15:  # At least 15 seconds between entry and first check
+            return False
+
+        current_premium = estimate_premium(
+            self.entry_premium, self.entry_spot, spot,
+            self.delta, self.gamma, self.theta, hours_held
+        )
+
+        # Update peak
+        if current_premium > self.peak_premium:
+            self.peak_premium = round(current_premium, 2)
+
+        entry = self.entry_premium
+        peak = self.peak_premium
+        profit_from_entry = peak - entry
+        peak_gain_pct = (peak - entry) / entry * 100 if entry > 0 else 0
+        current_gain_pct = (current_premium - entry) / entry * 100 if entry > 0 else 0
+
+        # Get regime-specific params
+        if self.mode == 'new':
+            rp = get_regime_params(regime)
+        else:
+            rp = {'tsl_trail_pct': 30, 'tsl_tight_pct': 20, 'bf_enabled': True}
+
+        exit_reason = None
+
+        # ---- 1. BREAKOUT_FAIL (3-5 min window) ----
+        bf_enabled = rp['bf_enabled']
+        if bf_enabled and self.GRACE_PERIOD < elapsed_secs <= self.BF_CHECK_END:
+            drop_from_entry = (entry - current_premium) / entry * 100 if entry > 0 else 0
+            peak_gain_bf = (peak - entry) / entry * 100 if entry > 0 else 0
+
+            if drop_from_entry > self.BF_REVERSE_DROP_PCT:
+                exit_reason = 'BREAKOUT_FAIL_REVERSE'
+            elif elapsed_secs >= (self.BF_CHECK_END - 15) and peak_gain_bf < self.BF_MIN_GAIN_PCT:
+                exit_reason = 'BREAKOUT_FAIL'
+
+        # ---- 2. TSL PHASE TRACKING ----
+        if not exit_reason and profit_from_entry > 0:
+            # Phase 1: Lock breakeven at 15%+
+            if peak_gain_pct >= self.TSL_BREAKEVEN_PCT and not self.breakeven_locked:
+                self.breakeven_locked = True
+                self.trailing_sl = round(entry * 1.03, 2)
+
+            # Phase 3: Tight trail at 40%+
+            if peak_gain_pct >= self.TSL_TIGHT_PCT:
+                new_tsl = round(peak - profit_from_entry * rp['tsl_tight_pct'] / 100, 2)
+                new_tsl = max(new_tsl, self.trailing_sl or 0)
+                if new_tsl > (self.trailing_sl or 0):
+                    self.trailing_sl = new_tsl
+
+            # Phase 2: Trail at 25%+
+            elif peak_gain_pct >= self.TSL_TRAIL_PCT:
+                new_tsl = round(peak - profit_from_entry * rp['tsl_trail_pct'] / 100, 2)
+                new_tsl = max(new_tsl, self.trailing_sl or 0)
+                if new_tsl > (self.trailing_sl or 0):
+                    self.trailing_sl = new_tsl
+
+            # TSL hit check
+            if self.trailing_sl and current_premium <= self.trailing_sl:
+                exit_reason = 'TRAILING_SL_HIT'
+
+        # ---- 3. STATIC EXITS ----
+        if not exit_reason:
+            if current_premium <= self.sl:
+                exit_reason = 'SL_HIT'
+            elif current_premium >= self.target:
+                if self.mode == 'new' and self.TARGET_TRAIL_ENABLED:
+                    if self.target_extensions < self.TARGET_TRAIL_MAX_EXT:
+                        # Extend target
+                        self.target_extensions += 1
+                        self.target = round(current_premium * (1 + self.TARGET_TRAIL_EXTEND_PCT / 100), 2)
+                        new_tsl = round(peak * (1 - self.TARGET_TRAIL_TSL_PCT / 100), 2)
+                        self.trailing_sl = max(new_tsl, self.trailing_sl or 0)
+                        # Don't exit — continue
+                    else:
+                        exit_reason = 'TARGET_HIT'
+                else:
+                    exit_reason = 'TARGET_HIT'
+
+        # ---- 4. TIME EXIT (>4 hours, stagnant) ----
+        if not exit_reason and hours_held > 4:
+            max_risk = entry * self.lot_size
+            unrealized = (current_premium - entry) * self.lot_size
+            profit_pct = unrealized / max(max_risk, 1) * 100
+            if abs(profit_pct) < 15:
+                exit_reason = 'TIME_EXIT'
+
+        if exit_reason:
+            self.exit_premium = round(current_premium, 2)
+            self.exit_time = timestamp
+            self.exit_reason = exit_reason
+            self.closed = True
+            return True
+
+        return False
+
+    def get_pnl(self):
+        """Calculate PnL."""
+        if not self.closed:
+            return 0
+        return round((self.exit_premium - self.entry_premium) * self.lot_size, 2)
+
+    def result(self):
+        """Return result dict."""
+        return {
+            'id': self.trade['id'],
+            'symbol': self.trade['symbol'],
+            'strategy': self.trade['strategy'],
+            'signal_type': self.trade['signal_type'],
+            'lot_size': self.lot_size,
+            'entry_premium': self.entry_premium,
+            'exit_premium': self.exit_premium or self.entry_premium,
+            'peak_premium': self.peak_premium,
+            'entry_time': self.entry_time.isoformat(),
+            'exit_time': self.exit_time.isoformat() if self.exit_time else '',
+            'exit_reason': self.exit_reason or 'OPEN',
+            'pnl': self.get_pnl(),
+            'pnl_pct': round((self.exit_premium - self.entry_premium) / self.entry_premium * 100, 1) if self.exit_premium else 0,
+            'target_extensions': self.target_extensions,
+            'trailing_sl': self.trailing_sl,
         }
 
 
 # ===================== BACKTEST ENGINE =====================
 
-def run_backtest(signals_df, rules, capital, market='equity', sym_col='symbol'):
+def run_exit_replay(portfolio_file, signals_df, mode='old'):
     """
-    Run backtest on signal data with given rules.
-
-    Args:
-        signals_df: DataFrame with columns [timestamp, symbol/commodity, strategy,
-                    type, strike, premium, spot, delta, gamma, oi, ...]
-        rules: Rule dict or 'REGIME_AWARE' for dynamic regime detection
-        capital: Starting capital
-        market: 'equity' or 'commodity'
-        sym_col: Column name for symbol ('symbol' or 'commodity')
-
-    Returns:
-        TradeSimulator with results
+    Replay actual entries through OLD or NEW exit rules using spot data
+    from signal CSV for premium estimation.
     """
-    regime_aware = (rules == 'REGIME_AWARE')
-
-    # Initialize with sideways rules if regime-aware
-    if regime_aware:
-        sim = TradeSimulator(NEW_RULES_SIDEWAYS, capital, market)
-    else:
-        sim = TradeSimulator(rules, capital, market)
-
-    # Sort by timestamp
-    signals_df = signals_df.sort_values('timestamp').reset_index(drop=True)
-
-    # Regime detector with hysteresis
-    regime_detector = BacktestRegimeDetector()
-
-    # Group signals by scan cycle (same timestamp[:16])
-    signals_df['scan_time'] = signals_df['timestamp'].str[:16]
-    scan_groups = signals_df.groupby('scan_time')
-
-    for scan_time_str, group in scan_groups:
-        timestamp = datetime.fromisoformat(group['timestamp'].iloc[0])
-
-        # Build current prices from this scan cycle
-        current_prices = {}
-        for sym in group[sym_col].unique():
-            sym_data = group[group[sym_col] == sym]
-            spot = sym_data['spot'].iloc[0]
-            current_prices[sym] = {'spot': spot}
-            regime_detector.update(sym, spot)
-
-        # Detect regime if regime-aware
-        if regime_aware:
-            primary_sym = group[sym_col].iloc[0]
-            regime = regime_detector.get_regime(primary_sym)
-            sim.rules = get_new_rules_for_regime(regime)
-
-        # Check exits first
-        sim.check_exits(current_prices, timestamp)
-
-        # Then try entries from this cycle's signals
-        # Deduplicate: take best signal per (symbol, type) in this cycle
-        for (sym, sig_type), sub_group in group.groupby([sym_col, 'type']):
-            # Pick best signal based on scoring rules
-            best_sig = None
-            best_score = -1
-
-            for _, sig in sub_group.iterrows():
-                if regime_aware or sim.rules.get('use_delta_gamma_scoring', False):
-                    score = score_signal_new(dict(sig))
-                else:
-                    score = score_signal_old(dict(sig))
-
-                if score > best_score:
-                    best_score = score
-                    best_sig = dict(sig)
-
-            if best_sig is None or best_score < 0:
-                continue  # All signals filtered out (delta range)
-
-            # Normalize symbol column
-            if sym_col == 'commodity':
-                best_sig['symbol'] = best_sig['commodity']
-
-            can, reason = sim.can_enter(best_sig, timestamp)
-            if can:
-                sim.enter_trade(best_sig, timestamp)
-
-    # Close remaining at last known prices
-    last_row = signals_df.iloc[-1]
-    last_time = datetime.fromisoformat(last_row['timestamp'])
-    last_prices = {}
-    for sym in signals_df[sym_col].unique():
-        sym_data = signals_df[signals_df[sym_col] == sym]
-        last_prices[sym] = {'spot': sym_data['spot'].iloc[-1]}
-    sim.close_all(last_prices, last_time)
-
-    return sim
-
-
-# ===================== ACTUAL TRADES LOADER =====================
-
-def load_actual_trades(portfolio_file, market='equity'):
-    """Load actual trades from portfolio JSON."""
     with open(portfolio_file) as f:
         data = json.load(f)
 
-    trades = data.get('closed_trades', [])
-    total_pnl = sum(t.get('pnl', 0) for t in trades)
-    winners = [t for t in trades if t.get('pnl', 0) > 0]
-    losers = [t for t in trades if t.get('pnl', 0) < 0]
-    breakout_fails = [t for t in trades if t.get('exit_reason', '') == 'BREAKOUT_FAIL']
-    tsl_exits = [t for t in trades if 'TRAILING_SL' in t.get('exit_reason', '')]
+    trades = data['closed_trades']
 
-    return {
-        'total_trades': len(trades),
+    # Build spot price timeline from signals: {symbol: [(timestamp, spot), ...]}
+    spot_timeline = {}
+    signals_df = signals_df.sort_values('timestamp')
+    for sym in signals_df['symbol'].unique():
+        sym_data = signals_df[signals_df['symbol'] == sym].drop_duplicates(
+            subset=['timestamp'], keep='first')
+        spot_timeline[sym] = [
+            (datetime.fromisoformat(row['timestamp']), row['spot'])
+            for _, row in sym_data.iterrows()
+        ]
+
+    # Initialize regime detector
+    regime_detector = BacktestRegimeDetector()
+
+    # Create exit simulators for each trade
+    sims = [ExitSimulator(t, mode) for t in trades]
+
+    # Walk through time using spot data
+    all_timestamps = sorted(set(
+        ts for sym_data in spot_timeline.values() for ts, _ in sym_data
+    ))
+
+    for timestamp in all_timestamps:
+        # Update regime with current spots
+        regime_by_sym = {}
+        for sym, timeline in spot_timeline.items():
+            # Find latest spot <= timestamp
+            spot = None
+            for ts, s in timeline:
+                if ts <= timestamp:
+                    spot = s
+                else:
+                    break
+            if spot is not None:
+                regime_detector.update(sym, spot)
+                regime_by_sym[sym] = regime_detector.get_regime(sym)
+
+        # Check exits for all open positions
+        for sim in sims:
+            if sim.closed:
+                continue
+            if timestamp < sim.entry_time:
+                continue
+
+            symbol = sim.trade['symbol']
+            spot = None
+            for ts, s in spot_timeline.get(symbol, []):
+                if ts <= timestamp:
+                    spot = s
+                else:
+                    break
+
+            if spot is None:
+                continue
+
+            regime = regime_by_sym.get(symbol, 'SIDEWAYS')
+            sim.check_exit(spot, timestamp, regime)
+
+    # Force close any still-open positions at last known prices
+    for sim in sims:
+        if not sim.closed:
+            symbol = sim.trade['symbol']
+            if spot_timeline.get(symbol):
+                last_ts, last_spot = spot_timeline[symbol][-1]
+                sim.check_exit(last_spot, last_ts, 'SIDEWAYS')
+            if not sim.closed:
+                sim.exit_premium = sim.entry_premium
+                sim.exit_time = all_timestamps[-1] if all_timestamps else sim.entry_time
+                sim.exit_reason = 'EOD_CLOSE'
+                sim.closed = True
+
+    return [sim.result() for sim in sims]
+
+
+def summarize(results):
+    """Summarize a list of trade results."""
+    total_pnl = sum(t['pnl'] for t in results)
+    winners = [t for t in results if t['pnl'] > 0]
+    losers = [t for t in results if t['pnl'] < 0]
+
+    by_reason = defaultdict(list)
+    for t in results:
+        by_reason[t['exit_reason']].append(t)
+
+    s = {
+        'total_trades': len(results),
         'total_pnl': round(total_pnl, 0),
         'winners': len(winners),
         'losers': len(losers),
-        'win_rate': round(len(winners) / len(trades) * 100, 1) if trades else 0,
+        'win_rate': round(len(winners) / len(results) * 100, 1) if results else 0,
         'avg_win': round(sum(t['pnl'] for t in winners) / len(winners), 0) if winners else 0,
         'avg_loss': round(sum(t['pnl'] for t in losers) / len(losers), 0) if losers else 0,
         'largest_win': round(max((t['pnl'] for t in winners), default=0), 0),
         'largest_loss': round(min((t['pnl'] for t in losers), default=0), 0),
-        'breakout_fail_count': len(breakout_fails),
-        'breakout_fail_pnl': round(sum(t.get('pnl', 0) for t in breakout_fails), 0),
-        'tsl_count': len(tsl_exits),
-        'tsl_pnl': round(sum(t.get('pnl', 0) for t in tsl_exits), 0),
-        'trades': trades,
     }
+
+    for reason, group in by_reason.items():
+        key = reason.lower().replace(' ', '_')
+        s[f'{key}_count'] = len(group)
+        s[f'{key}_pnl'] = round(sum(t['pnl'] for t in group), 0)
+
+    return s
+
+
+# ===================== OUTPUT =====================
+
+def print_comparison(actual_sum, old_sum, new_sum):
+    """Print side-by-side comparison."""
+    print(f"\n{'=' * 95}")
+    print(f"  EXIT STRATEGY REPLAY - March 11, 2026 (same entries, different exit rules)")
+    print(f"{'=' * 95}")
+    print(f"  {'Metric':<30} {'ACTUAL (bot)':>18} {'OLD (v10.2)':>18} {'NEW (v10.3d)':>18}")
+    print(f"  {'-' * 88}")
+
+    rows = [
+        ('Total Trades', 'total_trades', 'd'),
+        ('Total PnL', 'total_pnl', 'rs'),
+        ('Winners', 'winners', 'd'),
+        ('Losers', 'losers', 'd'),
+        ('Win Rate', 'win_rate', 'pct'),
+        ('Avg Win', 'avg_win', 'rs'),
+        ('Avg Loss', 'avg_loss', 'rs'),
+        ('Largest Win', 'largest_win', 'rs'),
+        ('Largest Loss', 'largest_loss', 'rs'),
+        ('BREAKOUT_FAIL', 'breakout_fail_count', 'd'),
+        ('BF PnL', 'breakout_fail_pnl', 'rs'),
+        ('TRAILING_SL_HIT', 'trailing_sl_hit_count', 'd'),
+        ('TSL PnL', 'trailing_sl_hit_pnl', 'rs'),
+        ('TARGET_HIT', 'target_hit_count', 'd'),
+        ('Target PnL', 'target_hit_pnl', 'rs'),
+        ('SL_HIT', 'sl_hit_count', 'd'),
+        ('SL PnL', 'sl_hit_pnl', 'rs'),
+        ('EOD_CLOSE', 'eod_close_count', 'd'),
+        ('EOD PnL', 'eod_close_pnl', 'rs'),
+        ('TIME_EXIT', 'time_exit_count', 'd'),
+        ('Time PnL', 'time_exit_pnl', 'rs'),
+    ]
+
+    for label_str, key, fmt in rows:
+        vals = []
+        for d in [actual_sum, old_sum, new_sum]:
+            v = d.get(key, None)
+            if v is None:
+                vals.append('-')
+            elif fmt == 'rs':
+                vals.append(f"Rs {v:+,.0f}")
+            elif fmt == 'pct':
+                vals.append(f"{v:.1f}%")
+            else:
+                vals.append(str(v))
+        # Skip rows where all 3 are '-'
+        if all(v == '-' for v in vals):
+            continue
+        print(f"  {label_str:<30} {vals[0]:>18} {vals[1]:>18} {vals[2]:>18}")
+
+    old_pnl = old_sum.get('total_pnl', 0)
+    new_pnl = new_sum.get('total_pnl', 0)
+    act_pnl = actual_sum.get('total_pnl', 0)
+    print(f"\n  v10.3d vs OLD:    Rs {new_pnl - old_pnl:+,.0f}")
+    print(f"  v10.3d vs ACTUAL: Rs {new_pnl - act_pnl:+,.0f}")
+
+
+def print_trades(results, label):
+    """Print individual trade details."""
+    print(f"\n  --- {label} ---")
+    for t in sorted(results, key=lambda x: x.get('exit_time', '')):
+        ext = f" ext#{t['target_extensions']}" if t.get('target_extensions', 0) > 0 else ""
+        tsl = f" TSL={t['trailing_sl']:.0f}" if t.get('trailing_sl') else ""
+        et = t['entry_time'][11:16]
+        xt = t['exit_time'][11:16] if t.get('exit_time') else '?'
+        print(f"    {et}->{xt} {t['symbol']:>10} {t['strategy']:>15} lot={t['lot_size']:>4} "
+              f"entry={t['entry_premium']:>8.2f} peak={t['peak_premium']:>8.2f} "
+              f"exit={t['exit_premium']:>8.2f} "
+              f"PnL={t['pnl']:>+10,.0f}  {t['exit_reason']}{ext}{tsl}")
 
 
 # ===================== MAIN =====================
 
-def print_comparison(label, actual, old_sim, new_sim):
-    """Print side-by-side comparison."""
-    print(f"\n{'='*80}")
-    print(f"  {label} BACKTEST COMPARISON — March 11, 2026")
-    print(f"{'='*80}")
-    print(f"{'Metric':<30} {'ACTUAL (bot)':>15} {'OLD Rules':>15} {'NEW v10.3':>15}")
-    print(f"{'-'*75}")
-
-    metrics = [
-        ('Total Trades', 'total_trades'),
-        ('Total PnL', 'total_pnl'),
-        ('Winners', 'winners'),
-        ('Losers', 'losers'),
-        ('Win Rate %', 'win_rate'),
-        ('Avg Win', 'avg_win'),
-        ('Avg Loss', 'avg_loss'),
-        ('Largest Win', 'largest_win'),
-        ('Largest Loss', 'largest_loss'),
-        ('BREAKOUT_FAIL Count', 'breakout_fail_count'),
-        ('BREAKOUT_FAIL PnL', 'breakout_fail_pnl'),
-        ('TSL Exit Count', 'tsl_count'),
-        ('TSL Exit PnL', 'tsl_pnl'),
-    ]
-
-    for label_str, key in metrics:
-        actual_val = actual.get(key, '-')
-        old_val = old_sim.get(key, '-')
-        new_val = new_sim.get(key, '-')
-
-        if key in ('total_pnl', 'avg_win', 'avg_loss', 'largest_win', 'largest_loss',
-                   'breakout_fail_pnl', 'tsl_pnl'):
-            actual_str = f"Rs {actual_val:+,.0f}" if isinstance(actual_val, (int, float)) else str(actual_val)
-            old_str = f"Rs {old_val:+,.0f}" if isinstance(old_val, (int, float)) else str(old_val)
-            new_str = f"Rs {new_val:+,.0f}" if isinstance(new_val, (int, float)) else str(new_val)
-        elif key == 'win_rate':
-            actual_str = f"{actual_val:.1f}%" if isinstance(actual_val, (int, float)) else str(actual_val)
-            old_str = f"{old_val:.1f}%" if isinstance(old_val, (int, float)) else str(old_val)
-            new_str = f"{new_val:.1f}%" if isinstance(new_val, (int, float)) else str(new_val)
-        else:
-            actual_str = str(actual_val)
-            old_str = str(old_val)
-            new_str = str(new_val)
-
-        print(f"  {label_str:<28} {actual_str:>15} {old_str:>15} {new_str:>15}")
-
-    # Improvement
-    if isinstance(new_sim.get('total_pnl'), (int, float)) and isinstance(old_sim.get('total_pnl'), (int, float)):
-        diff = new_sim['total_pnl'] - old_sim['total_pnl']
-        print(f"\n  v10.3 Improvement: Rs {diff:+,.0f}")
-
-
-def print_trade_details(sim, label):
-    """Print individual trade details."""
-    print(f"\n  --- {label} Trade Details ---")
-    for t in sim.closed_trades:
-        pnl_str = f"Rs {t['pnl']:+,.0f}"
-        print(f"    {t['symbol']:12s} {t['strategy']:12s} {t['signal_type']:14s} "
-              f"Strike={t['strike']:>8.0f} Entry={t['entry_premium']:>8.2f} Exit={t['exit_premium']:>8.2f} "
-              f"{pnl_str:>12s} {t['exit_reason']}")
-
-
-def analyze_delta_filtering(signals_df, sym_col='symbol'):
-    """Analyze how many signals would be filtered by delta range 0.20-0.70."""
-    total = len(signals_df.drop_duplicates(subset=[sym_col, 'strike', 'strategy', 'type']))
-    delta_col = signals_df['delta'].abs()
-
-    in_range = signals_df[(delta_col >= 0.20) & (delta_col <= 0.70)]
-    in_range_unique = len(in_range.drop_duplicates(subset=[sym_col, 'strike', 'strategy', 'type']))
-
-    out_range = signals_df[(delta_col < 0.20) | (delta_col > 0.70)]
-    out_range_unique = len(out_range.drop_duplicates(subset=[sym_col, 'strike', 'strategy', 'type']))
-
-    print(f"\n  Delta Filter Analysis:")
-    print(f"    Total unique signals: {total}")
-    print(f"    In range (0.20-0.70): {in_range_unique} ({in_range_unique/total*100:.0f}%)")
-    print(f"    Filtered out:         {out_range_unique} ({out_range_unique/total*100:.0f}%)")
-
-    # Show filtered signals
-    if out_range_unique > 0:
-        out_uniq = out_range.drop_duplicates(subset=[sym_col, 'strike', 'strategy', 'type'], keep='first')
-        print(f"\n    Filtered signals (delta outside 0.20-0.70):")
-        for _, s in out_uniq.head(15).iterrows():
-            sym = s.get(sym_col, '?')
-            print(f"      {sym:12s} {s['strategy']:12s} {s['type']:14s} "
-                  f"strike={s['strike']:>8.0f} delta={s['delta']:.4f} prem={s['premium']:.2f}")
-
-
-def analyze_regime_timeline(signals_df, sym_col='symbol'):
-    """Show regime transitions throughout the day using hysteresis-based detector."""
-    signals_df = signals_df.sort_values('timestamp')
-    primary = signals_df[sym_col].mode().iloc[0]  # Most common symbol
-    sym_data = signals_df[signals_df[sym_col] == primary].drop_duplicates(subset=['timestamp'], keep='first')
-
-    detector = BacktestRegimeDetector()
-    regimes = []
-    times = []
-    spots = []
-
-    for _, row in sym_data.iterrows():
-        detector.update(primary, row['spot'])
-        regime = detector.get_regime(primary)
-        regimes.append(regime)
-        times.append(row['timestamp'][:19])
-        spots.append(row['spot'])
-
-    # Show transitions
-    print(f"\n  Regime Timeline ({primary}) — with hysteresis (min {BacktestRegimeDetector.MIN_HOLD} cycles):")
-    last_regime = None
-    for i in range(len(regimes)):
-        if regimes[i] != last_regime:
-            print(f"    {times[i]} -> {regimes[i]} (spot={spots[i]:.0f})")
-            last_regime = regimes[i]
-
-    # Count time in each regime
-    from collections import Counter
-    counts = Counter(regimes)
-    total = len(regimes)
-    for r, c in counts.most_common():
-        print(f"    {r}: {c}/{total} cycles ({c/total*100:.0f}%)")
-
-
 def main():
-    print("=" * 80)
-    print("  v10.3 BACKTEST — March 11, 2026")
-    print("  Comparing OLD (v10.2) vs NEW (v10.3) Rules")
-    print("  Using LIVE signal data from VPS")
-    print("=" * 80)
+    print("=" * 95)
+    print("  v10.3d EXIT STRATEGY REPLAY - March 11, 2026")
+    print("  Same entries as actual bot, comparing OLD vs NEW exit rules")
+    print("  TSL FIX: TRENDING=40/25% (wide), FLAT=20/15% (tight)")
+    print("  NEW adds: trailing target (extend 20%, TSL 15% below peak)")
+    print("  Premium: delta*dS + 0.5*gamma*dS^2 - theta_decay")
+    print("=" * 95)
 
-    # ======================== EQUITY ========================
-    if os.path.exists(EQUITY_SIGNALS) and os.path.exists(EQUITY_PORTFOLIO):
-        eq_signals = pd.read_csv(EQUITY_SIGNALS)
-        eq_actual = load_actual_trades(EQUITY_PORTFOLIO, 'equity')
+    if not os.path.exists(EQUITY_SIGNALS) or not os.path.exists(EQUITY_PORTFOLIO):
+        print("  ERROR: Missing signal or portfolio data files")
+        return
 
-        print(f"\n  Equity signals: {len(eq_signals)} rows, "
-              f"{eq_signals['symbol'].nunique()} symbols")
+    eq_signals = pd.read_csv(EQUITY_SIGNALS)
+    print(f"\n  Equity signals: {len(eq_signals)} rows, {eq_signals['symbol'].nunique()} symbols")
 
-        # Regime analysis
-        analyze_regime_timeline(eq_signals, 'symbol')
+    # Show regime timeline
+    signals_sorted = eq_signals.sort_values('timestamp')
+    detector = BacktestRegimeDetector()
+    last_regimes = {}
+    print(f"\n  Regime Timeline:")
+    for sym in ['NIFTY', 'SENSEX', 'BANKNIFTY']:
+        sym_data = signals_sorted[signals_sorted['symbol'] == sym].drop_duplicates(
+            subset=['timestamp'], keep='first')
+        det = BacktestRegimeDetector()
+        print(f"    {sym}:")
+        last_r = None
+        for _, row in sym_data.iterrows():
+            det.update(sym, row['spot'])
+            r = det.get_regime(sym)
+            if r != last_r:
+                print(f"      {row['timestamp'][:19]} -> {r} (spot={row['spot']:.0f})")
+                last_r = r
 
-        # Delta filter analysis
-        analyze_delta_filtering(eq_signals, 'symbol')
+    # Load actual results
+    with open(EQUITY_PORTFOLIO) as f:
+        portfolio = json.load(f)
+    actual_trades = portfolio['closed_trades']
+    actual_sum = summarize([{
+        'pnl': t['pnl'],
+        'exit_reason': t['exit_reason'],
+        'target_extensions': t.get('target_extensions', 0),
+        'trailing_sl': t.get('trailing_sl'),
+    } for t in actual_trades])
 
-        # Run OLD rules backtest
-        old_sim = run_backtest(eq_signals, OLD_RULES, 300000, 'equity', 'symbol')
-        old_summary = old_sim.summary()
+    # Run OLD exit rules
+    print(f"\n  Running OLD (v10.2) exit replay...")
+    old_results = run_exit_replay(EQUITY_PORTFOLIO, eq_signals, 'old')
+    old_sum = summarize(old_results)
 
-        # Run NEW rules backtest (regime-aware)
-        new_sim = run_backtest(eq_signals, 'REGIME_AWARE', 300000, 'equity', 'symbol')
-        new_summary = new_sim.summary()
+    # Run NEW exit rules
+    print(f"  Running NEW (v10.3d) exit replay...")
+    new_results = run_exit_replay(EQUITY_PORTFOLIO, eq_signals, 'new')
+    new_sum = summarize(new_results)
 
-        print_comparison("EQUITY", eq_actual, old_summary, new_summary)
-        print_trade_details(old_sim, "OLD Rules")
-        print_trade_details(new_sim, "NEW v10.3")
+    # Print comparison
+    print_comparison(actual_sum, old_sum, new_sum)
+    print_trades(old_results, "OLD v10.2 Exit Rules")
+    print_trades(new_results, "NEW v10.3d Exit Rules (corrected TSL + trailing target)")
 
-    # ======================== COMMODITY ========================
-    if os.path.exists(COMMODITY_SIGNALS) and os.path.exists(COMMODITY_PORTFOLIO):
-        cm_signals = pd.read_csv(COMMODITY_SIGNALS)
-        cm_actual = load_actual_trades(COMMODITY_PORTFOLIO, 'commodity')
+    # Show what changed
+    print(f"\n  --- KEY DIFFERENCES ---")
+    for old_t, new_t in zip(
+        sorted(old_results, key=lambda x: x['id']),
+        sorted(new_results, key=lambda x: x['id'])
+    ):
+        if old_t['exit_reason'] != new_t['exit_reason'] or abs(old_t['pnl'] - new_t['pnl']) > 100:
+            diff = new_t['pnl'] - old_t['pnl']
+            print(f"    {old_t['id'][:35]:<35} "
+                  f"OLD: {old_t['exit_reason']:>20} PnL={old_t['pnl']:>+10,.0f}  |  "
+                  f"NEW: {new_t['exit_reason']:>20} PnL={new_t['pnl']:>+10,.0f}  "
+                  f"diff={diff:>+10,.0f}")
 
-        print(f"\n\n  Commodity signals: {len(cm_signals)} rows, "
-              f"{cm_signals['commodity'].nunique()} commodities")
-
-        # Regime analysis
-        analyze_regime_timeline(cm_signals, 'commodity')
-
-        # Delta filter analysis
-        analyze_delta_filtering(cm_signals, 'commodity')
-
-        # Run OLD rules
-        old_sim = run_backtest(cm_signals, OLD_RULES, 300000, 'commodity', 'commodity')
-        old_summary = old_sim.summary()
-
-        # Run NEW rules (regime-aware)
-        new_sim = run_backtest(cm_signals, 'REGIME_AWARE', 300000, 'commodity', 'commodity')
-        new_summary = new_sim.summary()
-
-        print_comparison("COMMODITY", cm_actual, old_summary, new_summary)
-        print_trade_details(old_sim, "OLD Rules")
-        print_trade_details(new_sim, "NEW v10.3")
-
-    print(f"\n{'='*80}")
-    print("  BACKTEST COMPLETE")
-    print(f"{'='*80}")
+    print(f"\n{'=' * 95}")
+    print(f"  BACKTEST COMPLETE")
+    print(f"{'=' * 95}")
 
 
 if __name__ == '__main__':

@@ -1080,7 +1080,7 @@ class AngelConnection:
                     except Exception:
                         dte = 7
                     T_fallback = dte / 365
-                    iv_estimate = 0.15  # Conservative default IV for BFO
+                    iv_default = 0.15  # Fallback IV if back-solve fails
                     for cand_strike in candidates:
                         token_info = self.find_option_tokens(name, None, cand_strike, opt_type)
                         if token_info:
@@ -1091,7 +1091,8 @@ class AngelConnection:
                                 ltp = float(mkt.get('ltp', 0) or 0)
                                 oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
                                 if ltp > 0:
-                                    # v10.3: Calculate delta+gamma via BS model
+                                    # v10.3d: Back-solve IV from real market LTP (was hardcoded 0.15)
+                                    iv_estimate = implied_vol(ltp, spot, cand_strike, T_fallback, RISK_FREE_RATE, opt_type) or iv_default
                                     g = bs_greeks(spot, cand_strike, T_fallback, RISK_FREE_RATE, iv_estimate, opt_type)
                                     delta = abs(g['delta'])
                                     gamma = g['gamma']

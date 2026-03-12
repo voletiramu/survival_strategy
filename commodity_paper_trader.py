@@ -896,6 +896,82 @@ class CommodityStrategyEngine:
         self.angel = angel
         self.historical_data = {}
 
+    def select_strike_live(self, commodity, spot, strike_int, T, r, iv, opt_type, min_premium=5.0):
+        """v10.3d: Strike selection with live API greeks, Black-76 fallback.
+
+        Tries Angel optionGreek API first for real delta/gamma/OI/volume.
+        Falls back to Black-76 model if API returns no data.
+        Includes inline OI liquidity check (MIN_ENTRY_OI=500).
+        """
+        MIN_ENTRY_OI = 500
+        atm = round(spot / strike_int) * strike_int
+        candidates = set(atm + i * strike_int for i in range(-2, 3))
+
+        # --- Try live API greeks first ---
+        if self.angel and self.angel._connected:
+            try:
+                greeks_data = self.angel.get_option_greeks(commodity)
+                if greeks_data and len(greeks_data) > 0:
+                    best_score = -1
+                    best = None
+                    for item in greeks_data:
+                        try:
+                            item_strike = float(item.get('strikePrice', 0))
+                        except (ValueError, TypeError):
+                            continue
+                        if item_strike not in candidates:
+                            continue
+                        item_type = item.get('optionType', '').upper()
+                        if item_type != opt_type:
+                            continue
+                        ltp = float(item.get('ltp', 0) or 0)
+                        if ltp < min_premium:
+                            continue
+                        delta = abs(float(item.get('delta', 0) or 0))
+                        gamma = float(item.get('gamma', 0) or 0)
+                        oi = float(item.get('opnInterest', 0) or 0)
+                        volume = float(item.get('tradeVolume', 0) or 0)
+
+                        # Skip flat/illiquid strikes
+                        if delta < 0.20 or delta > 0.70:
+                            continue
+                        if oi < MIN_ENTRY_OI:
+                            logger.debug(f"  MCX_SKIP_LOW_OI: {commodity} {int(item_strike)}{opt_type} OI={oi:.0f}")
+                            continue
+
+                        delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                        gamma_score = min(gamma * 10000, 5.0)
+                        oi_norm = min(oi / 100000, 1.0)
+                        vol_norm = min(volume / 10000, 1.0)
+                        score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+
+                        if score > best_score and ltp > 0:
+                            best_score = score
+                            best = {
+                                'strike': int(item_strike),
+                                'greeks': {
+                                    'delta': float(item.get('delta', 0) or 0),
+                                    'gamma': gamma,
+                                    'theta': float(item.get('theta', 0) or 0),
+                                    'vega': float(item.get('vega', 0) or 0),
+                                    'iv': float(item.get('impliedVolatility', 0) or 0) / 100,
+                                    'price': ltp,
+                                },
+                            }
+                    if best:
+                        logger.info(f"  MCX_LIVE_STRIKE: {commodity} {opt_type} ATM={atm} "
+                                   f"Selected={best['strike']} Delta={best['greeks']['delta']:.3f} "
+                                   f"Gamma={best['greeks']['gamma']:.6f} LTP={best['greeks']['price']:.2f} [API]")
+                        return best
+                    else:
+                        logger.debug(f"  MCX_API_NO_MATCH: {commodity} {opt_type} — no candidate passed filters")
+            except Exception as e:
+                logger.debug(f"  MCX_API_GREEKS_ERR: {commodity} {opt_type} — {e}")
+
+        # --- Fallback to Black-76 model ---
+        logger.debug(f"  MCX_B76_FALLBACK: {commodity} {opt_type} — using theoretical greeks")
+        return select_optimal_mcx_strike(spot, strike_int, T, r, iv, opt_type, min_premium)
+
     def load_historical(self, commodity):
         """Load historical data for commodity. Auto-download if missing/stale."""
         spec = COMMODITIES[commodity]
@@ -1174,49 +1250,37 @@ class CommodityStrategyEngine:
                 if intraday_body < 0 and spot < vwap:
                     logger.info(f"  CPR_DIR_SKIP: {commodity} CE breakout but body={intraday_body:.1f} & spot<VWAP={vwap:.0f}")
                 else:
-                    # v9.5: Greeks-based strike selection (best delta + highest gamma)
-                    opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
+                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
                     ce_strike = opt['strike']
                     g = opt['greeks']
                     if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        # v10.3: Pre-check real OI before signal generation
-                        if not self._check_mcx_strike_liquidity(commodity, ce_strike, 'CE'):
-                            pass  # Illiquid strike — skip signal
-                        else:
-                            # v9.6: Camarilla confirmation — higher target if R3 already breached
-                            use_target = target_hit_mult if ohlc['high'] > ind['cam_r3'] else target_base_mult
-                            logger.info(f"  GREEKS_STRIKE: {commodity} CE {cpr_label} CPR ATM={round(spot/strike_int)*strike_int} "
-                                       f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
-                            signals.append({
-                                'type': 'BUY_CE_CPR', 'strike': ce_strike,
-                                'premium': g['price'], 'greeks': g,
-                                'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout",
-                                'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
-                            })
+                        # v9.6: Camarilla confirmation — higher target if R3 already breached
+                        use_target = target_hit_mult if ohlc['high'] > ind['cam_r3'] else target_base_mult
+                        signals.append({
+                            'type': 'BUY_CE_CPR', 'strike': ce_strike,
+                            'premium': g['price'], 'greeks': g,
+                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout",
+                            'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
+                        })
             elif spot < ind['bc']:
                 # v10.1: Skip PE breakdown if intraday body bullish AND spot above VWAP
                 if intraday_body > 0 and spot > vwap:
                     logger.info(f"  CPR_DIR_SKIP: {commodity} PE breakdown but body={intraday_body:.1f} & spot>VWAP={vwap:.0f}")
                 else:
-                    # v9.5: Greeks-based strike selection (best delta + highest gamma)
-                    opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
+                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
                     pe_strike = opt['strike']
                     g = opt['greeks']
                     if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        # v10.3: Pre-check real OI before signal generation
-                        if not self._check_mcx_strike_liquidity(commodity, pe_strike, 'PE'):
-                            pass  # Illiquid strike — skip signal
-                        else:
-                            # v9.6: Camarilla confirmation — higher target if S3 already breached
-                            use_target = target_hit_mult if ohlc['low'] < ind['cam_s3'] else target_base_mult
-                            logger.info(f"  GREEKS_STRIKE: {commodity} PE {cpr_label} CPR ATM={round(spot/strike_int)*strike_int} "
-                                       f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f}")
-                            signals.append({
-                                'type': 'BUY_PE_CPR', 'strike': pe_strike,
-                                'premium': g['price'], 'greeks': g,
-                                'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout",
-                                'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
-                            })
+                        # v9.6: Camarilla confirmation — higher target if S3 already breached
+                        use_target = target_hit_mult if ohlc['low'] < ind['cam_s3'] else target_base_mult
+                        signals.append({
+                            'type': 'BUY_PE_CPR', 'strike': pe_strike,
+                            'premium': g['price'], 'greeks': g,
+                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout",
+                            'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
+                        })
 
         # SELL mean reversion: Wide CPR only (> 0.6%) — unchanged from v9.5
         if cpr_w > 0.6:
@@ -1288,46 +1352,39 @@ class CommodityStrategyEngine:
                     logger.info(f"  GAMMA_DIR_SKIP: {commodity} CE but spot={spot:.0f} < VWAP={gamma_vwap:.0f}")
                 else:
                     # v9.5: Greeks-based strike selection (best delta + highest gamma)
-                    opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'CE', MCX_MIN_PREMIUM_BUY)
+                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'CE', MCX_MIN_PREMIUM_BUY)
                     ce_strike = opt['strike']
                     g = opt['greeks']
                     if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        # v10.3: Pre-check real OI before signal generation
-                        if not self._check_mcx_strike_liquidity(commodity, ce_strike, 'CE'):
-                            pass  # Illiquid strike — skip signal
-                        else:
-                            logger.info(f"  GREEKS_STRIKE: {commodity} CE(Gamma) ATM={round(spot/strike_int)*strike_int} "
-                                       f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
-                                       f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
-                            signals.append({
-                                'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
-                                'premium': g['price'], 'greeks': g,
-                                'reason': f"Gamma Blast: Up breakout body={body:.1f} DTE={actual_dte}",
-                                'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
-                            })
+                        logger.info(f"  GREEKS_STRIKE: {commodity} CE(Gamma) ATM={round(spot/strike_int)*strike_int} "
+                                   f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
+                                   f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
+                        signals.append({
+                            'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
+                            'premium': g['price'], 'greeks': g,
+                            'reason': f"Gamma Blast: Up breakout body={body:.1f} DTE={actual_dte}",
+                            'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
+                        })
             else:
                 # v10.1: VWAP direction check — skip PE if spot above VWAP
                 if spot > gamma_vwap:
                     logger.info(f"  GAMMA_DIR_SKIP: {commodity} PE but spot={spot:.0f} > VWAP={gamma_vwap:.0f}")
                 else:
-                    # v9.5: Greeks-based strike selection (best delta + highest gamma)
-                    opt = select_optimal_mcx_strike(spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'PE', MCX_MIN_PREMIUM_BUY)
+                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'PE', MCX_MIN_PREMIUM_BUY)
                     pe_strike = opt['strike']
                     g = opt['greeks']
                     if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        # v10.3: Pre-check real OI before signal generation
-                        if not self._check_mcx_strike_liquidity(commodity, pe_strike, 'PE'):
-                            pass  # Illiquid strike — skip signal
-                        else:
-                            logger.info(f"  GREEKS_STRIKE: {commodity} PE(Gamma) ATM={round(spot/strike_int)*strike_int} "
-                                       f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
-                                       f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
-                            signals.append({
-                                'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
-                                'premium': g['price'], 'greeks': g,
-                                'reason': f"Gamma Blast: Down breakout body={body:.1f} DTE={actual_dte}",
-                                'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
-                            })
+                        logger.info(f"  GREEKS_STRIKE: {commodity} PE(Gamma) ATM={round(spot/strike_int)*strike_int} "
+                                   f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
+                                   f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
+                        signals.append({
+                            'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
+                            'premium': g['price'], 'greeks': g,
+                            'reason': f"Gamma Blast: Down breakout body={body:.1f} DTE={actual_dte}",
+                            'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
+                        })
         return signals
 
     def check_ghost_zone_signals(self, commodity, spot, ohlc, ind, dow, dte):
@@ -1738,31 +1795,6 @@ class AngelMCXConnection:
         except Exception as e:
             logger.error(f"MCX Market data error: {e}")
         return None
-
-    def _check_mcx_strike_liquidity(self, commodity, strike, opt_type, min_oi=500):
-        """v10.3: Pre-check real OI/LTP before generating signal.
-        Returns True if strike is liquid enough, False if illiquid.
-        Prevents generating signals on phantom/dead options.
-        """
-        try:
-            expiry = self._get_nearest_mcx_expiry(commodity)
-            if not expiry:
-                return True  # Can't check, allow signal (execution filter will catch)
-            opt_info = self.find_option_tokens(commodity, expiry, strike, opt_type)
-            if not opt_info:
-                return True  # Can't find token, allow signal
-            self.angel._throttle()
-            mkt = self.angel.get_market_data('MCX', str(opt_info.get('token', '')))
-            if mkt:
-                real_oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
-                real_ltp = float(mkt.get('ltp', 0) or 0)
-                if real_oi < min_oi or real_ltp <= 0:
-                    logger.warning(f"  MCX_STRIKE_REJECTED: {commodity} {strike}{opt_type} "
-                                  f"OI={real_oi:.0f} LTP={real_ltp:.2f} — illiquid, skipping signal")
-                    return False
-        except Exception as e:
-            logger.debug(f"  MCX liquidity pre-check error: {e}")
-        return True  # Default: allow signal
 
     def find_option_tokens(self, commodity, expiry, strike, opt_type):
         """Find MCX option contract token from instrument master.

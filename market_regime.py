@@ -1,4 +1,4 @@
-# market_regime.py — v10.3c
+# market_regime.py — v10.3d
 """Classifies intraday market regime for adaptive trading parameters.
 
 Detects whether each symbol is in a TRENDING, SIDEWAYS, or FLAT regime
@@ -8,8 +8,15 @@ and commodity_paper_trader.py to dynamically adjust:
 - BREAKOUT_FAIL (disabled on trending days)
 - Re-entry cooldowns (shorter on trending)
 
-v10.3c fixes:
-- Session open is now stored separately (not lost when deque rolls)
+v10.3d fixes:
+- TSL params corrected: TRENDING=wide(40/25), FLAT=tight(20/15) (were inverted)
+- TRENDING threshold lowered: 0.4% move + 0.4 efficiency (was 0.8/0.5 — never triggered on Mar 11)
+- FLAT threshold tightened: 0.15% move + 0.25 efficiency (was 0.3/0.3 — too inclusive)
+- Hysteresis reduced: 10 cycles ~2.5min (was 20 ~5min — too slow to detect trends)
+- VIX override lowered: 0.4% move (was 0.6%)
+
+v10.3c:
+- Session open stored separately (not lost when deque rolls)
 - Hysteresis: regime must persist for MIN_REGIME_HOLD cycles before switching
 - Larger rolling window (240 readings = ~60min equity, ~40min commodity)
 - Added regime_info() for dashboard/logging
@@ -30,8 +37,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Minimum cycles a new regime must persist before we actually switch
-# At ~15s per cycle, 20 cycles = ~5 minutes of confirmation
-MIN_REGIME_HOLD = 20
+# At ~15s per cycle, 10 cycles = ~2.5 minutes of confirmation
+MIN_REGIME_HOLD = 10
 
 # Rolling window size: 240 readings at 15s = ~60 min for equity
 HISTORY_MAXLEN = 240
@@ -130,9 +137,16 @@ class RegimeDetector:
         current = prices[-1]
         total_move_pct = abs(current - session_open) / session_open * 100 if session_open > 0 else 0
 
-        abs_moves = sum(abs(prices[i] - prices[i-1]) for i in range(1, len(prices)))
-        net_move = abs(current - session_open)
-        efficiency = net_move / abs_moves if abs_moves > 0 else 0
+        all_abs_moves = sum(abs(prices[i] - prices[i-1]) for i in range(1, len(prices)))
+        session_net = abs(current - session_open)
+        session_eff = session_net / all_abs_moves if all_abs_moves > 0 else 0
+
+        recent = prices[-min(60, len(prices)):]
+        recent_abs = sum(abs(recent[i] - recent[i-1]) for i in range(1, len(recent)))
+        recent_net = abs(recent[-1] - recent[0])
+        recent_eff = recent_net / recent_abs if recent_abs > 0 else 0
+
+        efficiency = max(session_eff, recent_eff)
 
         pending = self._pending_regime.get(symbol)
         pending_count = self._pending_count.get(symbol, 0)
@@ -168,26 +182,33 @@ class RegimeDetector:
         total_move_pct = abs(current - session_open) / session_open * 100
 
         # --- Metric 2: Efficiency ratio (net move / sum of absolute moves) ---
-        # Use last 60 readings (~15 min equity) for efficiency calculation
-        # This avoids very old data polluting the efficiency metric
+        # v10.3d: Use DUAL efficiency — session-wide AND recent 60-bar
+        # Session-wide catches persistent trends even when recent bars are choppy
+        # Recent catches momentum shifts. Use MAX of both.
+        all_abs_moves = sum(abs(prices[i] - prices[i-1]) for i in range(1, len(prices)))
+        session_net_move = abs(current - session_open)
+        session_efficiency = session_net_move / all_abs_moves if all_abs_moves > 0 else 0
+
         recent = prices[-min(60, len(prices)):]
-        abs_moves = sum(abs(recent[i] - recent[i-1]) for i in range(1, len(recent)))
-        net_move = abs(recent[-1] - recent[0])
-        efficiency = net_move / abs_moves if abs_moves > 0 else 0
+        recent_abs_moves = sum(abs(recent[i] - recent[i-1]) for i in range(1, len(recent)))
+        recent_net_move = abs(recent[-1] - recent[0])
+        recent_efficiency = recent_net_move / recent_abs_moves if recent_abs_moves > 0 else 0
+
+        efficiency = max(session_efficiency, recent_efficiency)
 
         # --- Metric 3: VIX level ---
         vix_high = self._vix is not None and self._vix > 18
 
-        # Classification thresholds
-        if total_move_pct >= 0.8 and efficiency >= 0.5:
+        # Classification thresholds (v10.3d: lowered from 0.8/0.5 — Mar 11 never reached TRENDING)
+        if total_move_pct >= 0.4 and efficiency >= 0.4:
             regime = MarketRegime.TRENDING
-        elif total_move_pct < 0.3 and efficiency < 0.3:
+        elif total_move_pct < 0.15 and efficiency < 0.25:
             regime = MarketRegime.FLAT
         else:
             regime = MarketRegime.SIDEWAYS
 
         # VIX override: high VIX + decent move = TRENDING
-        if vix_high and total_move_pct >= 0.6:
+        if vix_high and total_move_pct >= 0.4:
             regime = MarketRegime.TRENDING
 
         return regime
@@ -205,16 +226,16 @@ def get_regime_params(regime):
     """
     if regime == MarketRegime.TRENDING:
         return {
-            'tsl_trail_distance_pct': 20,      # Wider trail (was 30) — let winners run
-            'tsl_tight_distance_pct': 15,      # Wider tight (was 20)
+            'tsl_trail_distance_pct': 40,      # Wide trail — survive retracements, let winners run
+            'tsl_tight_distance_pct': 25,      # Wide tight — still give room on big trends
             'breakout_fail_enabled': False,     # DISABLE breakout fail on trending days
             'breakout_fail_min_gain_pct': 0,   # N/A when disabled
             'reentry_cooldown_seconds': 300,   # Shorter cooldown (5 min vs 10)
         }
     elif regime == MarketRegime.FLAT:
         return {
-            'tsl_trail_distance_pct': 40,      # Tighter trail — take what you can
-            'tsl_tight_distance_pct': 25,
+            'tsl_trail_distance_pct': 20,      # Tight trail — lock in small gains quickly
+            'tsl_tight_distance_pct': 15,      # Very tight — no room for retracement on flat days
             'breakout_fail_enabled': True,
             'breakout_fail_min_gain_pct': 3,   # Stricter — need 3% in 5 min
             'reentry_cooldown_seconds': 900,   # Longer cooldown (15 min)
