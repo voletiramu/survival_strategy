@@ -1985,6 +1985,31 @@ class StrategyEngine:
             'three_bar_trend': three_bar_trend,
         }
 
+    def _get_nearest_expiry(self, symbol):
+        """Get nearest expiry for index options from instruments master.
+
+        v10.3d-3: Added to StrategyEngine so _get_strike_from_chain()
+        can resolve expiry for optionGreek API calls.
+        """
+        if not self.angel or self.angel.instruments is None:
+            return None
+        exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
+        mask = (self.angel.instruments['name'] == symbol) & \
+               (self.angel.instruments['exch_seg'] == exchange) & \
+               (self.angel.instruments['instrumenttype'].isin(['OPTIDX']))
+        matches = self.angel.instruments[mask]
+        if len(matches) == 0:
+            return None
+        today = datetime.now().date()
+        try:
+            expiries = pd.to_datetime(matches['expiry'], format='mixed', dayfirst=True).dt.date
+            future = expiries[expiries >= today]
+            if len(future) == 0:
+                return None
+            return future.min().strftime('%d%b%Y').upper()
+        except Exception:
+            return None
+
     def _get_strike_from_chain(self, symbol, spot, opt_type, dte):
         """v5: Get optimal strike from live option chain with caching.
 
