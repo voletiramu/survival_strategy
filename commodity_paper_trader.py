@@ -2831,7 +2831,7 @@ class CommodityPaperTrader:
                         flipped_type, sig['spot'], dir_ohlc, dir_indicators)
                     if flip_valid:
                         flipped_opt = 'CE' if 'CE' in flipped_type else 'PE'
-                        existing_flipped = [p for p in self.positions
+                        existing_flipped = [p for p in self.portfolio.positions
                             if p['commodity'] == sig['commodity']
                             and ('CE' if 'CE' in p['signal_type'] else 'PE') == flipped_opt]
                         if existing_flipped:
