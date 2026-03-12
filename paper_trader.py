@@ -1005,14 +1005,6 @@ class AngelConnection:
                     "expirydate": expiry_date
                 })
                 if data and data.get('data'):
-                    # Diagnostic: show NFO API strikes vs candidates
-                    _api_strikes_nfo = set()
-                    for _sd in data['data']:
-                        if _sd.get('optionType', '') == opt_type:
-                            _api_strikes_nfo.add(float(_sd.get('strikePrice', 0) or 0))
-                    logger.info(f"  OPTGREEK_NFO: {name} {opt_type} — {len(data['data'])} total, "
-                               f"candidates={sorted(candidates)}, "
-                               f"API strikes (sample)={sorted(_api_strikes_nfo)[:10]}")
                     for strike_data in data['data']:
                         sd_type = strike_data.get('optionType', '')
                         if sd_type != opt_type:
@@ -1029,11 +1021,6 @@ class AngelConnection:
                         delta = abs(float(strike_data.get('delta', 0) or 0))
                         gamma = float(strike_data.get('gamma', 0) or 0)
 
-                        # Diagnostic: log each candidate match
-                        logger.info(f"  OPTGREEK_MATCH: {name} {sd_strike:.0f}{opt_type} "
-                                   f"delta={delta:.3f} gamma={gamma:.6f} oi={oi:.0f} "
-                                   f"ltp={ltp:.2f} vol={volume:.0f}")
-
                         # v10.3d: Gamma-first scoring — highest gamma wins
                         delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
                         gamma_score = gamma * 10000
@@ -1043,27 +1030,46 @@ class AngelConnection:
 
                         # FILTER: Skip strikes outside delta range 0.20-0.70
                         if delta > 0 and (delta < 0.20 or delta > 0.70):
-                            logger.info(f"    DELTA_FILTER: {sd_strike:.0f} delta={delta:.3f} — outside 0.20-0.70")
                             continue
 
-                        if score > best_score and ltp > 0:
+                        # v10.3d-4: Score by delta+gamma+volume (optionGreek API returns LTP=0, OI=0)
+                        # Real LTP/OI fetched after selecting best strike
+                        if score > best_score and volume > 0:
                             best_score = score
                             best = {
                                 'strike': sd_strike,
                                 'ltp': ltp,
                                 'oi': oi,
-                                'iv': iv / 100 if iv > 1 else iv,  # Normalize to decimal
+                                'iv': iv / 100 if iv > 1 else iv,
                                 'volume': volume,
-                                'delta': delta,    # v10.3: store greeks
+                                'delta': delta,
                                 'gamma': gamma,
                             }
 
                     if best:
-                        # Now find the token for this strike
+                        # Find token and fetch REAL market data (optionGreek gives LTP=0)
                         token_info = self.find_option_tokens(name, None, best['strike'], opt_type)
                         if token_info:
                             best['token'] = str(token_info.get('token', ''))
                             best['symbol'] = token_info.get('symbol', '')
+                            # v10.3d-4: Fetch real LTP + OI from market data API
+                            exchange = 'BFO' if name == 'SENSEX' else 'NFO'
+                            mkt = self.get_market_data(exchange, best['token'])
+                            if mkt:
+                                real_ltp = float(mkt.get('ltp', 0) or 0)
+                                real_oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
+                                if real_ltp > 0:
+                                    best['ltp'] = real_ltp
+                                    best['oi'] = real_oi
+                                else:
+                                    logger.warning(f"  OPTGREEK_SKIP: {name} {best['strike']}{opt_type} "
+                                                  f"real LTP=0 — dead option")
+                                    best = None
+                            else:
+                                logger.warning(f"  OPTGREEK_SKIP: {name} {best['strike']}{opt_type} "
+                                              f"— market data fetch failed")
+                                best = None
+                    if best:
                         logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
                                    f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
                                    f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "
@@ -1086,15 +1092,6 @@ class AngelConnection:
                         "expirydate": bfo_expiry
                     })
                     if bfo_data and bfo_data.get('data') and len(bfo_data['data']) > 0:
-                        # Diagnostic: show API strikes vs candidates
-                        api_strikes = set()
-                        for _sd in bfo_data['data']:
-                            if _sd.get('optionType', '') == opt_type:
-                                api_strikes.add(float(_sd.get('strikePrice', 0) or 0))
-                        logger.info(f"  OPTGREEK_BFO_OK: {name} via API expiry={bfo_expiry} — "
-                                   f"{len(bfo_data['data'])} strikes, "
-                                   f"candidates={sorted(candidates)}, "
-                                   f"API {opt_type} strikes (sample)={sorted(api_strikes)[:10]}")
                         for strike_data in bfo_data['data']:
                             sd_type = strike_data.get('optionType', '')
                             if sd_type != opt_type:
@@ -1102,8 +1099,6 @@ class AngelConnection:
                             sd_strike = float(strike_data.get('strikePrice', 0) or 0)
                             if sd_strike not in candidates:
                                 continue
-                            oi = float(strike_data.get('opnInterest', 0) or 0)
-                            ltp = float(strike_data.get('ltp', 0) or 0)
                             iv = float(strike_data.get('impliedVolatility', 0) or 0)
                             volume = float(strike_data.get('tradeVolume', 0) or 0)
                             delta = abs(float(strike_data.get('delta', 0) or 0))
@@ -1111,14 +1106,13 @@ class AngelConnection:
                             if delta > 0 and (delta < 0.20 or delta > 0.70):
                                 continue
                             delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                            gamma_score = gamma * 10000  # No cap — let highest gamma win
-                            oi_norm = min(oi / 100000, 1.0)
+                            gamma_score = gamma * 10000
                             vol_norm = min(volume / 10000, 1.0)
-                            score = (delta_score * 30) + (gamma_score * 40) + (oi_norm * 20) + (vol_norm * 10)
-                            if score > best_score and ltp > 0:
+                            score = (delta_score * 30) + (gamma_score * 40) + (vol_norm * 10)
+                            if score > best_score and volume > 0:
                                 best_score = score
                                 best = {
-                                    'strike': sd_strike, 'ltp': ltp, 'oi': oi,
+                                    'strike': sd_strike, 'ltp': 0, 'oi': 0,
                                     'iv': iv / 100 if iv > 1 else iv,
                                     'volume': volume, 'delta': delta, 'gamma': gamma,
                                 }
@@ -1127,6 +1121,20 @@ class AngelConnection:
                             if token_info:
                                 best['token'] = str(token_info.get('token', ''))
                                 best['symbol'] = token_info.get('symbol', '')
+                                # v10.3d-4: Fetch real LTP + OI
+                                exchange = 'BFO' if name == 'SENSEX' else 'NFO'
+                                mkt = self.get_market_data(exchange, best['token'])
+                                if mkt:
+                                    real_ltp = float(mkt.get('ltp', 0) or 0)
+                                    real_oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
+                                    if real_ltp > 0:
+                                        best['ltp'] = real_ltp
+                                        best['oi'] = real_oi
+                                    else:
+                                        best = None
+                                else:
+                                    best = None
+                        if best:
                             logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
                                        f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
                                        f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "

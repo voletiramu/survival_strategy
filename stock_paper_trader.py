@@ -1157,7 +1157,8 @@ class StockAngelConnection:
                     if delta > 0 and (delta < 0.20 or delta > 0.70):
                         continue
 
-                    if score > best_score and ltp > 0:
+                    # v10.3d-4: Score by delta+gamma+volume (optionGreek API returns LTP=0, OI=0)
+                    if score > best_score and volume > 0:
                         best_score = score
                         best = {
                             'strike': sd_strike,
@@ -1165,7 +1166,7 @@ class StockAngelConnection:
                             'oi': oi,
                             'iv': iv / 100 if iv > 1 else iv,
                             'volume': volume,
-                            'delta': delta,    # v10.3: store greeks
+                            'delta': delta,
                             'gamma': gamma,
                         }
 
@@ -1174,6 +1175,19 @@ class StockAngelConnection:
                     if token_info:
                         best['token'] = str(token_info.get('token', ''))
                         best['symbol'] = token_info.get('symbol', '')
+                        # v10.3d-4: Fetch real LTP + OI from market data API
+                        mkt = self.get_market_data('NFO', best['token'])
+                        if mkt:
+                            real_ltp = float(mkt.get('ltp', 0) or 0)
+                            real_oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
+                            if real_ltp > 0:
+                                best['ltp'] = real_ltp
+                                best['oi'] = real_oi
+                            else:
+                                best = None
+                        else:
+                            best = None
+                if best:
                     logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
                                 f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
                                 f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "
