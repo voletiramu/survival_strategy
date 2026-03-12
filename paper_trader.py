@@ -1005,6 +1005,14 @@ class AngelConnection:
                     "expirydate": expiry_date
                 })
                 if data and data.get('data'):
+                    # Diagnostic: show NFO API strikes vs candidates
+                    _api_strikes_nfo = set()
+                    for _sd in data['data']:
+                        if _sd.get('optionType', '') == opt_type:
+                            _api_strikes_nfo.add(float(_sd.get('strikePrice', 0) or 0))
+                    logger.info(f"  OPTGREEK_NFO: {name} {opt_type} — {len(data['data'])} total, "
+                               f"candidates={sorted(candidates)}, "
+                               f"API strikes (sample)={sorted(_api_strikes_nfo)[:10]}")
                     for strike_data in data['data']:
                         sd_type = strike_data.get('optionType', '')
                         if sd_type != opt_type:
@@ -1077,8 +1085,15 @@ class AngelConnection:
                         "expirydate": bfo_expiry
                     })
                     if bfo_data and bfo_data.get('data') and len(bfo_data['data']) > 0:
+                        # Diagnostic: show API strikes vs candidates
+                        api_strikes = set()
+                        for _sd in bfo_data['data']:
+                            if _sd.get('optionType', '') == opt_type:
+                                api_strikes.add(float(_sd.get('strikePrice', 0) or 0))
                         logger.info(f"  OPTGREEK_BFO_OK: {name} via API expiry={bfo_expiry} — "
-                                   f"{len(bfo_data['data'])} strikes")
+                                   f"{len(bfo_data['data'])} strikes, "
+                                   f"candidates={sorted(candidates)}, "
+                                   f"API {opt_type} strikes (sample)={sorted(api_strikes)[:10]}")
                         for strike_data in bfo_data['data']:
                             sd_type = strike_data.get('optionType', '')
                             if sd_type != opt_type:
