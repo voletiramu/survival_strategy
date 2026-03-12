@@ -1029,20 +1029,21 @@ class AngelConnection:
                         delta = abs(float(strike_data.get('delta', 0) or 0))
                         gamma = float(strike_data.get('gamma', 0) or 0)
 
+                        # Diagnostic: log each candidate match
+                        logger.info(f"  OPTGREEK_MATCH: {name} {sd_strike:.0f}{opt_type} "
+                                   f"delta={delta:.3f} gamma={gamma:.6f} oi={oi:.0f} "
+                                   f"ltp={ltp:.2f} vol={volume:.0f}")
+
                         # v10.3d: Gamma-first scoring — highest gamma wins
-                        # Delta score: peak at 0.50, drops to 0 at ~0.20/0.80
                         delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                        # Gamma score: NO CAP — let highest gamma win (was capped at 5.0)
                         gamma_score = gamma * 10000
-                        # OI score: liquidity, normalized
                         oi_norm = min(oi / 100000, 1.0)
-                        # Volume score: activity, normalized
                         vol_norm = min(volume / 10000, 1.0)
-                        # Weighted: Gamma(40%) + Delta(30%) + OI(20%) + Volume(10%)
                         score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
                         # FILTER: Skip strikes outside delta range 0.20-0.70
                         if delta > 0 and (delta < 0.20 or delta > 0.70):
+                            logger.info(f"    DELTA_FILTER: {sd_strike:.0f} delta={delta:.3f} — outside 0.20-0.70")
                             continue
 
                         if score > best_score and ltp > 0:
