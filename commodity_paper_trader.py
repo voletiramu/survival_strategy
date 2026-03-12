@@ -940,10 +940,11 @@ class CommodityStrategyEngine:
                             continue
 
                         delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                        gamma_score = min(gamma * 10000, 5.0)
+                        gamma_score = gamma * 10000  # No cap — highest gamma wins
                         oi_norm = min(oi / 100000, 1.0)
                         vol_norm = min(volume / 10000, 1.0)
-                        score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+                        # Weighted: Gamma(40%) + Delta(30%) + OI(20%) + Volume(10%)
+                        score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
                         if score > best_score and ltp > 0:
                             best_score = score

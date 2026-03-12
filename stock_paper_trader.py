@@ -1121,13 +1121,13 @@ class StockAngelConnection:
                     delta = abs(float(strike_data.get('delta', 0) or 0))
                     gamma = float(strike_data.get('gamma', 0) or 0)
 
-                    # v10.3: Delta+Gamma optimized scoring (was OI-only)
+                    # v10.3d: Gamma-first scoring — highest gamma wins
                     delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                    gamma_score = min(gamma * 10000, 5.0)
+                    gamma_score = gamma * 10000  # No cap — let highest gamma win
                     oi_norm = min(oi / 100000, 1.0)
                     vol_norm = min(volume / 10000, 1.0)
-                    # Weighted: Delta(35%) + Gamma(25%) + OI(25%) + Volume(15%)
-                    score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+                    # Weighted: Gamma(40%) + Delta(30%) + OI(20%) + Volume(10%)
+                    score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
                     # FILTER: Skip strikes outside delta range 0.20-0.70
                     if delta > 0 and (delta < 0.20 or delta > 0.70):

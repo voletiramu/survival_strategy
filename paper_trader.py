@@ -1021,17 +1021,17 @@ class AngelConnection:
                         delta = abs(float(strike_data.get('delta', 0) or 0))
                         gamma = float(strike_data.get('gamma', 0) or 0)
 
-                        # v10.3: Delta+Gamma optimized scoring (was OI-only)
+                        # v10.3d: Gamma-first scoring — highest gamma wins
                         # Delta score: peak at 0.50, drops to 0 at ~0.20/0.80
                         delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                        # Gamma score: higher gamma = faster premium acceleration
-                        gamma_score = min(gamma * 10000, 5.0)
+                        # Gamma score: NO CAP — let highest gamma win (was capped at 5.0)
+                        gamma_score = gamma * 10000
                         # OI score: liquidity, normalized
                         oi_norm = min(oi / 100000, 1.0)
                         # Volume score: activity, normalized
                         vol_norm = min(volume / 10000, 1.0)
-                        # Weighted: Delta(35%) + Gamma(25%) + OI(25%) + Volume(15%)
-                        score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (vol_norm * 15)
+                        # Weighted: Gamma(40%) + Delta(30%) + OI(20%) + Volume(10%)
+                        score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
                         # FILTER: Skip strikes outside delta range 0.20-0.70
                         if delta > 0 and (delta < 0.20 or delta > 0.70):
@@ -1064,23 +1064,77 @@ class AngelConnection:
         except Exception as e:
             logger.error(f"Option chain strike selection error for {name}: {e}")
 
-        # v7.4: BFO/SENSEX fallback — optionGreek API doesn't support BFO
-        # Use find_option_tokens + get_market_data per strike to get real LTP
-        # v10.3: Added delta+gamma scoring via bs_greeks calculation
+        # v10.3d: Try optionGreek API for SENSEX/BFO (was skipped entirely before)
+        # Fall back to per-strike market data + BS greeks only if API returns empty
         if name == 'SENSEX' or best is None:
+            # Step 1: Try optionGreek API (same as NFO path)
+            try:
+                bfo_expiry = self._get_nearest_expiry(name) if not expiry_date else expiry_date
+                if bfo_expiry:
+                    self._throttle()
+                    bfo_data = self.obj.optionGreek({
+                        "name": name,
+                        "expirydate": bfo_expiry
+                    })
+                    if bfo_data and bfo_data.get('data') and len(bfo_data['data']) > 0:
+                        logger.info(f"  OPTGREEK_BFO_OK: {name} via API expiry={bfo_expiry} — "
+                                   f"{len(bfo_data['data'])} strikes")
+                        for strike_data in bfo_data['data']:
+                            sd_type = strike_data.get('optionType', '')
+                            if sd_type != opt_type:
+                                continue
+                            sd_strike = float(strike_data.get('strikePrice', 0) or 0)
+                            if sd_strike not in candidates:
+                                continue
+                            oi = float(strike_data.get('opnInterest', 0) or 0)
+                            ltp = float(strike_data.get('ltp', 0) or 0)
+                            iv = float(strike_data.get('impliedVolatility', 0) or 0)
+                            volume = float(strike_data.get('tradeVolume', 0) or 0)
+                            delta = abs(float(strike_data.get('delta', 0) or 0))
+                            gamma = float(strike_data.get('gamma', 0) or 0)
+                            if delta > 0 and (delta < 0.20 or delta > 0.70):
+                                continue
+                            delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                            gamma_score = gamma * 10000  # No cap — let highest gamma win
+                            oi_norm = min(oi / 100000, 1.0)
+                            vol_norm = min(volume / 10000, 1.0)
+                            score = (delta_score * 30) + (gamma_score * 40) + (oi_norm * 20) + (vol_norm * 10)
+                            if score > best_score and ltp > 0:
+                                best_score = score
+                                best = {
+                                    'strike': sd_strike, 'ltp': ltp, 'oi': oi,
+                                    'iv': iv / 100 if iv > 1 else iv,
+                                    'volume': volume, 'delta': delta, 'gamma': gamma,
+                                }
+                        if best:
+                            token_info = self.find_option_tokens(name, None, best['strike'], opt_type)
+                            if token_info:
+                                best['token'] = str(token_info.get('token', ''))
+                                best['symbol'] = token_info.get('symbol', '')
+                            logger.info(f"  OPTIMAL_STRIKE: {name} {opt_type} ATM={atm_strike} "
+                                       f"Selected={best['strike']} Delta={best.get('delta',0):.3f} "
+                                       f"Gamma={best.get('gamma',0):.6f} OI={best['oi']:,.0f} "
+                                       f"LTP={best['ltp']:.2f} IV={best.get('iv', 0)*100:.1f}% [BFO API]")
+                            return best
+                    else:
+                        logger.info(f"  OPTGREEK_BFO_EMPTY: {name} expiry={bfo_expiry} — "
+                                   f"API returned empty, trying per-strike fallback")
+            except Exception as e:
+                logger.warning(f"  OPTGREEK_BFO_ERR: {name} — {e}, trying per-strike fallback")
+
+            # Step 2: Per-strike fallback with real LTP + BS greeks (only if API failed)
             try:
                 expiry = self._get_nearest_expiry(name) if not expiry_date else expiry_date
                 if expiry:
                     best_fallback_score = -1
                     best_strike_info = None
-                    # Estimate DTE for greeks calculation
                     try:
                         exp_dt = datetime.strptime(expiry, '%d%b%Y')
                         dte = max((exp_dt.date() - datetime.now().date()).days, 1)
                     except Exception:
                         dte = 7
                     T_fallback = dte / 365
-                    iv_default = 0.15  # Fallback IV if back-solve fails
+                    iv_default = 0.15
                     for cand_strike in candidates:
                         token_info = self.find_option_tokens(name, None, cand_strike, opt_type)
                         if token_info:
@@ -1091,29 +1145,22 @@ class AngelConnection:
                                 ltp = float(mkt.get('ltp', 0) or 0)
                                 oi = float(mkt.get('opnInterest', mkt.get('oi', 0)) or 0)
                                 if ltp > 0:
-                                    # v10.3d: Back-solve IV from real market LTP (was hardcoded 0.15)
                                     iv_estimate = implied_vol(ltp, spot, cand_strike, T_fallback, RISK_FREE_RATE, opt_type) or iv_default
                                     g = bs_greeks(spot, cand_strike, T_fallback, RISK_FREE_RATE, iv_estimate, opt_type)
                                     delta = abs(g['delta'])
                                     gamma = g['gamma']
-                                    # Same scoring as primary path
                                     delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                                    gamma_score = min(gamma * 10000, 5.0)
+                                    gamma_score = gamma * 10000
                                     oi_norm = min(oi / 100000, 1.0)
-                                    score = (delta_score * 35) + (gamma_score * 25) + (oi_norm * 25) + (0.5 * 15)
-                                    # Filter delta range
+                                    score = (delta_score * 30) + (gamma_score * 40) + (oi_norm * 20) + (0.5 * 10)
                                     if delta < 0.20 or delta > 0.70:
                                         continue
                                     if score > best_fallback_score:
                                         best_fallback_score = score
                                         best_strike_info = {
-                                            'strike': cand_strike,
-                                            'ltp': ltp,
-                                            'oi': oi,
-                                            'iv': iv_estimate,
-                                            'volume': 0,
-                                            'delta': delta,
-                                            'gamma': gamma,
+                                            'strike': cand_strike, 'ltp': ltp, 'oi': oi,
+                                            'iv': iv_estimate, 'volume': 0,
+                                            'delta': delta, 'gamma': gamma,
                                             'token': str(token_info.get('token', '')),
                                             'symbol': token_info.get('symbol', ''),
                                         }
@@ -1121,10 +1168,10 @@ class AngelConnection:
                         logger.info(f"  BFO_FALLBACK_STRIKE: {name} {opt_type} ATM={atm_strike} "
                                    f"Selected={best_strike_info['strike']} Delta={best_strike_info.get('delta',0):.3f} "
                                    f"Gamma={best_strike_info.get('gamma',0):.6f} OI={best_strike_info['oi']:,.0f} "
-                                   f"LTP={best_strike_info['ltp']:.2f}")
+                                   f"LTP={best_strike_info['ltp']:.2f} [BS fallback]")
                         return best_strike_info
             except Exception as e:
-                logger.error(f"BFO fallback strike selection error for {name}: {e}")
+                logger.error(f"BFO per-strike fallback error for {name}: {e}")
 
         # Fallback: mathematical derivation
         logger.info(f"  FALLBACK_STRIKE: {name} {opt_type} using ATM={atm_strike} (option chain unavailable)")
