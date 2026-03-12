@@ -2025,8 +2025,13 @@ class StrategyEngine:
                             'time': now,
                         }
                         return result['strike'], result.get('ltp', 0), result.get('iv', 0)
+                    else:
+                        logger.info(f"  ANGEL_STRIKE_EMPTY: {symbol} {opt_type} expiry={expiry} — "
+                                   f"no valid strike from optionGreek API")
+                else:
+                    logger.info(f"  ANGEL_STRIKE_NO_EXPIRY: {symbol} — no future expiry found")
             except Exception as e:
-                logger.debug(f"Option chain strike lookup failed for {symbol}: {e}")
+                logger.info(f"  ANGEL_STRIKE_ERR: {symbol} {opt_type} — {e}")
 
         # Source 2: v9.4 — Pipeline chain from NSE/BSE (get real LTP for ATM strike)
         if self.market_pipeline:
