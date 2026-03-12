@@ -912,6 +912,12 @@ class CommodityStrategyEngine:
             try:
                 # v10.3d-3: Get nearest MCX expiry for API call (was missing → "Invalid expiry date")
                 expiry = None
+                # Lazy-load instruments if not yet loaded
+                if self.angel.instruments is None:
+                    cache = os.path.join(DATA_DIR, 'instrument_master.csv')
+                    if os.path.exists(cache):
+                        self.angel.instruments = pd.read_csv(cache, low_memory=False)
+                        logger.info(f"  MCX instruments loaded: {len(self.angel.instruments)} from cache")
                 if self.angel.instruments is not None:
                     mask = (self.angel.instruments['name'] == commodity) & \
                            (self.angel.instruments['exch_seg'] == 'MCX') & \

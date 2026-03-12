@@ -1036,6 +1036,30 @@ class StockAngelConnection:
             logger.error(f"Real PCR error for {name}: {e}")
         return None
 
+    def _get_nearest_expiry(self, symbol, exchange='NFO'):
+        """Get nearest expiry for stock options from instruments master.
+
+        v10.3d-3: Added to StockAngelConnection so select_optimal_strike()
+        can resolve expiry for NFO/BFO fallback.
+        """
+        if self.instruments is None:
+            return None
+        mask = ((self.instruments['name'] == symbol) &
+                (self.instruments['exch_seg'] == exchange) &
+                (self.instruments['instrumenttype'] == 'OPTSTK'))
+        matches = self.instruments[mask]
+        if len(matches) == 0:
+            return None
+        today = datetime.now().date()
+        try:
+            expiries = pd.to_datetime(matches['expiry'], format='mixed', dayfirst=True).dt.date
+            future = expiries[expiries >= today]
+            if len(future) == 0:
+                return None
+            return future.min().strftime('%d%b%Y').upper()
+        except Exception:
+            return None
+
     def select_optimal_strike(self, name, spot, opt_type, expiry_date=None, num_strikes=3):
         """Select best strike from live option chain for a stock.
 
