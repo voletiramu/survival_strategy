@@ -75,11 +75,12 @@ MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 m
 # Strategies compete for the same capital — no per-strategy hard limits.
 # Allocation percentages are for MONITORING/LOGGING only.
 STRATEGY_ALLOCATION = {
-    'Gamma Blast': 0.40,    # 40% target — best risk-adjusted (Sharpe 4.42)
-    'CPR':         0.30,    # 30% target — solid 70% WR, consistent
-    'Ghost Zone':  0.20,    # 20% target — v7 institutional methodology
-    'PCR+VWAP':    0.10,    # 10% target — needs live OI data to prove
-    # 'Survivor':  0.00,    # HALTED — needs Rs 1L+ per symbol
+    'CPR':          0.25,    # 25% target — solid 65% WR, consistent
+    'Gamma Blast':  0.30,    # 30% target — best risk-adjusted (Sharpe 4.42)
+    'Ghost Zone':   0.15,    # 15% target — v7 institutional methodology
+    'PCR+VWAP':     0.10,    # 10% target — needs live OI data to prove
+    'Trend Rider':  0.20,    # 20% target — NEW: trend day riding (PF 5.56 in backtest)
+    # 'Survivor':   0.00,    # HALTED — needs Rs 1L+ per symbol
 }
 
 def get_strategy_used_capital(positions, strategy_name):
@@ -120,13 +121,20 @@ STRATEGY_EXIT_MULT = {
     'Gamma Blast':  {'oi': 1.0, 'iv': 1.0},
     'Ghost Zone':   {'oi': 0.7, 'iv': 0.8},    # 30% LOWER threshold → exits faster
     'PCR+VWAP':     {'oi': 1.0, 'iv': 1.0},
+    'Trend Rider':  {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold — let trends run
     'Survivor':     {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold → tolerates swings
 }
 
 # Trade Quality Filters (eliminate brokerage-losing weak trades)
 MIN_PREMIUM_BUY = 15             # Min Rs 15 premium for BUY trades (was Rs 3)
+MIN_PREMIUM_BUY_BN = 40          # v11.1: BANKNIFTY min premium Rs 40 (premiums 3-5x NIFTY)
 MIN_PREMIUM_SELL = 20            # Min Rs 20 premium for SELL trades (was Rs 5)
 MIN_SIGNAL_SCORE = 50            # v2.5: Quality score 0-100, reject below 50 (was 40)
+
+# v11.1: Drawdown-reduction filters (backtest-validated: +Rs 10,671 PnL, -52% BANKNIFTY DD)
+CPR_MIN_WIDTH_PCT = 0.03         # Skip CPR signals when TC-BC width < 0.03% of pivot
+CHOPPY_DAY_EFF_THRESHOLD = 15    # Block late entries if 11:00 efficiency < 15%
+CHOPPY_DAY_BLOCK_AFTER = dtime(11, 0)  # Block new entries after 11:00 on choppy days
 DIRECTION_FLIP_MIN_SCORE = 70    # v7.6.2: Higher bar for DIRECTION_FLIP (closing existing to flip)
 
 # v7.7: Signal-Based Hold Score — controls exits
@@ -140,6 +148,17 @@ VIX_LOW_THRESHOLD = 14           # Below 14 = low vol regime → increase filter
 VIX_HIGH_THRESHOLD = 20          # Above 20 = high vol regime → relax filters 0.8x
 VIX_LOW_MULTIPLIER = 1.5         # Multiply thresholds by 1.5 in low VIX
 VIX_HIGH_MULTIPLIER = 0.8        # Multiply thresholds by 0.8 in high VIX
+# v10.6: VIX Hard Gate — block ALL entries in extreme VIX regimes
+VIX_BLOCK_HIGH = 35              # VIX > 35: too volatile, block entries
+VIX_BLOCK_LOW = 11               # VIX < 11: no movement expected, block entries
+# v10.6: Greeks Refresh + Theta Decay Exit
+GREEKS_REFRESH_INTERVAL_SECONDS = 300   # Refresh Greeks every 5 min during hold
+THETA_BURDEN_TIGHTEN_PCT = 5.0   # >5%/day theta burden → tighten SL to 90%
+THETA_BURDEN_EXIT_PCT = 999.0    # DISABLED (was 10%) — backtest proved it kills winning trades in 3 min
+THETA_TIGHTEN_SL_FACTOR = 0.90   # SL set to 90% of current premium
+# v10.6: PCR Shift Monitor (equity only)
+PCR_SHIFT_MIN_HOLD_MINUTES = 15
+PCR_SHIFT_SL_TIGHTEN_PCT = 0.20  # Tighten SL by 20% when PCR opposes trade
 
 # Cooldowns & Limits
 GRACE_PERIOD_SECONDS = 180       # v7.5: 3 min (was 10 min — missed fast spikes)
@@ -155,6 +174,11 @@ MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x 
 # Old system: TSL thresholds tied to target distance. With 2.5x targets,
 # needed 45% premium gain just to lock breakeven → never triggered.
 # New system: TSL triggers on actual premium gain from entry.
+# v10.4: Phase 0 — micro-gains protection (captures 5%+ peaks that never reach Phase 1)
+TSL_MICRO_GAIN_PCT = 5               # Activate at 5% peak gain
+TSL_MICRO_TRAIL_DISTANCE_PCT = 60    # Keep 40% of peak gain from entry (trail 60%)
+TSL_MICRO_MIN_HOLD_SECONDS = 300     # Only after 5 min hold (avoid noise exits)
+
 TSL_BREAKEVEN_GAIN_PCT = 15      # Phase 1: Lock breakeven when premium gains 15%
 TSL_TRAIL_GAIN_PCT = 25          # Phase 2: Start trailing when premium gains 25%
 TSL_TRAIL_DISTANCE_PCT = 30      # Phase 2 trail: 30% below peak profit
@@ -168,10 +192,20 @@ TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
 TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 
 # v10.1: Breakout Failure Detection
-BREAKOUT_FAIL_CHECK_MINUTES = 5
-BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
-BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
+BREAKOUT_FAIL_CHECK_MINUTES = 15       # v11: Increased from 5 min — backtest showed early exits hurt PnL
+BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in check window
+BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in check window
 BREAKOUT_FAIL_REVERSE_ENABLED = True
+
+# v11: TREND RIDER — 5th strategy for riding big trend days
+TR_ENTRY_TIME = dtime(10, 15)          # Enter after 1-hour confirmation
+TR_LAST_ENTRY_TIME = dtime(10, 30)     # Must enter by 10:30
+TR_MAX_GAP_PCT = 1.5                   # Skip gaps > 1.5% (reversal risk)
+TR_MIN_SCORE = 5                       # Need 5/10+ signal score
+TR_WIDE_TSL_TRIGGER_PCT = 35           # Start trailing after 35% gain
+TR_WIDE_TSL_DISTANCE_PCT = 28          # Trail 28% from peak (wide)
+TR_TARGET_MULT = 1.5                   # Target = 1.5x premium
+TR_SL_MULT = 0.65                      # SL at 65% of entry (35% loss allowed)
 
 # v10.3: Import regime-aware parameter function
 from market_regime import get_regime_params  # noqa: E402
@@ -486,6 +520,102 @@ def compute_signal_score(signal, spot, indicators, vix=None):
         score -= 5
 
     return max(min(score, 100), 0)
+
+
+def compute_direction_confidence(sig, spot, indicators, vix, greeks):
+    """v10.4: Direction Confidence Index (DCI) — continuous 0-100 score.
+
+    Uses ALL 8 available signal inputs mathematically weighted by their
+    backtest-proven correlation with profitable trades.
+    Higher = stronger conviction in the signal direction.
+
+    Components:
+      VWAP position     (±10): Distance from VWAP = institutional bias
+      EMA trend         (±12): EMA9 vs EMA20 crossover + gap size
+      3-bar momentum    (±8):  Recent candle direction alignment
+      PCR sentiment     (±8):  Put-Call Ratio institutional positioning
+      IV signal strength(±10): Higher IV = bigger premium moves
+      Delta quality     (±5):  ATM delta = best gamma exposure
+      Intraday body     (±5):  Spot vs open confirms direction
+      Theta burden      (-8):  Penalty for BUY on high theta near expiry
+    """
+    is_ce = 'CE' in sig.get('type', '')
+    score = 50  # Neutral baseline
+
+    # 1. VWAP POSITION (±10): Distance from VWAP indicates institutional bias
+    vwap = indicators.get('vwap', spot) if indicators else spot
+    vwap_dist_pct = (spot - vwap) / vwap * 100 if vwap else 0
+    if is_ce:
+        score += min(max(vwap_dist_pct * 5, -10), 10)
+    else:
+        score += min(max(-vwap_dist_pct * 5, -10), 10)
+
+    # 2. EMA TREND (±12): EMA9 vs EMA20 crossover + gap size
+    ema9 = indicators.get('ema_9', spot) if indicators else spot
+    ema20 = indicators.get('ema_20', spot) if indicators else spot
+    ema_gap_pct = (ema9 - ema20) / ema20 * 100 if ema20 else 0
+    if is_ce:
+        score += min(max(ema_gap_pct * 10, -12), 12)
+    else:
+        score += min(max(-ema_gap_pct * 10, -12), 12)
+
+    # 3. 3-BAR MOMENTUM (±8): Recent candle direction alignment
+    trend = indicators.get('three_bar_trend', 0) if indicators else 0
+    if is_ce:
+        score += min(trend * 3, 8)
+    else:
+        score += min(-trend * 3, 8)
+
+    # 4. PCR SENTIMENT (±8): Put-Call Ratio institutional positioning
+    pcr = indicators.get('pcr', 1.0) if indicators else 1.0
+    if is_ce and pcr > 1.0:
+        score += min((pcr - 1.0) * 20, 8)
+    elif not is_ce and pcr < 1.0:
+        score += min((1.0 - pcr) * 20, 8)
+
+    # 5. IV SIGNAL STRENGTH (±10): Higher IV = bigger premium moves
+    iv = greeks.get('iv', 0) if greeks else 0
+    if iv > 0:
+        if iv >= 0.40:
+            score += 10
+        elif iv >= 0.25:
+            score += 5
+        elif iv < 0.15:
+            score -= 10
+        elif iv < 0.20:
+            score -= 5
+
+    # 6. DELTA QUALITY (±5): ATM delta = best gamma exposure
+    delta = abs(greeks.get('delta', 0)) if greeks else 0
+    if 0.40 <= delta <= 0.60:
+        score += 5
+    elif delta < 0.25 or delta > 0.75:
+        score -= 5
+
+    # 7. INTRADAY BODY (±5): Spot vs open confirms direction
+    open_price = indicators.get('open', spot) if indicators else spot
+    body_pct = (spot - open_price) / open_price * 100 if open_price else 0
+    if is_ce:
+        score += min(max(body_pct * 3, -5), 5)
+    else:
+        score += min(max(-body_pct * 3, -5), 5)
+
+    # 8. THETA BURDEN (penalty for BUY on high theta near expiry)
+    theta = greeks.get('theta', 0) if greeks else 0
+    dte = sig.get('dte', 5)
+    if dte <= 1 and abs(theta) > 0:
+        premium = sig.get('premium', 100)
+        theta_pct_per_hour = abs(theta) / premium * 100 / 6.5 if premium > 0 else 0
+        if 'BUY' in sig.get('type', '') and theta_pct_per_hour > 3:
+            score -= 8
+
+    return max(min(score, 100), 0)
+
+
+# v10.4 constants for DCI and IV gates
+DCI_MIN_THRESHOLD = 40          # Minimum DCI to enter a trade
+IV_MIN_FOR_DTE1 = 0.20          # Minimum IV for DTE=1 trades
+IV_MIN_FOR_DTE0 = 0.25          # Minimum IV for expiry-day trades
 
 
 def compute_hold_score(pos, spot, indicators, current_oi=None, current_iv=None):
@@ -1022,14 +1152,14 @@ class AngelConnection:
                         gamma = float(strike_data.get('gamma', 0) or 0)
 
                         # v10.3d: Gamma-first scoring — highest gamma wins
-                        delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                        delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
                         gamma_score = gamma * 10000
                         oi_norm = min(oi / 100000, 1.0)
                         vol_norm = min(volume / 10000, 1.0)
                         score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
                         # FILTER: Skip strikes outside delta range 0.20-0.70
-                        if delta > 0 and (delta < 0.20 or delta > 0.70):
+                        if delta > 0 and (delta < 0.35 or delta > 0.65):
                             continue
 
                         # v10.3d-4: Score by delta+gamma+volume (optionGreek API returns LTP=0, OI=0)
@@ -1103,9 +1233,9 @@ class AngelConnection:
                             volume = float(strike_data.get('tradeVolume', 0) or 0)
                             delta = abs(float(strike_data.get('delta', 0) or 0))
                             gamma = float(strike_data.get('gamma', 0) or 0)
-                            if delta > 0 and (delta < 0.20 or delta > 0.70):
+                            if delta > 0 and (delta < 0.35 or delta > 0.65):
                                 continue
-                            delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                            delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
                             gamma_score = gamma * 10000
                             vol_norm = min(volume / 10000, 1.0)
                             score = (delta_score * 30) + (gamma_score * 40) + (vol_norm * 10)
@@ -1173,11 +1303,11 @@ class AngelConnection:
                                     g = bs_greeks(spot, cand_strike, T_fallback, RISK_FREE_RATE, iv_estimate, opt_type)
                                     delta = abs(g['delta'])
                                     gamma = g['gamma']
-                                    delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                                    delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
                                     gamma_score = gamma * 10000
                                     oi_norm = min(oi / 100000, 1.0)
                                     score = (delta_score * 30) + (gamma_score * 40) + (oi_norm * 20) + (0.5 * 10)
-                                    if delta < 0.20 or delta > 0.70:
+                                    if delta < 0.35 or delta > 0.65:
                                         continue
                                     if score > best_fallback_score:
                                         best_fallback_score = score
@@ -2129,6 +2259,12 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         cpr_w = ind['cpr_width']
 
+        # v11.1: Skip CPR signals on ultra-narrow CPR days (causes signal flipping)
+        if cpr_w < CPR_MIN_WIDTH_PCT:
+            logger.info(f"  CPR_NARROW_SKIP: {symbol} CPR width {cpr_w:.4f}% < {CPR_MIN_WIDTH_PCT}% "
+                       f"— TC≈BC≈Pivot, signals unreliable")
+            return signals
+
         # ---- v7.5: Realistic intraday option targets ----
         # Old targets (2.5x) required 150% option gain — almost never hit intraday.
         # New targets based on realistic option delta/gamma math:
@@ -2174,7 +2310,7 @@ class StrategyEngine:
                         'premium': premium,
                         'greeks': g,
                         'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * target_hit_mult if ohlc['high'] > ind['cam_r3'] else premium * target_base_mult,
                         'sl': premium * sl_mult,
                     })
@@ -2199,7 +2335,7 @@ class StrategyEngine:
                         'premium': premium,
                         'greeks': g,
                         'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * target_hit_mult if ohlc['low'] < ind['cam_s3'] else premium * target_base_mult,
                         'sl': premium * sl_mult,
                     })
@@ -2305,7 +2441,7 @@ class StrategyEngine:
                             'greeks': g,
                             'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
                                       f"ATR={atr:.0f} range={day_range:.2f}x"
-                                      f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                                      f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                             'target': premium * target_mult,
                             'sl': premium * sl_mult,
                         })
@@ -2326,7 +2462,7 @@ class StrategyEngine:
                             'greeks': g,
                             'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
                                       f"ATR={atr:.0f} range={day_range:.2f}x"
-                                      f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                                      f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                             'target': premium * target_mult,
                             'sl': premium * sl_mult,
                         })
@@ -2454,7 +2590,7 @@ class StrategyEngine:
                         'reason': f"GTZ v7 Demand: zone={zone_low:.0f}-{zone_high:.0f} "
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
                                   f"{oi_label}{exhaustion_label}"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * 1.5,  # v7.5: realistic intraday target (was 2.5x)
                         'sl': premium * 0.35,      # SL below zone
                     })
@@ -2495,7 +2631,7 @@ class StrategyEngine:
                         'reason': f"GTZ v7 Supply: zone={zone_low:.0f}-{zone_high:.0f} "
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
                                   f"{oi_label}"
-                                  f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * 1.5,  # v7.5: realistic intraday target
                         'sl': premium * 0.35,
                     })
@@ -2523,9 +2659,9 @@ class StrategyEngine:
         vwap = ind['vwap']
         pcr = ind['pcr']
 
-        # BUY CE: PCR > 1.05 (bullish), near VWAP
-        # v10.1: Fixed direction bug — CE requires spot > VWAP (was 0.995x allowing below)
-        if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
+        # BUY CE: PCR > 1.10 (bullish — put writers dominating), near VWAP
+        # v11: Corrected PCR thresholds — high PCR = institutions selling puts = bullish
+        if pcr > 1.10 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
             ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
             use_iv = chain_iv if chain_iv > 0 else ind['iv']
             g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
@@ -2537,14 +2673,14 @@ class StrategyEngine:
                     'premium': premium,
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
-                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                     'target': premium * 1.5,  # v7.5: realistic intraday target
                     'sl': premium * 0.4,
                 })
 
-        # BUY PE: PCR < 0.95 (bearish), near VWAP
-        # v10.1: Fixed direction bug — PE requires spot < VWAP (was 1.005x allowing above)
-        elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
+        # BUY PE: PCR < 0.80 (bearish — call writers dominating), near VWAP
+        # v11: Corrected PCR thresholds — low PCR = institutions selling calls = bearish
+        elif pcr < 0.80 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
             pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
             use_iv = chain_iv if chain_iv > 0 else ind['iv']
             g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
@@ -2556,9 +2692,147 @@ class StrategyEngine:
                     'premium': premium,
                     'greeks': g,
                     'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
-                              f"{' [CHAIN]' if chain_ltp > 0 else ''}",
+                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                     'target': premium * 1.5,  # v7.5: realistic intraday target
                     'sl': premium * 0.4,
+                })
+
+        return signals
+
+    def check_trend_rider_signal(self, symbol, spot, ohlc, indicators, dow, dte):
+        """Trend Rider v3 — ride big trend days with wide trailing stops.
+        v11: NEW strategy. Evaluates once per day at 10:15 using multi-signal confirmation.
+        Backtest: PF 5.56, 66.7% WR across NIFTY/BANKNIFTY/SENSEX.
+
+        Returns list with 0 or 1 signal (max 1 trade per day per symbol).
+        """
+        signals = []
+        ind = indicators
+        T = dte / 365
+        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
+
+        now = datetime.now()
+        if now.time() < TR_ENTRY_TIME or now.time() > TR_LAST_ENTRY_TIME:
+            return signals
+
+        # Need previous day data for gap, prev trend
+        df = self.historical_data.get(symbol)
+        if df is None or len(df) < 3:
+            return signals
+
+        prev1 = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+        prev2 = df.iloc[-3] if len(df) >= 3 else prev1
+        prev_close = prev1['Close']
+
+        # Gap check
+        day_open = ohlc['open']
+        gap_pct = (day_open - prev_close) / prev_close * 100
+        if abs(gap_pct) > TR_MAX_GAP_PCT:
+            logger.info(f"  TR_SKIP: {symbol} gap={gap_pct:+.2f}% > {TR_MAX_GAP_PCT}% (reversal risk)")
+            return signals
+
+        # 1-hour move
+        atr = ind['atr']
+        if atr <= 0:
+            return signals
+        move_1h = (spot - day_open) / atr
+
+        # VWAP
+        vwap = ind.get('vwap', spot)
+
+        # Check sustained direction (not spike-and-reverse)
+        # Use intraday body as proxy for 9:45 direction
+        intraday_body = spot - day_open
+        early_body = ohlc.get('close', spot) - day_open  # Current body direction
+
+        # Scoring
+        bear_score = 0; bull_score = 0
+        bear_r = []; bull_r = []
+
+        # 1. Gap (2 pts)
+        if gap_pct < -0.3:
+            bear_score += 2; bear_r.append(f'gap{gap_pct:.1f}%')
+        elif gap_pct > 0.3:
+            bull_score += 2; bull_r.append(f'gap+{gap_pct:.1f}%')
+
+        # 2. 1-hour momentum (3 pts — strongest signal)
+        if move_1h < -0.20:
+            bear_score += 3; bear_r.append(f'1h{move_1h:.2f}')
+        elif move_1h > 0.20:
+            bull_score += 3; bull_r.append(f'1h+{move_1h:.2f}')
+
+        # 3. VWAP position (1 pt)
+        if vwap > 0 and spot < vwap:
+            bear_score += 1; bear_r.append('<VW')
+        elif vwap > 0 and spot > vwap:
+            bull_score += 1; bull_r.append('>VW')
+
+        # 4. PCR (2 pts) — only with real PCR data
+        pcr = ind.get('pcr', 1.0)
+        pcr_source = ind.get('pcr_source', 'PROXY')
+        if pcr_source in ('PIPELINE', 'ANGEL_OI', 'REAL'):
+            if pcr < 0.85:
+                bear_score += 2; bear_r.append(f'PCR{pcr:.2f}')
+            elif pcr > 1.10:
+                bull_score += 2; bull_r.append(f'PCR{pcr:.2f}')
+
+        # 5. Previous day trend (1-2 pts)
+        prev1_red = prev1['Close'] < prev1['Open']
+        prev2_red = prev2['Close'] < prev2['Open']
+        prev1_grn = prev1['Close'] > prev1['Open']
+        prev2_grn = prev2['Close'] > prev2['Open']
+        if prev1_red and prev2_red:
+            bear_score += 2; bear_r.append('2xRed')
+        elif prev1_red:
+            bear_score += 1; bear_r.append('pRed')
+        if prev1_grn and prev2_grn:
+            bull_score += 2; bull_r.append('2xGrn')
+        elif prev1_grn:
+            bull_score += 1; bull_r.append('pGrn')
+
+        # 6. Making new low/high in first hour (1 pt)
+        if spot < day_open and spot <= ohlc['low'] * 1.001:
+            bear_score += 1; bear_r.append('newLo')
+        elif spot > day_open and spot >= ohlc['high'] * 0.999:
+            bull_score += 1; bull_r.append('newHi')
+
+        # Generate signal
+        if bear_score >= TR_MIN_SCORE:
+            pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY:
+                reason_str = '+'.join(bear_r)
+                signals.append({
+                    'type': 'BUY_PE',
+                    'strike': pe_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': f"TrendRider DN {reason_str} sc={bear_score}"
+                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                    'target': premium * TR_TARGET_MULT,
+                    'sl': premium * TR_SL_MULT,
+                    'trend_rider_score': bear_score,
+                })
+
+        elif bull_score >= TR_MIN_SCORE:
+            ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY:
+                reason_str = '+'.join(bull_r)
+                signals.append({
+                    'type': 'BUY_CE',
+                    'strike': ce_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': f"TrendRider UP {reason_str} sc={bull_score}"
+                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                    'target': premium * TR_TARGET_MULT,
+                    'sl': premium * TR_SL_MULT,
+                    'trend_rider_score': bull_score,
                 })
 
         return signals
@@ -2677,6 +2951,8 @@ class PaperTrader:
         from market_regime import RegimeDetector
         self.regime_detector = RegimeDetector()
         self._last_logged_regime = {}
+        # v11: Trend Rider — track daily entries (max 1 per symbol per day)
+        self._trend_rider_today = {}  # {symbol: date_str} — tracks if TR entered today
 
     def connect(self):
         """Connect to Angel API."""
@@ -2785,14 +3061,27 @@ class PaperTrader:
         opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
 
         # Source 1: Pipeline chain LTP from NSE/BSE (most reliable, no API auth needed)
+        # v10.5: Skip stale BSE data for SENSEX (> 5 min old → fall through to Angel BFO)
         try:
             if self.market_pipeline:
                 chain = self.market_pipeline.get_option_chain(symbol)
                 if chain:
-                    contracts = chain.get(opt_type, [])
-                    for c in contracts:
-                        if c.get('strike') == pos['strike'] and c.get('ltp', 0) > 0:
-                            return c['ltp']
+                    # Staleness check for BSE (SENSEX) — BSE session can go stale
+                    fetch_time = chain.get('_fetch_time')
+                    if symbol == 'SENSEX' and fetch_time:
+                        age_sec = (datetime.now() - fetch_time).total_seconds()
+                        if age_sec > 300:  # > 5 min
+                            logger.debug(f"  BSE_STALE: {symbol} chain data is {age_sec:.0f}s old, using Angel BFO")
+                        else:
+                            contracts = chain.get(opt_type, [])
+                            for c in contracts:
+                                if c.get('strike') == pos['strike'] and c.get('ltp', 0) > 0:
+                                    return c['ltp']
+                    else:
+                        contracts = chain.get(opt_type, [])
+                        for c in contracts:
+                            if c.get('strike') == pos['strike'] and c.get('ltp', 0) > 0:
+                                return c['ltp']
         except Exception as e:
             logger.debug(f"  Pipeline exit LTP failed for {symbol} {pos['strike']}{opt_type}: {e}")
 
@@ -2929,6 +3218,7 @@ class PaperTrader:
             self.daily_trade_count = 0
             self.exit_history = []
             self.ghost_zone_losses = {}
+            self._trend_rider_today = {}  # v11: Reset TR daily entries
 
         # Fetch India VIX for adaptive filtering
         vix = self.get_india_vix()
@@ -3069,6 +3359,17 @@ class PaperTrader:
 
             dte = max(1, (3 - dow) + 1) if dow <= 3 else 1
 
+            # v11.1: Choppy day detection — block late entries if morning efficiency < 15%
+            choppy_blocked = False
+            if now.time() >= CHOPPY_DAY_BLOCK_AFTER:
+                day_range = ohlc['high'] - ohlc['low']
+                net_move = abs(spot - ohlc['open'])
+                day_eff = net_move / day_range * 100 if day_range > 0 else 100
+                if day_eff < CHOPPY_DAY_EFF_THRESHOLD:
+                    choppy_blocked = True
+                    logger.info(f"  CHOPPY_DAY_BLOCK: {symbol} efficiency={day_eff:.0f}% "
+                               f"(range={day_range:.0f}, net={net_move:.0f}) — blocking new entries")
+
             # Run active strategies (Survivor HALTED — needs Rs 1L+ capital per symbol)
             strategy_checks = [
                 ('CPR', self.engine.check_cpr_signals),
@@ -3079,6 +3380,9 @@ class PaperTrader:
             ]
 
             for strat_name, check_fn in strategy_checks:
+                if choppy_blocked:
+                    logger.debug(f"  CHOPPY_SKIP: {strat_name} blocked on choppy day")
+                    continue
                 signals = check_fn(symbol, spot, ohlc, indicators, dow, dte)
                 for sig in signals:
                     sig['strategy'] = strat_name
@@ -3088,6 +3392,22 @@ class PaperTrader:
                     all_signals.append(sig)
 
                     logger.info(f"  SIGNAL [{strat_name}]: {sig['type']} "
+                               f"Strike={sig['strike']:.0f} Premium=Rs {sig['premium']:.2f} "
+                               f"| {sig['reason']}")
+
+            # v11: TREND RIDER — independent scan at 10:15-10:30 (max 1 per symbol per day)
+            today_str = now.strftime('%Y-%m-%d')
+            tr_entered_today = self._trend_rider_today.get(symbol) == today_str
+            if not tr_entered_today and TR_ENTRY_TIME <= now.time() <= TR_LAST_ENTRY_TIME:
+                tr_signals = self.engine.check_trend_rider_signal(symbol, spot, ohlc, indicators, dow, dte)
+                for sig in tr_signals:
+                    sig['strategy'] = 'Trend Rider'
+                    sig['symbol'] = symbol
+                    sig['spot'] = spot
+                    sig['dte'] = dte
+                    sig['is_trend_rider'] = True  # Flag for special handling in execute
+                    all_signals.append(sig)
+                    logger.info(f"  SIGNAL [Trend Rider]: {sig['type']} "
                                f"Strike={sig['strike']:.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
 
@@ -3167,6 +3487,16 @@ class PaperTrader:
             logger.info(f"  {len(suppressed)} conflicting signals suppressed, {len(signals)} remaining")
 
         vix_mult = self.get_vix_multiplier()
+
+        # v10.6: VIX Hard Gate — block ALL entries in extreme VIX
+        if self.current_vix is not None:
+            if self.current_vix > VIX_BLOCK_HIGH:
+                logger.warning(f"  SKIP_VIX_EXTREME_HIGH: VIX={self.current_vix:.1f} > {VIX_BLOCK_HIGH} — blocking {len(signals)} entries")
+                return
+            if self.current_vix < VIX_BLOCK_LOW:
+                logger.warning(f"  SKIP_VIX_EXTREME_LOW: VIX={self.current_vix:.1f} < {VIX_BLOCK_LOW} — blocking {len(signals)} entries")
+                return
+
         executed = 0
         skipped = 0
         for sig in signals:
@@ -3227,15 +3557,19 @@ class PaperTrader:
                 skipped += 1
                 continue
 
-            # Different strategy holding same direction = confirmation, allow entry
-            diff_strat_same_dir = [p for p in self.portfolio.positions
-                                   if p['symbol'] == sig['symbol']
-                                   and abs(p['strike'] - sig['strike']) <= tol
-                                   and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
-                                   and p['strategy'] != sig['strategy']]
-            if diff_strat_same_dir:
-                logger.info(f"  STRATEGY_CONFIRM: {sig['strategy']} {sig['symbol']} {sig['strike']}{sig_opt_type} "
-                           f"confirms {diff_strat_same_dir[0]['strategy']} @ {diff_strat_same_dir[0]['strike']} — allowing entry")
+            # v10.4: Cross-strategy dedup — block if ANY strategy already holds same strike+direction
+            # Previously this allowed "confirmation" entries, but backtest proved it creates duplicates
+            # (e.g., Silver 280000 CE at 13:30 executed by both CPR and Gamma Blast = same position twice)
+            cross_strat_dup = [p for p in self.portfolio.positions
+                               if p['symbol'] == sig['symbol']
+                               and abs(p['strike'] - sig['strike']) <= tol
+                               and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
+                               and p['strategy'] != sig['strategy']]
+            if cross_strat_dup:
+                logger.info(f"  SKIP_CROSS_DEDUP: {sig['strategy']} {sig['symbol']} {sig['strike']}{sig_opt_type} "
+                           f"— already held by {cross_strat_dup[0]['strategy']} @ {cross_strat_dup[0]['strike']}")
+                skipped += 1
+                continue
 
             # Check for CONFLICTING positions: no BUY_CE + SELL_CE on same symbol/strike
             opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
@@ -3282,6 +3616,16 @@ class PaperTrader:
                 for opp in all_opposite:
                     opp_pnl = opp.get('unrealized_pnl', 0)
                     opp_current = opp.get('current_premium', opp['entry_premium'])
+
+                    # v10.4: DCI-based flip protection — don't flip strong-direction positions
+                    opp_details = opp.get('details', {}) if isinstance(opp.get('details'), dict) else {}
+                    existing_dci = opp_details.get('dci', 0)
+                    if existing_dci > 60:
+                        logger.info(f"  SKIP_FLIP_DCI: Existing {opp['id']} ({opp['strategy']} "
+                                   f"{opp['signal_type']}) DCI={existing_dci:.0f} > 60 — direction strong, "
+                                   f"blocking flip to {sig['type']}")
+                        flip_blocked = True
+                        break
 
                     # v7.7: Only flip LOSING positions. Profitable ones run regardless of breakeven_locked.
                     if opp_pnl <= 0:
@@ -3392,8 +3736,14 @@ class PaperTrader:
                         continue
 
             # ---- v2.3: VIX-adjusted minimum premium check ----
+            # v11.1: BANKNIFTY higher min premium (premiums 3-5x NIFTY, each SL costs more)
             is_sell = 'SELL' in sig['type']
-            min_prem = (MIN_PREMIUM_SELL if is_sell else MIN_PREMIUM_BUY) * vix_mult
+            if is_sell:
+                min_prem = MIN_PREMIUM_SELL * vix_mult
+            elif sig.get('symbol') == 'BANKNIFTY':
+                min_prem = MIN_PREMIUM_BUY_BN * vix_mult
+            else:
+                min_prem = MIN_PREMIUM_BUY * vix_mult
             if sig['premium'] < min_prem:
                 logger.info(f"  SKIP_PREMIUM: {sig['symbol']} {sig['type']} Rs {sig['premium']:.2f} "
                            f"< VIX-adjusted min Rs {min_prem:.2f} (VIX mult={vix_mult}x)")
@@ -3493,6 +3843,33 @@ class PaperTrader:
                 skipped += 1
                 continue
 
+            # ---- v10.4: Direction Confidence Index — math-based entry filter ----
+            g = sig['greeks']
+            dci = compute_direction_confidence(sig, sig['spot'], indicators, self.current_vix, g)
+            if dci < DCI_MIN_THRESHOLD:
+                logger.info(f"  SKIP_DCI: {sig['symbol']} {sig['type']} DCI={dci:.0f} < {DCI_MIN_THRESHOLD} — weak direction")
+                skipped += 1
+                continue
+            # DCI-based lot tier: higher confidence = more capital
+            if dci >= 70:
+                sig['_lot_tier'] = 'ELITE'      # 30% capital allocation
+            elif dci >= 55:
+                sig['_lot_tier'] = 'STRONG'     # 20% capital allocation
+            else:
+                sig['_lot_tier'] = 'BASE'       # 10% capital allocation (minimum)
+            logger.info(f"  DCI: {sig['symbol']} {sig['type']} DCI={dci:.0f}/100 tier={sig['_lot_tier']}")
+
+            # ---- v10.4: IV + DTE hard gate (0% WR when IV crushed near expiry) ----
+            if sig.get('dte', 5) <= 1 and g and g.get('iv', 0) > 0:
+                if g['iv'] < IV_MIN_FOR_DTE0 and sig.get('dte', 5) == 0:
+                    logger.info(f"  SKIP_IV_DTE: {sig['symbol']} {sig['type']} IV={g['iv']*100:.1f}% < {IV_MIN_FOR_DTE0*100:.0f}% on expiry day — theta decay dominates")
+                    skipped += 1
+                    continue
+                if g['iv'] < IV_MIN_FOR_DTE1 and sig.get('dte', 5) == 1:
+                    logger.info(f"  SKIP_IV_DTE: {sig['symbol']} {sig['type']} IV={g['iv']*100:.1f}% < {IV_MIN_FOR_DTE1*100:.0f}% with DTE=1 — low IV near expiry")
+                    skipped += 1
+                    continue
+
             # ---- v2.3: Profit filter check ----
             lot_size = LOT_SIZES.get(sig['symbol'], 50)
             target_mult = sig.get('target', sig['premium'] * 2) / max(sig['premium'], 0.01)
@@ -3567,14 +3944,17 @@ class PaperTrader:
                 continue
 
             # Replace BS premium with real market LTP + compute real Greeks
+            MAX_BS_MARKET_GAP_PCT = 30  # v10.4: Block if BS vs market gap too large
             if real_ltp and real_ltp > 0:
-                # Log BS vs Market gap for monitoring (info only, never reject)
+                # v10.4: BS vs Market gap gate — block invalid pricing
                 if bs_premium > 0:
                     premium_gap_pct = abs(real_ltp - bs_premium) / bs_premium * 100
-                    if premium_gap_pct > 50:
-                        logger.info(f"  PREMIUM_NOTE: {sig['symbol']} {sig['type']} "
-                                   f"BS={bs_premium:.2f} vs Market={real_ltp:.2f} ({premium_gap_pct:.0f}% gap) "
-                                   f"— using LIVE market price")
+                    if premium_gap_pct > MAX_BS_MARKET_GAP_PCT:
+                        logger.info(f"  SKIP_PREMIUM_GAP: {sig['symbol']} {sig['type']} "
+                                   f"BS={bs_premium:.2f} vs Market={real_ltp:.2f} ({premium_gap_pct:.0f}% gap > {MAX_BS_MARKET_GAP_PCT}%) "
+                                   f"— pricing unreliable, trade blocked")
+                        skipped += 1
+                        continue
 
                 # Preserve target/SL ratios from strategy, apply to real premium
                 if bs_premium > 0:
@@ -3626,6 +4006,10 @@ class PaperTrader:
                     'option_exchange': option_exchange,
                     'quality_score': sig.get('quality_score', 0),  # v2.5: FIX — was missing! Enables dynamic lots
                     'expiry': expiry,  # v9.1: Store expiry for dashboard display
+                    'dci': dci,  # v10.4: Direction Confidence Index at entry
+                    'entry_iv': g.get('iv', 0),  # v10.4: IV at entry for BREAKOUT_FAIL scaling
+                    'entry_regime': self.regime_detector.get_regime(sig['symbol']) if hasattr(self, 'regime_detector') else 'UNKNOWN',  # v10.4
+                    'lot_tier': sig.get('_lot_tier', 'BASE'),  # v10.4: DCI-based lot tier
                 },
                 oi=entry_oi,
                 spot_price=sig.get('spot', 0),
@@ -3635,6 +4019,11 @@ class PaperTrader:
                 continue
             executed += 1
             self.daily_trade_count += 1
+
+            # v11: Track Trend Rider entry (max 1 per symbol per day)
+            if sig.get('is_trend_rider') or sig.get('strategy') == 'Trend Rider':
+                self._trend_rider_today[sig['symbol']] = datetime.now().strftime('%Y-%m-%d')
+                logger.info(f"  TREND_RIDER_ENTERED: {sig['symbol']} marked for today — no more TR entries")
 
             # Send Telegram notification
             try:
@@ -4129,6 +4518,59 @@ class PaperTrader:
             if not spot:
                 continue
 
+            # ---- v10.6: GREEKS REFRESH — Recalculate every 5 min during hold ----
+            _last_refresh = pos.get('greeks_refreshed_at')
+            _should_refresh = (_last_refresh is None or
+                              (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= GREEKS_REFRESH_INTERVAL_SECONDS)
+            if _should_refresh and pos.get('strike') and pos.get('iv'):
+                try:
+                    _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                    _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
+                    _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
+                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
+                    _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                    pos['delta'] = round(_g['delta'], 4)
+                    pos['gamma'] = round(_g['gamma'], 6)
+                    pos['theta'] = round(_g['theta'], 4)
+                    pos['greeks_refreshed_at'] = datetime.now().isoformat()
+                    logger.debug(f"  GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
+                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr)")
+                except Exception as e:
+                    logger.debug(f"  GREEKS_REFRESH_ERR: {pos.get('id', '?')} — {e}")
+
+            # ---- v10.6: THETA DECAY EXIT — expiry day theta burden check (BUY only) ----
+            _elapsed_days_td = (datetime.now() - entry_time).total_seconds() / 86400
+            _remaining_dte = max(pos.get('dte', 5) - _elapsed_days_td, 0)
+            if _remaining_dte < 1 and not pos.get('is_sell', False):
+                _theta_val = abs(pos.get('theta', 0))
+                _curr_prem = pos.get('current_premium', pos['entry_premium'])
+                if _curr_prem > 0 and _theta_val > 0:
+                    _theta_burden_pct = _theta_val / _curr_prem * 100
+                    if _theta_burden_pct > THETA_BURDEN_EXIT_PCT and pos.get('unrealized_pnl', 0) < 0:
+                        logger.info(f"  THETA_DECAY_EXIT: {pos['id']} theta_burden={_theta_burden_pct:.1f}%/day "
+                                   f"> {THETA_BURDEN_EXIT_PCT}% + losing Rs {pos.get('unrealized_pnl', 0):.0f}")
+                        self.portfolio.close_position(pos['id'], _curr_prem, 'THETA_DECAY_EXIT')
+                        self._track_exit(pos, 'THETA_DECAY_EXIT')
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = LOT_SIZES.get(pos['symbol'], 50)
+                            cap = pos['entry_premium'] * lot_size
+                            notify_trade_exit(market="EQUITY", strategy=pos['strategy'],
+                                symbol=pos['symbol'], signal_type=pos['signal_type'],
+                                strike=pos['strike'], entry_price=pos['entry_premium'],
+                                exit_price=_curr_prem, entry_time=pos['timestamp'],
+                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                                exit_reason='THETA_DECAY_EXIT')
+                        except Exception:
+                            pass
+                        continue
+                    elif _theta_burden_pct > THETA_BURDEN_TIGHTEN_PCT:
+                        _new_tsl = round(_curr_prem * THETA_TIGHTEN_SL_FACTOR, 2)
+                        if pos.get('trailing_sl') is None or _new_tsl > (pos.get('trailing_sl') or 0):
+                            logger.info(f"  THETA_SL_TIGHTEN: {pos['id']} theta_burden={_theta_burden_pct:.1f}%/day "
+                                       f"> {THETA_BURDEN_TIGHTEN_PCT}% — SL→Rs {_new_tsl:.2f}")
+                            pos['trailing_sl'] = _new_tsl
+
             # ---- PREMIUM UPDATE: Real market LTP with fallback to delta+gamma+theta ----
             # v3.1: Guard against None values in spot/delta/gamma to prevent NoneType crashes
             entry_spot = pos.get('entry_spot', 0)
@@ -4167,6 +4609,31 @@ class PaperTrader:
                     hold_score = 50
             pos['hold_score'] = hold_score
             hold_label = 'STRONG' if hold_score >= HOLD_SCORE_STRONG else 'MODERATE' if hold_score >= HOLD_SCORE_WEAK else 'WEAK'
+
+            # ---- v10.6: PCR SHIFT MONITOR — tighten SL if PCR opposes trade ----
+            if hold_mins >= PCR_SHIFT_MIN_HOLD_MINUTES and self.market_pipeline:
+                try:
+                    _pcr_shift = self.market_pipeline.get_pcr_shift(symbol)
+                    if _pcr_shift and _pcr_shift.get('direction', 'NEUTRAL') != 'NEUTRAL':
+                        _is_ce = 'CE' in pos['signal_type']
+                        _pcr_opposes = ((_is_ce and _pcr_shift['direction'] == 'BEARISH') or
+                                       (not _is_ce and _pcr_shift['direction'] == 'BULLISH'))
+                        if _pcr_opposes and not pos.get('is_sell', False):
+                            _new_pcr_tsl = round(current_premium * (1 - PCR_SHIFT_SL_TIGHTEN_PCT), 2)
+                            if pos.get('trailing_sl') is None or _new_pcr_tsl > (pos.get('trailing_sl') or 0):
+                                logger.info(f"  PCR_SHIFT_SL_TIGHTEN: {pos['id']} PCR shift={_pcr_shift['shift']:+.3f} "
+                                           f"({_pcr_shift['direction']}) opposes BUY_{'CE' if _is_ce else 'PE'} — "
+                                           f"SL→Rs {_new_pcr_tsl:.2f}")
+                                pos['trailing_sl'] = _new_pcr_tsl
+                        elif _pcr_opposes and pos.get('is_sell', False):
+                            _new_pcr_tsl = round(current_premium * (1 + PCR_SHIFT_SL_TIGHTEN_PCT), 2)
+                            if pos.get('trailing_sl') is None or _new_pcr_tsl < pos['trailing_sl']:
+                                logger.info(f"  PCR_SHIFT_SL_TIGHTEN: {pos['id']} PCR shift={_pcr_shift['shift']:+.3f} "
+                                           f"({_pcr_shift['direction']}) opposes SELL_{'CE' if _is_ce else 'PE'} — "
+                                           f"SL→Rs {_new_pcr_tsl:.2f}")
+                                pos['trailing_sl'] = _new_pcr_tsl
+                except Exception as e:
+                    logger.debug(f"  PCR_SHIFT_CHECK_ERR: {pos.get('id', '?')} — {e}")
 
             # ---- v7.7: SIGNAL WEAK EXIT — early exit for losing positions with weak signals ----
             if (hold_mins >= HOLD_SCORE_MIN_HOLD_MINS
@@ -4221,10 +4688,23 @@ class PaperTrader:
                         continue
 
             # ---- v10.1: BREAKOUT FAILURE DETECTION ----
+            # v11: Skip for Trend Rider — it has wide SL, no breakout check needed
             # v10.3: Regime-aware — disabled on TRENDING days to let winners run
-            regime = self.regime_detector.get_regime(symbol)
-            regime_params = get_regime_params(regime)
-            if regime_params['breakout_fail_enabled'] and GRACE_PERIOD_SECONDS < elapsed_secs <= BREAKOUT_FAIL_CHECK_MINUTES * 60:
+            # v10.4: Regime-aware timer + IV extension + confidence gate
+            _skip_breakout_fail = (pos.get('strategy') == 'Trend Rider')
+            if not _skip_breakout_fail:
+                regime = self.regime_detector.get_regime(symbol)
+                regime_params = get_regime_params(regime)
+                # v10.4: Dynamic timer from regime params (was hardcoded 5 min)
+                bf_check_minutes = regime_params.get('breakout_fail_check_minutes', BREAKOUT_FAIL_CHECK_MINUTES)
+                bf_timer_secs = bf_check_minutes * 60
+                # v10.4: If entry IV > 40% (high vol), extend timer 50% — big moves take longer
+                entry_iv = details.get('entry_iv', 0) if isinstance(pos.get('details'), dict) else 0
+                if entry_iv > 0.40:
+                    bf_timer_secs = int(bf_timer_secs * 1.5)
+                # v10.4: Confidence gate — skip BREAKOUT_FAIL if regime not confident (< 60 data points)
+                regime_confident = self.regime_detector.is_regime_confident(symbol) if hasattr(self.regime_detector, 'is_regime_confident') else True
+            if not _skip_breakout_fail and regime_params['breakout_fail_enabled'] and regime_confident and GRACE_PERIOD_SECONDS < elapsed_secs <= bf_timer_secs:
                 entry_prem_bf = pos['entry_premium']
                 if entry_prem_bf > 0:
                     if not pos['is_sell']:
@@ -4261,10 +4741,10 @@ class PaperTrader:
                             pass
                         continue
 
-                    # Near 5-min mark: no movement — exit (no reverse)
-                    # v10.3: Use regime-aware min gain threshold
+                    # v10.4: Near timer end — no movement — exit (no reverse)
+                    # v10.3/v10.4: Use regime-aware min gain threshold + dynamic timer
                     bf_min_gain = regime_params['breakout_fail_min_gain_pct']
-                    if elapsed_secs >= (BREAKOUT_FAIL_CHECK_MINUTES * 60 - 15) and gain_bf < bf_min_gain:
+                    if elapsed_secs >= (bf_timer_secs - 15) and gain_bf < bf_min_gain:
                         logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {bf_min_gain}% in {int(elapsed_secs)}s (regime={regime.value})")
                         self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL')
                         self._track_exit(pos, 'BREAKOUT_FAIL')
@@ -4305,47 +4785,99 @@ class PaperTrader:
                                  if entry_prem > 0 else 0)
                 profit_from_entry = peak - entry_prem
 
+                # v11: TREND RIDER — Wide TSL (separate from standard phases)
+                is_trend_rider = pos.get('strategy') == 'Trend Rider'
+                if is_trend_rider:
+                    # Only start trailing after 35% gain, trail 28% from peak
+                    if peak_gain_pct >= TR_WIDE_TSL_TRIGGER_PCT:
+                        wide_tsl = round(peak * (1 - TR_WIDE_TSL_DISTANCE_PCT / 100), 2)
+                        if wide_tsl > (pos.get('trailing_sl') or 0):
+                            pos['trailing_sl'] = wide_tsl
+                            logger.info(f"  TSL_WIDE_TR: {pos['id']} peak={peak_gain_pct:.0f}% → "
+                                       f"SL Rs {wide_tsl:.2f} (28% from peak Rs {peak:.2f})")
+
+                    # Check trailing SL hit
+                    if pos.get('trailing_sl') and current_premium <= pos['trailing_sl']:
+                        logger.info(f"  WIDE_TSL_HIT: {pos['id']} premium {current_premium:.2f} <= "
+                                   f"TSL {pos['trailing_sl']:.2f} (Trend Rider)")
+                        self.portfolio.close_position(pos['id'], current_premium, 'WIDE_TSL_HIT')
+                        self._track_exit(pos, 'WIDE_TSL_HIT')
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = LOT_SIZES.get(symbol, 50)
+                            cap = entry_prem * lot_size
+                            notify_trade_exit(
+                                market="EQUITY", strategy=pos['strategy'],
+                                symbol=symbol, signal_type=pos['signal_type'],
+                                strike=pos['strike'], entry_price=entry_prem,
+                                exit_price=current_premium, entry_time=pos['timestamp'],
+                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                                exit_reason='WIDE_TSL_HIT',
+                            )
+                        except Exception:
+                            pass
+                        continue
+
+                    # Trend Rider: skip standard TSL phases, go directly to target/SL/EOD checks
+                    # (handled by static target & SL below)
+
+                else:
+                    # ---- Standard strategies: TSL phases ----
+
+                    # v10.4: Phase 0 — Micro-gains protection (5%+ peaks that never reach Phase 1)
+                    if (peak_gain_pct >= TSL_MICRO_GAIN_PCT
+                            and elapsed_secs >= TSL_MICRO_MIN_HOLD_SECONDS
+                            and not pos.get('breakeven_locked')):
+                        # Set trailing SL = entry + 40% of peak gain (floor at entry - 2%)
+                        micro_sl = round(entry_prem + (profit_from_entry * (1 - TSL_MICRO_TRAIL_DISTANCE_PCT / 100)), 2)
+                        micro_sl = max(micro_sl, round(entry_prem * 0.98, 2))  # Floor: entry - 2%
+                        if micro_sl > (pos.get('trailing_sl') or 0):
+                            pos['trailing_sl'] = micro_sl
+                            logger.info(f"  TSL_MICRO: {pos['id']} peak={peak_gain_pct:.1f}% → SL Rs {micro_sl:.2f} "
+                                       f"(keeping {100-TSL_MICRO_TRAIL_DISTANCE_PCT}% of peak gain)")
+
                 # Phase 1: Lock breakeven when premium gains 15%+
-                if peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
+                if not is_trend_rider and peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
                     pos['breakeven_locked'] = True
                     pos['trailing_sl'] = round(entry_prem * 1.03, 2)  # entry + 3% buffer
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} gained {peak_gain_pct:.0f}% → locked SL at Rs {pos['trailing_sl']:.2f}")
 
-                # v10.3: Regime-aware TSL distances
-                regime = self.regime_detector.get_regime(symbol)
-                regime_params = get_regime_params(regime)
-                r_trail_dist = regime_params['tsl_trail_distance_pct']
-                r_tight_dist = regime_params['tsl_tight_distance_pct']
+                # v10.3: Regime-aware TSL distances (skip for Trend Rider — uses wide TSL above)
+                if not is_trend_rider:
+                    regime = self.regime_detector.get_regime(symbol)
+                    regime_params = get_regime_params(regime)
+                    r_trail_dist = regime_params['tsl_trail_distance_pct']
+                    r_tight_dist = regime_params['tsl_tight_distance_pct']
 
-                # Phase 3: Tight trail when premium gained 40%+ (regime-aware distance)
-                if peak_gain_pct >= TSL_TIGHT_GAIN_PCT:
-                    new_trailing_sl = round(peak - (profit_from_entry * r_tight_dist / 100), 2)
-                    new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
-                    if new_trailing_sl > (pos.get('trailing_sl') or 0):
-                        pos['trailing_sl'] = new_trailing_sl
-                        logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
-                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%, phase3, trail={r_tight_dist}%)")
+                    # Phase 3: Tight trail when premium gained 40%+ (regime-aware distance)
+                    if peak_gain_pct >= TSL_TIGHT_GAIN_PCT:
+                        new_trailing_sl = round(peak - (profit_from_entry * r_tight_dist / 100), 2)
+                        new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
+                        if new_trailing_sl > (pos.get('trailing_sl') or 0):
+                            pos['trailing_sl'] = new_trailing_sl
+                            logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
+                                       f"(peak={peak:.2f} +{peak_gain_pct:.0f}%, phase3, trail={r_tight_dist}%)")
 
-                # Phase 2: Trail when premium gained 25%+ (regime-aware distance)
-                elif peak_gain_pct >= TSL_TRAIL_GAIN_PCT:
-                    new_trailing_sl = round(peak - (profit_from_entry * r_trail_dist / 100), 2)
-                    new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
-                    if new_trailing_sl > (pos.get('trailing_sl') or 0):
-                        pos['trailing_sl'] = new_trailing_sl
-                        logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
-                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%)")
+                    # Phase 2: Trail when premium gained 25%+ (regime-aware distance)
+                    elif peak_gain_pct >= TSL_TRAIL_GAIN_PCT:
+                        new_trailing_sl = round(peak - (profit_from_entry * r_trail_dist / 100), 2)
+                        new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
+                        if new_trailing_sl > (pos.get('trailing_sl') or 0):
+                            pos['trailing_sl'] = new_trailing_sl
+                            logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
+                                       f"(peak={peak:.2f} +{peak_gain_pct:.0f}%)")
 
-                # v7.7: Signal-based TSL ratchet — if signals STRONG, raise TSL aggressively
-                if (hold_score >= HOLD_SCORE_STRONG
-                        and peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT
-                        and pos.get('trailing_sl')):
-                    ratchet_tsl = round(current_premium * 0.85, 2)
-                    if ratchet_tsl > pos['trailing_sl']:
-                        old_tsl = pos['trailing_sl']
-                        pos['trailing_sl'] = ratchet_tsl
-                        logger.info(f"  SIGNAL_HOLD_RATCHET: {pos['id']} hold_score={hold_score} "
-                                   f"→ TSL Rs {old_tsl:.2f}→{ratchet_tsl:.2f} "
-                                   f"(85% of current Rs {current_premium:.2f})")
+                    # v7.7: Signal-based TSL ratchet — if signals STRONG, raise TSL aggressively
+                    if (hold_score >= HOLD_SCORE_STRONG
+                            and peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT
+                            and pos.get('trailing_sl')):
+                        ratchet_tsl = round(current_premium * 0.85, 2)
+                        if ratchet_tsl > pos['trailing_sl']:
+                            old_tsl = pos['trailing_sl']
+                            pos['trailing_sl'] = ratchet_tsl
+                            logger.info(f"  SIGNAL_HOLD_RATCHET: {pos['id']} hold_score={hold_score} "
+                                       f"→ TSL Rs {old_tsl:.2f}→{ratchet_tsl:.2f} "
+                                       f"(85% of current Rs {current_premium:.2f})")
 
                 # Check trailing SL hit (BUY: premium drops below trailing SL)
                 if pos.get('trailing_sl') and current_premium <= pos['trailing_sl']:
@@ -4382,6 +4914,18 @@ class PaperTrader:
                 trough_gain_pct = ((entry_prem - trough) / entry_prem * 100
                                    if entry_prem > 0 else 0)
                 profit_from_entry = entry_prem - trough
+
+                # v10.4: Phase 0 — Micro-gains for SELL (5%+ premium drop, held 5+ min)
+                if (trough_gain_pct >= TSL_MICRO_GAIN_PCT
+                        and elapsed_secs >= TSL_MICRO_MIN_HOLD_SECONDS
+                        and not pos.get('breakeven_locked')):
+                    # SELL: trailing SL = entry - 40% of peak drop (cap at entry + 2%)
+                    micro_sl = round(entry_prem - (profit_from_entry * (1 - TSL_MICRO_TRAIL_DISTANCE_PCT / 100)), 2)
+                    micro_sl = min(micro_sl, round(entry_prem * 1.02, 2))  # Cap: entry + 2%
+                    if pos.get('trailing_sl') is None or micro_sl < pos['trailing_sl']:
+                        pos['trailing_sl'] = micro_sl
+                        logger.info(f"  TSL_MICRO: {pos['id']} SELL trough={trough_gain_pct:.1f}% → SL Rs {micro_sl:.2f} "
+                                   f"(keeping {100-TSL_MICRO_TRAIL_DISTANCE_PCT}% of peak drop)")
 
                 # Phase 1: Lock breakeven when premium drops 15%+ from entry (SELL profit)
                 if trough_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):

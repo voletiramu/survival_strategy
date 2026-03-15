@@ -35,6 +35,8 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
+from market_regime import RegimeDetector, get_regime_params
+
 sys.stdout.reconfigure(line_buffering=True, encoding='utf-8', errors='replace')
 
 # ====================================================================
@@ -108,6 +110,14 @@ VIX_LOW_THRESHOLD = 14
 VIX_HIGH_THRESHOLD = 20
 VIX_LOW_MULTIPLIER = 1.5
 VIX_HIGH_MULTIPLIER = 0.8
+# v10.6: VIX Hard Gate — block ALL entries in extreme VIX regimes
+VIX_BLOCK_HIGH = 35
+VIX_BLOCK_LOW = 11
+# v10.6: Greeks Refresh + Theta Decay Exit
+GREEKS_REFRESH_INTERVAL_SECONDS = 300
+THETA_BURDEN_TIGHTEN_PCT = 5.0
+THETA_BURDEN_EXIT_PCT = 10.0
+THETA_TIGHTEN_SL_FACTOR = 0.90
 
 # Cooldowns & Limits
 GRACE_PERIOD_SECONDS = 180     # 3 min grace period after entry
@@ -125,6 +135,11 @@ PRE_MARKET = dtime(9, 0)
 FIRST_TRADE_TIME = dtime(9, 30)
 LAST_ENTRY_TIME = dtime(14, 30)
 EOD_FORCE_CLOSE_TIME = dtime(15, 20)
+
+# v10.5b: Direction Confidence Index (DCI) — same thresholds as equity/commodity
+DCI_MIN_THRESHOLD = 40          # Minimum DCI to enter a trade
+IV_MIN_FOR_DTE1 = 0.20          # Minimum IV for DTE=1 trades
+IV_MIN_FOR_DTE0 = 0.25          # Minimum IV for expiry-day trades
 
 # Angel API credentials
 ANGEL_CRED_FILE = os.environ.get(
@@ -161,6 +176,86 @@ from strategies.signal_scoring import compute_signal_score
 from strategies.hold_scoring import compute_hold_score
 from strategies.indicators import compute_all_indicators
 from stock_fno_config import StockFnOConfig, TIER1_STOCKS, TIER2_STOCKS, TIER3_STOCKS
+
+
+def compute_direction_confidence(sig, spot, indicators, vix, greeks):
+    """v10.4: Direction Confidence Index (DCI) — continuous 0-100 score.
+
+    Uses ALL 8 available signal inputs mathematically weighted by their
+    backtest-proven correlation with profitable trades.
+    Identical to equity/commodity bot DCI function.
+    """
+    is_ce = 'CE' in sig.get('type', '')
+    score = 50  # Neutral baseline
+
+    # 1. VWAP POSITION (±10)
+    vwap = indicators.get('vwap', spot) if indicators else spot
+    vwap_dist_pct = (spot - vwap) / vwap * 100 if vwap else 0
+    if is_ce:
+        score += min(max(vwap_dist_pct * 5, -10), 10)
+    else:
+        score += min(max(-vwap_dist_pct * 5, -10), 10)
+
+    # 2. EMA TREND (±12)
+    ema9 = indicators.get('ema_9', spot) if indicators else spot
+    ema20 = indicators.get('ema_20', spot) if indicators else spot
+    ema_gap_pct = (ema9 - ema20) / ema20 * 100 if ema20 else 0
+    if is_ce:
+        score += min(max(ema_gap_pct * 10, -12), 12)
+    else:
+        score += min(max(-ema_gap_pct * 10, -12), 12)
+
+    # 3. 3-BAR MOMENTUM (±8)
+    trend = indicators.get('three_bar_trend', 0) if indicators else 0
+    if is_ce:
+        score += min(trend * 3, 8)
+    else:
+        score += min(-trend * 3, 8)
+
+    # 4. PCR SENTIMENT (±8)
+    pcr = indicators.get('pcr', 1.0) if indicators else 1.0
+    if is_ce and pcr > 1.0:
+        score += min((pcr - 1.0) * 20, 8)
+    elif not is_ce and pcr < 1.0:
+        score += min((1.0 - pcr) * 20, 8)
+
+    # 5. IV SIGNAL STRENGTH (±10)
+    iv = greeks.get('iv', 0) if greeks else 0
+    if iv > 0:
+        if iv >= 0.40:
+            score += 10
+        elif iv >= 0.25:
+            score += 5
+        elif iv < 0.15:
+            score -= 10
+        elif iv < 0.20:
+            score -= 5
+
+    # 6. DELTA QUALITY (±5)
+    delta = abs(greeks.get('delta', 0)) if greeks else 0
+    if 0.40 <= delta <= 0.60:
+        score += 5
+    elif delta < 0.25 or delta > 0.75:
+        score -= 5
+
+    # 7. INTRADAY BODY (±5)
+    open_price = indicators.get('open', spot) if indicators else spot
+    body_pct = (spot - open_price) / open_price * 100 if open_price else 0
+    if is_ce:
+        score += min(max(body_pct * 3, -5), 5)
+    else:
+        score += min(max(-body_pct * 3, -5), 5)
+
+    # 8. THETA BURDEN (-8 penalty for BUY on high theta near expiry)
+    theta = greeks.get('theta', 0) if greeks else 0
+    dte = sig.get('dte', 5)
+    if dte <= 1 and abs(theta) > 0:
+        premium = sig.get('premium', 100)
+        theta_pct_per_hour = abs(theta) / premium * 100 / 6.5 if premium > 0 else 0
+        if 'BUY' in sig.get('type', '') and theta_pct_per_hour > 3:
+            score -= 8
+
+    return max(min(score, 100), 0)
 
 
 def validate_signal_direction(signal_type, spot, ohlc, indicators):
@@ -589,6 +684,7 @@ class StockAngelConnection:
         self._backoff_until = 0       # Exponential backoff timestamp
         self._auth_time = 0           # v9.2: Track when we last authenticated
         self._app_type = 'Historical' # v9.2: Remember app type for reconnect
+        self.market_pipeline = None   # v10.5: NSE pipeline for stock option chain fallback
         self._reconnecting = False    # v9.2: Prevent recursive reconnect loops
 
     def load_credentials(self):
@@ -1146,15 +1242,15 @@ class StockAngelConnection:
                     gamma = float(strike_data.get('gamma', 0) or 0)
 
                     # v10.3d: Gamma-first scoring — highest gamma wins
-                    delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
+                    delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
                     gamma_score = gamma * 10000  # No cap — let highest gamma win
                     oi_norm = min(oi / 100000, 1.0)
                     vol_norm = min(volume / 10000, 1.0)
                     # Weighted: Gamma(40%) + Delta(30%) + OI(20%) + Volume(10%)
                     score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
-                    # FILTER: Skip strikes outside delta range 0.20-0.70
-                    if delta > 0 and (delta < 0.20 or delta > 0.70):
+                    # v11.1: Tighter delta range 0.35-0.65 (was 0.20-0.70)
+                    if delta > 0 and (delta < 0.35 or delta > 0.65):
                         continue
 
                     # v10.3d-4: Score by delta+gamma+volume (optionGreek API returns LTP=0, OI=0)
@@ -1198,8 +1294,45 @@ class StockAngelConnection:
         except Exception as e:
             logger.error(f"Option chain strike selection error for {name}: {e}")
 
-        # v10.3: No live data available — SKIP this stock (NO Black-Scholes fallback)
-        # RULE: Only live signal data from Angel/BSE/NSE
+        # v10.5: NSE pipeline fallback — try NSE option chain when Angel fails
+        if hasattr(self, 'market_pipeline') and self.market_pipeline:
+            try:
+                chain = self.market_pipeline.get_stock_option_chain(name)
+                if chain:
+                    contracts = chain.get(opt_type, [])
+                    nse_best = None
+                    nse_best_oi = -1
+                    for c in contracts:
+                        c_strike = c.get('strike', 0)
+                        if c_strike not in candidates:
+                            continue
+                        c_ltp = c.get('ltp', 0)
+                        c_oi = c.get('oi', 0)
+                        if c_ltp <= 0:
+                            continue
+                        if c_oi > nse_best_oi:
+                            nse_best_oi = c_oi
+                            nse_best = {
+                                'strike': c_strike,
+                                'ltp': c_ltp,
+                                'oi': c_oi,
+                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
+                                'volume': c.get('volume', 0),
+                            }
+                    if nse_best:
+                        # Find token for this strike
+                        token_info = self.find_option_tokens(name, None, nse_best['strike'], opt_type)
+                        if token_info:
+                            nse_best['token'] = str(token_info.get('token', ''))
+                            nse_best['symbol'] = token_info.get('symbol', '')
+                        logger.info(f"  NSE_FALLBACK: {name} {opt_type} ATM={atm_strike} "
+                                    f"Selected={nse_best['strike']} OI={nse_best['oi']:,.0f} "
+                                    f"LTP={nse_best['ltp']:.2f} [NSE Pipeline]")
+                        return nse_best
+            except Exception as e:
+                logger.debug(f"  NSE_FALLBACK_ERR: {name} {opt_type} — {e}")
+
+        # No live data available — SKIP this stock (NO Black-Scholes fallback)
         logger.warning(f"  SKIP_NO_LIVE_DATA: {name} {opt_type} ATM={atm_strike} — "
                        f"no live option data from any exchange, skipping")
         return None
@@ -1659,6 +1792,11 @@ class StockStrategyEngine:
             list of signal dicts.
         """
         try:
+            # v11.1: Skip CPR signals on ultra-narrow CPR days
+            cpr_w = indicators.get('cpr_width', 1.0)
+            if cpr_w < 0.03:
+                logger.info(f"  CPR_NARROW_SKIP: {symbol} CPR width {cpr_w:.4f}% < 0.03% — signals unreliable")
+                return []
             signals = check_cpr_breakout(spot, ohlc, indicators, config)
             # v10.1: VWAP direction filtering for CPR signals
             vwap = indicators.get('vwap', 0)
@@ -1873,6 +2011,17 @@ class StockPaperTrader:
         self._running = False
         self._initialized = False
         self.data_logger = None  # v10.2e: Live data logger for backtesting
+        self.market_pipeline = None  # v10.5: NSE pipeline for stock option chain fallback
+
+        # v10.5b: Regime detector (same as equity/commodity)
+        self.regime_detector = RegimeDetector()
+        self._last_logged_regime = {}
+
+    def set_market_pipeline(self, pipeline):
+        """v10.5: Set market data pipeline for NSE stock option chain fallback."""
+        self.market_pipeline = pipeline
+        self.angel.market_pipeline = pipeline
+        logger.info("[StockBot] Market data pipeline attached for NSE fallback")
 
     def initialize(self):
         """Connect to Angel API and load instruments.
@@ -1936,6 +2085,58 @@ class StockPaperTrader:
             self._spot_cache[symbol] = {'price': last_close, 'time': datetime.now()}
             return last_close
 
+        return None
+
+    def get_india_vix(self):
+        """v10.5b: Fetch India VIX. Cached 120s.
+        Priority: MarketDataPipeline → Angel API → HV proxy.
+        Same as equity bot get_india_vix().
+        """
+        if not hasattr(self, '_vix_cache'):
+            self._vix_cache = {'value': None, 'time': None}
+        cached = self._vix_cache
+        if cached['value'] and cached['time'] and (datetime.now() - cached['time']).total_seconds() < 120:
+            return cached['value']
+
+        # Method 0: MarketDataPipeline (NSE direct)
+        if self.market_pipeline:
+            try:
+                vix = self.market_pipeline.get_vix()
+                if vix and 5 < vix < 80:
+                    self._vix_cache = {'value': vix, 'time': datetime.now()}
+                    self.current_vix = vix
+                    return vix
+            except Exception:
+                pass
+
+        # Method 1: Angel API with known VIX tokens
+        for token in ['26017', '99926004']:
+            try:
+                ltp = self.angel.get_ltp('NSE', token)
+                if ltp and ltp > 0:
+                    vix = ltp
+                    if vix > 1000:
+                        vix = vix / 1000
+                    elif vix > 100:
+                        vix = vix / 100
+                    if 5 < vix < 80:
+                        self._vix_cache = {'value': vix, 'time': datetime.now()}
+                        self.current_vix = vix
+                        return vix
+            except Exception:
+                pass
+
+        # Method 2: Fallback — NIFTY HV proxy
+        try:
+            df = self.engine.historical_data.get('NIFTY')
+            if df is not None and len(df) > 20:
+                log_ret = np.log(df['Close'] / df['Close'].shift(1))
+                hv = log_ret.tail(20).std() * np.sqrt(252) * 100
+                self.current_vix = max(min(hv, 40), 8)
+                self._vix_cache = {'value': self.current_vix, 'time': datetime.now()}
+                return self.current_vix
+        except Exception:
+            pass
         return None
 
     def get_vix_multiplier(self):
@@ -2044,6 +2245,21 @@ class StockPaperTrader:
                 return ltp
         except Exception as e:
             logger.debug(f"  Option LTP fetch failed for {cache_key}: {e}")
+
+        # v10.5: NSE pipeline fallback for exit LTP
+        if hasattr(self, 'market_pipeline') and self.market_pipeline:
+            try:
+                symbol = pos.get('stock_symbol', pos.get('symbol', ''))
+                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                chain = self.market_pipeline.get_stock_option_chain(symbol)
+                if chain:
+                    for c in chain.get(opt_type, []):
+                        if c.get('strike') == pos['strike'] and c.get('ltp', 0) > 0:
+                            nse_ltp = c['ltp']
+                            self._option_ltp_cache[cache_key] = {'ltp': nse_ltp, 'time': datetime.now()}
+                            return nse_ltp
+            except Exception as e:
+                logger.debug(f"  NSE_LTP_FALLBACK_ERR: {e}")
 
         return None
 
@@ -2371,6 +2587,69 @@ class StockPaperTrader:
             if not spot:
                 continue
 
+            # ---- v10.6: GREEKS REFRESH — Recalculate every 5 min during hold ----
+            _last_refresh = pos.get('greeks_refreshed_at')
+            _should_refresh = (_last_refresh is None or
+                              (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= GREEKS_REFRESH_INTERVAL_SECONDS)
+            if _should_refresh and pos.get('strike') and pos.get('iv'):
+                try:
+                    _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                    _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
+                    _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
+                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
+                    _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                    pos['delta'] = round(_g['delta'], 4)
+                    pos['gamma'] = round(_g['gamma'], 6)
+                    pos['theta'] = round(_g['theta'], 4)
+                    pos['greeks_refreshed_at'] = datetime.now().isoformat()
+                    logger.debug(f"  GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
+                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr)")
+                except Exception as e:
+                    logger.debug(f"  GREEKS_REFRESH_ERR: {pos.get('id', '?')} — {e}")
+
+            # ---- v10.6: THETA DECAY EXIT — expiry day theta burden check (BUY only) ----
+            _elapsed_days_td = (datetime.now() - entry_time).total_seconds() / 86400
+            _remaining_dte = max(pos.get('dte', 5) - _elapsed_days_td, 0)
+            if _remaining_dte < 1 and not pos.get('is_sell', False):
+                _theta_val = abs(pos.get('theta', 0))
+                _curr_prem = pos.get('current_premium', pos['entry_premium'])
+                if _curr_prem > 0 and _theta_val > 0:
+                    _theta_burden_pct = _theta_val / _curr_prem * 100
+                    if _theta_burden_pct > THETA_BURDEN_EXIT_PCT and pos.get('unrealized_pnl', 0) < 0:
+                        logger.info(f"  THETA_DECAY_EXIT: {pos['id']} theta_burden={_theta_burden_pct:.1f}%/day "
+                                   f"> {THETA_BURDEN_EXIT_PCT}% + losing Rs {pos.get('unrealized_pnl', 0):.0f}")
+                        self.portfolio.close_position(pos['id'], _curr_prem, 'THETA_DECAY_EXIT')
+                        self._track_exit(pos, 'THETA_DECAY_EXIT')
+                        try:
+                            from trade_notifier import notify_trade_exit
+                            lot_size = pos.get('lot_size', 1)
+                            cap = pos['entry_premium'] * lot_size
+                            notify_trade_exit(market="STOCKS", strategy=pos['strategy'],
+                                symbol=symbol, signal_type=pos['signal_type'],
+                                strike=pos['strike'], entry_price=pos['entry_premium'],
+                                exit_price=_curr_prem, entry_time=pos['timestamp'],
+                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
+                                exit_reason='THETA_DECAY_EXIT')
+                        except Exception:
+                            pass
+                        continue
+                    elif _theta_burden_pct > THETA_BURDEN_TIGHTEN_PCT:
+                        _new_tsl = round(_curr_prem * THETA_TIGHTEN_SL_FACTOR, 2)
+                        if pos.get('trailing_sl') is None or _new_tsl > (pos.get('trailing_sl') or 0):
+                            logger.info(f"  THETA_SL_TIGHTEN: {pos['id']} theta_burden={_theta_burden_pct:.1f}%/day "
+                                       f"> {THETA_BURDEN_TIGHTEN_PCT}% — SL→Rs {_new_tsl:.2f}")
+                            pos['trailing_sl'] = _new_tsl
+
+            # ---- v10.5b: Update regime detector (same as equity/commodity) ----
+            self.regime_detector.update(symbol, spot, self.current_vix)
+            regime = self.regime_detector.get_regime(symbol)
+            regime_params = get_regime_params(regime)
+            if self._last_logged_regime.get(symbol) != regime:
+                logger.info(f"  REGIME: {symbol} → {regime.value} "
+                           f"(TSL trail={regime_params['tsl_trail_distance_pct']}%, "
+                           f"BKOUT_FAIL={'OFF' if not regime_params['breakout_fail_enabled'] else 'ON'})")
+                self._last_logged_regime[symbol] = regime
+
             # ---- PREMIUM UPDATE: Real market LTP with fallback to delta+gamma+theta ----
             entry_spot = pos.get('entry_spot', 0)
             if entry_spot == 0 or entry_spot is None:
@@ -2466,8 +2745,16 @@ class StockPaperTrader:
                         continue
 
             # ---- v10.1: BREAKOUT FAILURE DETECTION ----
-            # If premium never moved above entry or drops fast, exit early (+ optional reverse)
-            if BREAKOUT_FAIL_REVERSE_ENABLED and GRACE_PERIOD_SECONDS < elapsed_secs <= BREAKOUT_FAIL_CHECK_MINUTES * 60:
+            # v10.5b: Regime-aware — disabled on TRENDING days, dynamic timer + confidence gate
+            bf_check_minutes = regime_params.get('breakout_fail_check_minutes', BREAKOUT_FAIL_CHECK_MINUTES)
+            bf_timer_secs = bf_check_minutes * 60
+            # v10.5b: If entry IV > 40%, extend timer 50% — big moves take longer
+            details_bf = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
+            bf_entry_iv = details_bf.get('entry_iv', 0)
+            if bf_entry_iv > 0.40:
+                bf_timer_secs = int(bf_timer_secs * 1.5)
+            regime_confident = self.regime_detector.is_regime_confident(symbol) if hasattr(self.regime_detector, 'is_regime_confident') else True
+            if regime_params['breakout_fail_enabled'] and regime_confident and GRACE_PERIOD_SECONDS < elapsed_secs <= bf_timer_secs:
                 entry_prem_bf = pos['entry_premium']
                 if entry_prem_bf > 0:
                     if not pos['is_sell']:
@@ -2504,9 +2791,10 @@ class StockPaperTrader:
                             pass
                         continue
 
-                    # Near 5-min mark: no movement — exit (no reverse)
-                    if elapsed_secs >= (BREAKOUT_FAIL_CHECK_MINUTES * 60 - 15) and gain_bf < BREAKOUT_FAIL_MIN_GAIN_PCT:
-                        logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {BREAKOUT_FAIL_MIN_GAIN_PCT}% in {int(elapsed_secs)}s")
+                    # Near timer end: no movement — exit (no reverse)
+                    bf_min_gain = regime_params.get('breakout_fail_min_gain_pct', BREAKOUT_FAIL_MIN_GAIN_PCT)
+                    if elapsed_secs >= (bf_timer_secs - 15) and gain_bf < bf_min_gain:
+                        logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {bf_min_gain}% in {int(elapsed_secs)}s (regime={regime.value})")
                         self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL')
                         self._track_exit(pos, 'BREAKOUT_FAIL')
                         try:
@@ -2931,14 +3219,23 @@ class StockPaperTrader:
 
             # Check CPR breakout
             cpr_signals = self.engine.check_cpr_breakout_signals(symbol, spot, ohlc, indicators, config)
+            for s in cpr_signals:
+                s['_indicators'] = indicators  # v10.5b: for DCI computation in execute
+                s['dte'] = dte
             all_signals.extend(cpr_signals)
 
             # Check Gamma Blast
             gamma_signals = self.engine.check_gamma_blast_signals(symbol, spot, ohlc, indicators, config)
+            for s in gamma_signals:
+                s['_indicators'] = indicators
+                s['dte'] = dte
             all_signals.extend(gamma_signals)
 
             # Check PCR+VWAP
             pcr_signals = self.engine.check_pcr_vwap_signals(symbol, spot, indicators, config)
+            for s in pcr_signals:
+                s['_indicators'] = indicators
+                s['dte'] = dte
             all_signals.extend(pcr_signals)
 
         # v9.6: Diagnostic logging — spot/indicator summary
@@ -3024,6 +3321,15 @@ class StockPaperTrader:
         """
         if not signals:
             return
+
+        # v10.6: VIX Hard Gate — block ALL entries in extreme VIX
+        if self.current_vix is not None:
+            if self.current_vix > VIX_BLOCK_HIGH:
+                logger.warning(f"  SKIP_VIX_EXTREME_HIGH: VIX={self.current_vix:.1f} > {VIX_BLOCK_HIGH} — blocking {len(signals)} stock entries")
+                return
+            if self.current_vix < VIX_BLOCK_LOW:
+                logger.warning(f"  SKIP_VIX_EXTREME_LOW: VIX={self.current_vix:.1f} < {VIX_BLOCK_LOW} — blocking {len(signals)} stock entries")
+                return
 
         executed = 0
         skipped = 0
@@ -3174,6 +3480,24 @@ class StockPaperTrader:
                         logger.info(f"  REVERSE_BOOST: {symbol} score {score-15} → {score}")
                     sig['quality_score'] = score
 
+            # ---- v10.5b: DCI entry gate (same as equity/commodity) ----
+            sig_indicators = sig.get('_indicators', {})
+            sig_greeks = sig.get('greeks', {}) or {}
+            dci = compute_direction_confidence(sig, sig.get('spot', 0), sig_indicators, self.current_vix, sig_greeks)
+            sig['_dci'] = dci
+            if dci < DCI_MIN_THRESHOLD:
+                logger.info(f"  SKIP_DCI: {symbol} {signal_type} DCI={dci:.0f} < {DCI_MIN_THRESHOLD} — weak direction")
+                skipped += 1
+                continue
+            # DCI-based lot tier
+            if dci >= 70:
+                sig['_lot_tier'] = 'ELITE'
+            elif dci >= 55:
+                sig['_lot_tier'] = 'STRONG'
+            else:
+                sig['_lot_tier'] = 'BASE'
+            logger.info(f"  DCI: {symbol} {signal_type} DCI={dci:.0f}/100 tier={sig['_lot_tier']}")
+
             # Get spot and determine strike
             spot = self.get_stock_spot(symbol)
             if not spot:
@@ -3208,6 +3532,19 @@ class StockPaperTrader:
                             f"Black-Scholes fallback DISABLED for stock trades.")
                 skipped += 1
                 continue
+
+            # ---- v10.5b: IV + DTE hard gate (same as equity/commodity) ----
+            sig_dte = sig.get('dte', 30)
+            if sig_dte <= 1 and entry_iv > 0:
+                iv_decimal = entry_iv if entry_iv < 1 else entry_iv / 100
+                if sig_dte == 0 and iv_decimal < IV_MIN_FOR_DTE0:
+                    logger.info(f"  SKIP_IV_DTE: {symbol} {signal_type} IV={iv_decimal*100:.1f}% < {IV_MIN_FOR_DTE0*100:.0f}% on expiry day")
+                    skipped += 1
+                    continue
+                if sig_dte == 1 and iv_decimal < IV_MIN_FOR_DTE1:
+                    logger.info(f"  SKIP_IV_DTE: {symbol} {signal_type} IV={iv_decimal*100:.1f}% < {IV_MIN_FOR_DTE1*100:.0f}% with DTE=1")
+                    skipped += 1
+                    continue
 
             # Premium filter
             is_sell = 'SELL' in signal_type
@@ -3281,6 +3618,9 @@ class StockPaperTrader:
                     'quality_score': score,
                     'target_mult': target_mult,
                     'sl_mult': sl_mult,
+                    'entry_iv': iv_for_greeks,  # v10.5b: for regime-aware breakout_fail
+                    'dci': sig.get('_dci', 0),  # v10.5b: DCI at entry
+                    'lot_tier': sig.get('_lot_tier', 'BASE'),  # v10.5b: DCI tier
                 },
                 oi=entry_oi,
                 spot_price=spot,
@@ -3409,6 +3749,9 @@ class StockPaperTrader:
 
         This is the core loop body called every 30 seconds during market hours.
         """
+        # v10.5b: Fetch VIX (needed for DCI + regime detector)
+        self.get_india_vix()
+
         # Check exits first (before scanning for new signals)
         self.check_exits()
 

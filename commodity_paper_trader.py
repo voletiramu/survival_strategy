@@ -147,6 +147,11 @@ TSL_TRAIL_DISTANCE_PCT = 30      # Phase 2 trail: 30% below peak profit
 TSL_TIGHT_GAIN_PCT = 40          # Phase 3: Tight trail at 40%+ gain
 TSL_TIGHT_DISTANCE_PCT = 20      # Phase 3 trail: 20% below peak profit
 
+# v10.4: Phase 0 TSL — micro-trail for early gains before breakeven lock
+TSL_MICRO_GAIN_PCT = 5
+TSL_MICRO_TRAIL_DISTANCE_PCT = 60
+TSL_MICRO_MIN_HOLD_SECONDS = 300
+
 # v10.1: Trailing Target — extend target instead of hard exit
 TARGET_TRAIL_ENABLED = True
 TARGET_TRAIL_EXTEND_PCT = 20          # Extend target by 20% of current premium when hit
@@ -209,6 +214,14 @@ MCX_VIX_LOW_THRESHOLD = 14            # Below 14 = low vol regime → stricter f
 MCX_VIX_HIGH_THRESHOLD = 20           # Above 20 = high vol regime → relax filters 0.8x
 MCX_VIX_LOW_MULTIPLIER = 1.5
 MCX_VIX_HIGH_MULTIPLIER = 0.8
+# v10.6: VIX Hard Gate — block ALL entries in extreme VIX regimes
+MCX_VIX_BLOCK_HIGH = 35
+MCX_VIX_BLOCK_LOW = 11
+# v10.6: Greeks Refresh + Theta Decay Exit
+MCX_GREEKS_REFRESH_INTERVAL_SECONDS = 300
+MCX_THETA_BURDEN_TIGHTEN_PCT = 5.0
+MCX_THETA_BURDEN_EXIT_PCT = 10.0
+MCX_THETA_TIGHTEN_SL_FACTOR = 0.90
 
 # MCX Trading costs
 MCX_BROKERAGE = 20
@@ -552,6 +565,62 @@ def mcx_compute_signal_score(signal, spot, indicators, vix=None):
         score -= 5   # Missing VWAP is less critical
 
     return max(min(score, 100), 0)
+
+
+def compute_direction_confidence(sig, spot, indicators, vix, greeks):
+    """v10.4: Direction Confidence Index (DCI) — continuous 0-100 score."""
+    is_ce = 'CE' in sig.get('type', '')
+    score = 50
+    vwap = indicators.get('vwap', spot) if indicators else spot
+    vwap_dist_pct = (spot - vwap) / vwap * 100 if vwap else 0
+    if is_ce:
+        score += min(max(vwap_dist_pct * 5, -10), 10)
+    else:
+        score += min(max(-vwap_dist_pct * 5, -10), 10)
+    ema9 = indicators.get('ema_9', spot) if indicators else spot
+    ema20 = indicators.get('ema_20', spot) if indicators else spot
+    ema_gap_pct = (ema9 - ema20) / ema20 * 100 if ema20 else 0
+    if is_ce:
+        score += min(max(ema_gap_pct * 10, -12), 12)
+    else:
+        score += min(max(-ema_gap_pct * 10, -12), 12)
+    trend = indicators.get('three_bar_trend', 0) if indicators else 0
+    if is_ce:
+        score += min(trend * 3, 8)
+    else:
+        score += min(-trend * 3, 8)
+    pcr = indicators.get('pcr', 1.0) if indicators else 1.0
+    if is_ce and pcr > 1.0:
+        score += min((pcr - 1.0) * 20, 8)
+    elif not is_ce and pcr < 1.0:
+        score += min((1.0 - pcr) * 20, 8)
+    iv = greeks.get('iv', 0) if greeks else 0
+    if iv > 0:
+        if iv >= 0.40: score += 10
+        elif iv >= 0.25: score += 5
+        elif iv < 0.15: score -= 10
+        elif iv < 0.20: score -= 5
+    delta = abs(greeks.get('delta', 0)) if greeks else 0
+    if 0.40 <= delta <= 0.60: score += 5
+    elif delta < 0.25 or delta > 0.75: score -= 5
+    open_price = indicators.get('open', spot) if indicators else spot
+    body_pct = (spot - open_price) / open_price * 100 if open_price else 0
+    if is_ce:
+        score += min(max(body_pct * 3, -5), 5)
+    else:
+        score += min(max(-body_pct * 3, -5), 5)
+    theta = greeks.get('theta', 0) if greeks else 0
+    dte = sig.get('dte', 5)
+    if dte <= 1 and abs(theta) > 0:
+        premium = sig.get('premium', 100)
+        theta_pct_per_hour = abs(theta) / premium * 100 / 6.5 if premium > 0 else 0
+        if 'BUY' in sig.get('type', '') and theta_pct_per_hour > 3:
+            score -= 8
+    return max(min(score, 100), 0)
+
+DCI_MIN_THRESHOLD = 40
+IV_MIN_FOR_DTE1 = 0.20
+IV_MIN_FOR_DTE0 = 0.25
 
 
 def mcx_compute_hold_score(pos, spot, indicators, current_oi=None, current_iv=None):
@@ -959,7 +1028,7 @@ class CommodityStrategyEngine:
                         volume = float(item.get('tradeVolume', 0) or 0)
 
                         # Skip flat/illiquid strikes
-                        if delta < 0.20 or delta > 0.70:
+                        if delta < 0.35 or delta > 0.65:
                             continue
                         if oi < MIN_ENTRY_OI:
                             logger.debug(f"  MCX_SKIP_LOW_OI: {commodity} {int(item_strike)}{opt_type} OI={oi:.0f}")
@@ -995,9 +1064,10 @@ class CommodityStrategyEngine:
             except Exception as e:
                 logger.debug(f"  MCX_API_GREEKS_ERR: {commodity} {opt_type} — {e}")
 
-        # --- Fallback to Black-76 model ---
-        logger.debug(f"  MCX_B76_FALLBACK: {commodity} {opt_type} — using theoretical greeks")
-        return select_optimal_mcx_strike(spot, strike_int, T, r, iv, opt_type, min_premium)
+        # v10.5: NO fallback to Black-76 model — live exchange data ONLY
+        logger.info(f"  MCX_SKIP_NO_LIVE: {commodity} {opt_type} ATM={atm} — "
+                   f"no live data from Angel MCX API, signal blocked (zero BS tolerance)")
+        return None
 
     def load_historical(self, commodity):
         """Load historical data for commodity. Auto-download if missing/stale."""
@@ -1248,6 +1318,11 @@ class CommodityStrategyEngine:
         T = dte / 365
         cpr_w = ind['cpr_width']
 
+        # v11.1: Skip CPR signals on ultra-narrow CPR days
+        if cpr_w < 0.03:
+            logger.info(f"  CPR_NARROW_SKIP: {commodity} CPR width {cpr_w:.4f}% < 0.03% — signals unreliable")
+            return signals
+
         # v9.6: Multi-tier CPR targets (ported from equity)
         # Narrow (<0.3%): strong breakout → highest targets
         # Moderate (0.3-0.6%): directional trade → standard targets
@@ -1277,61 +1352,70 @@ class CommodityStrategyEngine:
                 if intraday_body < 0 and spot < vwap:
                     logger.info(f"  CPR_DIR_SKIP: {commodity} CE breakout but body={intraday_body:.1f} & spot<VWAP={vwap:.0f}")
                 else:
-                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    # v10.5: Live API greeks ONLY — no B76 fallback
                     opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
-                    ce_strike = opt['strike']
-                    g = opt['greeks']
-                    if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        # v9.6: Camarilla confirmation — higher target if R3 already breached
-                        use_target = target_hit_mult if ohlc['high'] > ind['cam_r3'] else target_base_mult
-                        signals.append({
-                            'type': 'BUY_CE_CPR', 'strike': ce_strike,
-                            'premium': g['price'], 'greeks': g,
-                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout",
-                            'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
-                        })
+                    if opt:
+                        ce_strike = opt['strike']
+                        g = opt['greeks']
+                        if g['price'] > MCX_MIN_PREMIUM_BUY:
+                            # v9.6: Camarilla confirmation — higher target if R3 already breached
+                            use_target = target_hit_mult if ohlc['high'] > ind['cam_r3'] else target_base_mult
+                            signals.append({
+                                'type': 'BUY_CE_CPR', 'strike': ce_strike,
+                                'premium': g['price'], 'greeks': g,
+                                'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout [LIVE]",
+                                'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
+                            })
             elif spot < ind['bc']:
                 # v10.1: Skip PE breakdown if intraday body bullish AND spot above VWAP
                 if intraday_body > 0 and spot > vwap:
                     logger.info(f"  CPR_DIR_SKIP: {commodity} PE breakdown but body={intraday_body:.1f} & spot>VWAP={vwap:.0f}")
                 else:
-                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    # v10.5: Live API greeks ONLY — no B76 fallback
                     opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
-                    pe_strike = opt['strike']
-                    g = opt['greeks']
-                    if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        # v9.6: Camarilla confirmation — higher target if S3 already breached
-                        use_target = target_hit_mult if ohlc['low'] < ind['cam_s3'] else target_base_mult
-                        signals.append({
-                            'type': 'BUY_PE_CPR', 'strike': pe_strike,
-                            'premium': g['price'], 'greeks': g,
-                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout",
-                            'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
-                        })
+                    if opt:
+                        pe_strike = opt['strike']
+                        g = opt['greeks']
+                        if g['price'] > MCX_MIN_PREMIUM_BUY:
+                            # v9.6: Camarilla confirmation — higher target if S3 already breached
+                            use_target = target_hit_mult if ohlc['low'] < ind['cam_s3'] else target_base_mult
+                            signals.append({
+                                'type': 'BUY_PE_CPR', 'strike': pe_strike,
+                                'premium': g['price'], 'greeks': g,
+                                'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout [LIVE]",
+                                'target': g['price'] * use_target, 'sl': g['price'] * sl_mult,
+                            })
 
-        # SELL mean reversion: Wide CPR only (> 0.6%) — unchanged from v9.5
+        # SELL mean reversion: Wide CPR only (> 0.6%)
+        # v10.5: Use select_strike_live() instead of black76_greeks() — live data only
         if cpr_w > 0.6:
             margin_ok = self.portfolio.capital >= spec['margin']
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_int) * strike_int
-                g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
-                if g['price'] > MCX_MIN_PREMIUM_SELL:
-                    signals.append({
-                        'type': 'SELL_CE_CPR', 'strike': ce_strike,
-                        'premium': g['price'], 'greeks': g,
-                        'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at R3",
-                        'target': g['price'] * 0.3, 'sl': g['price'] * 1.2,  # v2.5: Was 0.15/1.8
-                    })
+                opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_SELL)
+                if opt:
+                    g = opt['greeks']
+                    ce_strike = opt['strike']
+                    if g['price'] > MCX_MIN_PREMIUM_SELL:
+                        signals.append({
+                            'type': 'SELL_CE_CPR', 'strike': ce_strike,
+                            'premium': g['price'], 'greeks': g,
+                            'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at R3 [LIVE]",
+                            'target': g['price'] * 0.3, 'sl': g['price'] * 1.2,
+                        })
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_int) * strike_int
-                g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
-                if g['price'] > MCX_MIN_PREMIUM_SELL:
-                    signals.append({
-                        'type': 'SELL_PE_CPR', 'strike': pe_strike,
-                        'premium': g['price'], 'greeks': g,
-                        'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at S3",
-                        'target': g['price'] * 0.3, 'sl': g['price'] * 1.2,  # v2.5: Was 0.15/1.8
-                    })
+                opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_SELL)
+                if opt:
+                    g = opt['greeks']
+                    pe_strike = opt['strike']
+                    if g['price'] > MCX_MIN_PREMIUM_SELL:
+                        signals.append({
+                            'type': 'SELL_PE_CPR', 'strike': pe_strike,
+                            'premium': g['price'], 'greeks': g,
+                            'reason': f"Wide CPR ({ind['cpr_width']:.3f}%) mean reversion at S3 [LIVE]",
+                            'target': g['price'] * 0.3, 'sl': g['price'] * 1.2,
+                        })
         return signals
 
     def check_gamma_blast_signals(self, commodity, spot, ohlc, ind, dow, dte):
@@ -1379,39 +1463,41 @@ class CommodityStrategyEngine:
                     logger.info(f"  GAMMA_DIR_SKIP: {commodity} CE but spot={spot:.0f} < VWAP={gamma_vwap:.0f}")
                 else:
                     # v9.5: Greeks-based strike selection (best delta + highest gamma)
-                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    # v10.5: Live API greeks ONLY — no Black-76 fallback
                     opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'CE', MCX_MIN_PREMIUM_BUY)
-                    ce_strike = opt['strike']
-                    g = opt['greeks']
-                    if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        logger.info(f"  GREEKS_STRIKE: {commodity} CE(Gamma) ATM={round(spot/strike_int)*strike_int} "
-                                   f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
-                                   f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
-                        signals.append({
-                            'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
-                            'premium': g['price'], 'greeks': g,
-                            'reason': f"Gamma Blast: Up breakout body={body:.1f} DTE={actual_dte}",
-                            'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
-                        })
+                    if opt:
+                        ce_strike = opt['strike']
+                        g = opt['greeks']
+                        if g['price'] > MCX_MIN_PREMIUM_BUY:
+                            logger.info(f"  GREEKS_STRIKE: {commodity} CE(Gamma) ATM={round(spot/strike_int)*strike_int} "
+                                       f"Selected={ce_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
+                                       f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
+                            signals.append({
+                                'type': 'BUY_CE_GAMMA', 'strike': ce_strike,
+                                'premium': g['price'], 'greeks': g,
+                                'reason': f"Gamma Blast: Up breakout body={body:.1f} DTE={actual_dte} [LIVE]",
+                                'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
+                            })
             else:
                 # v10.1: VWAP direction check — skip PE if spot above VWAP
                 if spot > gamma_vwap:
                     logger.info(f"  GAMMA_DIR_SKIP: {commodity} PE but spot={spot:.0f} > VWAP={gamma_vwap:.0f}")
                 else:
-                    # v10.3d: Live API greeks with Black-76 fallback + OI check
+                    # v10.5: Live API greeks ONLY — no Black-76 fallback
                     opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'PE', MCX_MIN_PREMIUM_BUY)
-                    pe_strike = opt['strike']
-                    g = opt['greeks']
-                    if g['price'] > MCX_MIN_PREMIUM_BUY:
-                        logger.info(f"  GREEKS_STRIKE: {commodity} PE(Gamma) ATM={round(spot/strike_int)*strike_int} "
-                                   f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
-                                   f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
-                        signals.append({
-                            'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
-                            'premium': g['price'], 'greeks': g,
-                            'reason': f"Gamma Blast: Down breakout body={body:.1f} DTE={actual_dte}",
-                            'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
-                        })
+                    if opt:
+                        pe_strike = opt['strike']
+                        g = opt['greeks']
+                        if g['price'] > MCX_MIN_PREMIUM_BUY:
+                            logger.info(f"  GREEKS_STRIKE: {commodity} PE(Gamma) ATM={round(spot/strike_int)*strike_int} "
+                                       f"Selected={pe_strike} delta={g['delta']:.3f} gamma={g['gamma']:.6f} "
+                                       f"DTE={actual_dte} iv_mult={iv_mult:.2f}")
+                            signals.append({
+                                'type': 'BUY_PE_GAMMA', 'strike': pe_strike,
+                                'premium': g['price'], 'greeks': g,
+                                'reason': f"Gamma Blast: Down breakout body={body:.1f} DTE={actual_dte} [LIVE]",
+                                'target': g['price'] * target_mult, 'sl': g['price'] * sl_mult,
+                            })
         return signals
 
     def check_ghost_zone_signals(self, commodity, spot, ohlc, ind, dow, dte):
@@ -2030,7 +2116,8 @@ class CommodityPaperTrader:
         return None
 
     def _get_commodity_option_ltp(self, pos):
-        """Get real-time option LTP for a commodity position, with 15s cache.
+        """Get real-time option LTP for a commodity position.
+        v10.5: WebSocket first (instant, no rate limit), then REST API fallback.
         Returns LTP float or None if unavailable.
         """
         details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
@@ -2050,18 +2137,26 @@ class CommodityPaperTrader:
                         details['option_token'] = option_token
                     else:
                         pos['details'] = {'option_token': option_token}
+                    # v10.5: Subscribe to WebSocket for real-time updates
+                    if self.ws_feed and option_token:
+                        self.ws_feed.subscribe_mcx_options([option_token])
 
         if not option_token:
             return None
 
-        # Check cache (5-second TTL — v7.6.2: reduced from 15s to minimize price lag)
+        # v10.5 Source 1: WebSocket real-time LTP (instant, no rate limit)
+        if self.ws_feed:
+            ws_ltp = self.ws_feed.get_ltp(str(option_token))
+            if ws_ltp and ws_ltp > 0:
+                return ws_ltp
+
+        # Source 2: REST API with 5s cache
         cache_key = f"MCX_{option_token}"
         cached = self._option_ltp_cache.get(cache_key)
         if cached and (datetime.now() - cached['time']).total_seconds() < 5:
             return cached['ltp']
 
         try:
-            # Use get_market_data for MCX option LTP (commodity get_ltp is futures only)
             mkt_data = self.angel.get_market_data('MCX', option_token)
             if mkt_data:
                 ltp = float(mkt_data.get('ltp', 0) or 0)
@@ -2501,6 +2596,16 @@ class CommodityPaperTrader:
             # Monthly expiry - estimate DTE
             dte = max(5, 15 - (now.day % 28))
 
+            # v11.1: Choppy day detection — block late entries if morning efficiency < 15%
+            choppy_blocked = False
+            if now.time() >= dtime(11, 0):
+                day_range = ohlc['high'] - ohlc['low']
+                net_move = abs(spot - ohlc['open'])
+                day_eff = net_move / day_range * 100 if day_range > 0 else 100
+                if day_eff < 15:
+                    choppy_blocked = True
+                    logger.info(f"  CHOPPY_DAY_BLOCK: {commodity} eff={day_eff:.0f}% — blocking new entries")
+
             # v7.1: Only 3 commodity strategies — PCR+VWAP needs equity OI data,
             # Survivor halted (needs more capital)
             checks = [
@@ -2512,6 +2617,9 @@ class CommodityPaperTrader:
             ]
 
             for strat_name, check_fn in checks:
+                if choppy_blocked:
+                    logger.debug(f"  CHOPPY_SKIP: {strat_name} blocked on choppy day")
+                    continue
                 signals = check_fn(commodity, spot, ohlc, indicators, dow, dte)
                 for sig in signals:
                     sig['strategy'] = strat_name
@@ -2593,6 +2701,15 @@ class CommodityPaperTrader:
         if self.current_vix:
             logger.info(f"  MCX_VIX: {self.current_vix:.1f} (multiplier={vix_mult:.1f}x)")
 
+        # v10.6: VIX Hard Gate — block ALL entries in extreme VIX
+        if self.current_vix is not None:
+            if self.current_vix > MCX_VIX_BLOCK_HIGH:
+                logger.warning(f"  MCX_SKIP_VIX_EXTREME_HIGH: VIX={self.current_vix:.1f} > {MCX_VIX_BLOCK_HIGH} — blocking {len(signals)} commodity entries")
+                return
+            if self.current_vix < MCX_VIX_BLOCK_LOW:
+                logger.warning(f"  MCX_SKIP_VIX_EXTREME_LOW: VIX={self.current_vix:.1f} < {MCX_VIX_BLOCK_LOW} — blocking {len(signals)} commodity entries")
+                return
+
         executed = 0
         skipped = 0
         for sig in signals:
@@ -2651,14 +2768,17 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
+            # v10.4: Cross-strategy dedup — BLOCK instead of allowing duplicate positions
             diff_strat_same_dir = [p for p in self.portfolio.positions
                                    if p['commodity'] == sig['commodity']
                                    and abs(p['strike'] - sig['strike']) <= tol
                                    and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
                                    and p['strategy'] != sig['strategy']]
             if diff_strat_same_dir:
-                logger.info(f"  MCX_STRATEGY_CONFIRM: {sig['strategy']} {sig['commodity']} {sig['strike']}{sig_opt_type} "
-                           f"confirms {diff_strat_same_dir[0]['strategy']} @ {diff_strat_same_dir[0]['strike']} — allowing entry")
+                logger.info(f"  SKIP_CROSS_DEDUP: {sig['strategy']} {sig['commodity']} {sig['strike']}{sig_opt_type} "
+                           f"already held by {diff_strat_same_dir[0]['strategy']} @ {diff_strat_same_dir[0]['strike']} — blocked")
+                skipped += 1
+                continue
 
             # Check for CONFLICTING positions: no BUY_CE + SELL_CE on same commodity/strike
             opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
@@ -2701,6 +2821,15 @@ class CommodityPaperTrader:
                 if flip_score < MCX_DIRECTION_FLIP_MIN_SCORE:
                     logger.info(f"  SKIP_FLIP_QUALITY: {sig['strategy']} {sig['commodity']} {sig['type']} "
                                f"score={flip_score} < {MCX_DIRECTION_FLIP_MIN_SCORE} — not strong enough to flip")
+                    skipped += 1
+                    continue
+
+                # v10.4: DCI-based flip protection — if existing position had high DCI, block flip
+                opp_details = opp.get('details', {}) if isinstance(opp.get('details'), dict) else {}
+                opp_dci = opp_details.get('dci', 0)
+                if opp_dci > 60:
+                    logger.info(f"  SKIP_FLIP_DCI: {sig['strategy']} {sig['commodity']} {sig['type']} "
+                               f"— existing {opp['id']} has DCI={opp_dci} > 60 — high confidence, flip blocked")
                     skipped += 1
                     continue
 
@@ -2885,6 +3014,28 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
+            # ---- v10.4: DCI entry gate ----
+            sig_greeks = sig.get('greeks', {})
+            dci = compute_direction_confidence(sig, sig['spot'], indicators, self.current_vix, sig_greeks)
+            sig['_dci'] = dci
+            if dci < DCI_MIN_THRESHOLD:
+                logger.info(f"  SKIP_DCI: {sig['commodity']} {sig['type']} DCI={dci} < {DCI_MIN_THRESHOLD}")
+                skipped += 1
+                continue
+            logger.info(f"  DCI_PASS: {sig['commodity']} {sig['type']} DCI={dci}/100")
+
+            # ---- v10.4: IV + DTE hard gate ----
+            entry_iv_val = sig_greeks.get('iv', 0)
+            sig_dte = sig.get('dte', 5)
+            if sig_dte <= 1 and entry_iv_val < IV_MIN_FOR_DTE1:
+                logger.info(f"  SKIP_IV_DTE: {sig['commodity']} {sig['type']} IV={entry_iv_val:.2f} < {IV_MIN_FOR_DTE1} with DTE={sig_dte}")
+                skipped += 1
+                continue
+            if sig_dte == 0 and entry_iv_val < IV_MIN_FOR_DTE0:
+                logger.info(f"  SKIP_IV_DTE0: {sig['commodity']} {sig['type']} IV={entry_iv_val:.2f} < {IV_MIN_FOR_DTE0} with DTE=0")
+                skipped += 1
+                continue
+
             # ---- v2.3: Profit filter check ----
             is_sell = 'SELL' in sig['type']
             spec = COMMODITIES[sig['commodity']]
@@ -2978,6 +3129,16 @@ class CommodityPaperTrader:
                            f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
                            f"Target={sig['target']:.2f} SL={sig['sl']:.2f}")
 
+                # v10.4: Premium BS vs Market gap gate — skip if gap > 30%
+                if bs_premium > 0:
+                    premium_gap_pct = abs(real_ltp - bs_premium) / bs_premium * 100
+                    if premium_gap_pct > 30:
+                        logger.info(f"  SKIP_PREMIUM_GAP: {sig['commodity']} {sig['strike']}{opt_type} "
+                                   f"BS={bs_premium:.2f} vs Market={real_ltp:.2f} gap={premium_gap_pct:.1f}% > 30% — trade skipped")
+                        skipped += 1
+                        continue
+                    logger.info(f"  PREMIUM_GAP: {sig['commodity']} {sig['strike']}{opt_type} gap={premium_gap_pct:.1f}% (OK)")
+
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
                 commodity=sig['commodity'],
@@ -2990,7 +3151,11 @@ class CommodityPaperTrader:
                          'sl': sig.get('sl'), 'spot': sig.get('spot'),
                          'option_token': option_token,
                          'quality_score': sig.get('quality_score', 0),  # v2.5: FIX — was missing!
-                         'expiry': expiry},  # v9.1: Store expiry for dashboard display
+                         'expiry': expiry,  # v9.1: Store expiry for dashboard display
+                         'dci': sig.get('_dci', 0),  # v10.4: Direction Confidence Index
+                         'entry_iv': sig['greeks'].get('iv', 0),  # v10.4: Entry IV
+                         'entry_regime': regime.value if hasattr(regime, 'value') else str(regime),  # v10.4
+                         },
                 oi=entry_oi,
                 iv=sig['greeks'].get('iv', 0),
             )
@@ -2999,6 +3164,10 @@ class CommodityPaperTrader:
                 continue
             executed += 1
             self.daily_trade_count += 1
+
+            # v10.5: Subscribe option token to WebSocket for real-time exit LTP
+            if option_token and self.ws_feed:
+                self.ws_feed.subscribe_mcx_options([option_token])
 
             # Send Telegram notification
             try:
@@ -3089,6 +3258,48 @@ class CommodityPaperTrader:
 
             spec = COMMODITIES[commodity]
 
+            # ---- v10.6: GREEKS REFRESH — Recalculate every 5 min during hold ----
+            _last_refresh = pos.get('greeks_refreshed_at')
+            _should_refresh = (_last_refresh is None or
+                              (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= MCX_GREEKS_REFRESH_INTERVAL_SECONDS)
+            if _should_refresh and pos.get('strike') and pos.get('iv'):
+                try:
+                    _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                    _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
+                    _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
+                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
+                    _g = black76_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                    pos['delta'] = round(_g['delta'], 4)
+                    pos['gamma'] = round(_g['gamma'], 6)
+                    pos['theta'] = round(_g['theta'], 4)
+                    pos['greeks_refreshed_at'] = datetime.now().isoformat()
+                    logger.debug(f"  MCX_GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
+                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr)")
+                except Exception as e:
+                    logger.debug(f"  MCX_GREEKS_REFRESH_ERR: {pos.get('id', '?')} — {e}")
+
+            # ---- v10.6: THETA DECAY EXIT — expiry day theta burden check (BUY only) ----
+            _elapsed_days_td = (datetime.now() - entry_time).total_seconds() / 86400
+            _remaining_dte = max(pos.get('dte', 5) - _elapsed_days_td, 0)
+            if _remaining_dte < 1 and not pos.get('is_sell', False):
+                _theta_val = abs(pos.get('theta', 0))
+                _curr_prem = pos.get('current_premium', pos['entry_premium'])
+                if _curr_prem > 0 and _theta_val > 0:
+                    _theta_burden_pct = _theta_val / _curr_prem * 100
+                    if _theta_burden_pct > MCX_THETA_BURDEN_EXIT_PCT and pos.get('unrealized_pnl', 0) < 0:
+                        logger.info(f"  MCX_THETA_DECAY_EXIT: {pos['id']} theta_burden={_theta_burden_pct:.1f}%/day "
+                                   f"> {MCX_THETA_BURDEN_EXIT_PCT}% + losing Rs {pos.get('unrealized_pnl', 0):.0f}")
+                        self.portfolio.close_position(pos['id'], _curr_prem, 'THETA_DECAY_EXIT')
+                        self._track_exit(pos, 'THETA_DECAY_EXIT')
+                        self._notify_commodity_exit(pos, commodity, _curr_prem, 'THETA_DECAY_EXIT')
+                        continue
+                    elif _theta_burden_pct > MCX_THETA_BURDEN_TIGHTEN_PCT:
+                        _new_tsl = round(_curr_prem * MCX_THETA_TIGHTEN_SL_FACTOR, 2)
+                        if pos.get('trailing_sl') is None or _new_tsl > (pos.get('trailing_sl') or 0):
+                            logger.info(f"  MCX_THETA_SL_TIGHTEN: {pos['id']} theta_burden={_theta_burden_pct:.1f}%/day "
+                                       f"> {MCX_THETA_BURDEN_TIGHTEN_PCT}% — SL→Rs {_new_tsl:.2f}")
+                            pos['trailing_sl'] = _new_tsl
+
             # ---- PREMIUM UPDATE: Real market LTP with fallback to delta+gamma+theta ----
             entry_spot = pos.get('entry_spot', 0)
             if entry_spot == 0:
@@ -3151,7 +3362,12 @@ class CommodityPaperTrader:
             # v10.3: Regime-aware — disabled on TRENDING days
             regime = self.regime_detector.get_regime(commodity)
             regime_params = get_regime_params(regime)
-            if regime_params['breakout_fail_enabled'] and MCX_GRACE_PERIOD_SECONDS < elapsed_secs <= BREAKOUT_FAIL_CHECK_MINUTES * 60:
+            # v10.4: Regime-aware breakout fail timer + IV extension + confidence gate
+            bf_check_secs = regime_params.get('breakout_fail_check_minutes', BREAKOUT_FAIL_CHECK_MINUTES) * 60
+            entry_iv_bf = pos.get('details', {}).get('entry_iv', 0) if isinstance(pos.get('details'), dict) else 0
+            if entry_iv_bf > 0.40:
+                bf_check_secs = int(bf_check_secs * 1.5)  # High IV: 1.5x timer
+            if regime_params['breakout_fail_enabled'] and MCX_GRACE_PERIOD_SECONDS < elapsed_secs <= bf_check_secs:
                 entry_prem_bf = pos['entry_premium']
                 if entry_prem_bf > 0:
                     if not pos['is_sell']:
@@ -3163,29 +3379,34 @@ class CommodityPaperTrader:
                         gain_bf = (entry_prem_bf - peak_bf) / entry_prem_bf * 100
                         drop_bf = (current - entry_prem_bf) / entry_prem_bf * 100
 
-                    # Rapid drop: exit + queue reverse
-                    if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
-                        logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s")
-                        self.portfolio.close_position(pos['id'], current, 'BREAKOUT_FAIL_REVERSE')
-                        self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
-                        rev_type = 'PE' if 'CE' in pos['signal_type'] else 'CE'
-                        self.pending_reverses[commodity] = {
-                            'opt_type': rev_type, 'spot': spot,
-                            'source_id': pos['id'], 'timestamp': datetime.now().isoformat()
-                        }
-                        logger.info(f"  REVERSE_QUEUED: {commodity} BUY_{rev_type}")
-                        self._notify_commodity_exit(pos, commodity, current, 'BREAKOUT_FAIL_REVERSE')
-                        continue
+                    # v10.4: Confidence gate — skip breakout fail if entry DCI was high
+                    entry_dci = pos.get('details', {}).get('dci', 0) if isinstance(pos.get('details'), dict) else 0
+                    if entry_dci >= 70:
+                        logger.info(f"  BKOUT_FAIL_DCI_SKIP: {pos['id']} entry DCI={entry_dci} >= 70 — high confidence, skipping breakout fail check")
+                    else:
+                        # Rapid drop: exit + queue reverse
+                        if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
+                            logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s (bf_timer={bf_check_secs}s)")
+                            self.portfolio.close_position(pos['id'], current, 'BREAKOUT_FAIL_REVERSE')
+                            self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
+                            rev_type = 'PE' if 'CE' in pos['signal_type'] else 'CE'
+                            self.pending_reverses[commodity] = {
+                                'opt_type': rev_type, 'spot': spot,
+                                'source_id': pos['id'], 'timestamp': datetime.now().isoformat()
+                            }
+                            logger.info(f"  REVERSE_QUEUED: {commodity} BUY_{rev_type}")
+                            self._notify_commodity_exit(pos, commodity, current, 'BREAKOUT_FAIL_REVERSE')
+                            continue
 
-                    # Near 5-min mark: no movement — exit (no reverse)
-                    # v10.3: Regime-aware min gain threshold
-                    bf_min_gain = regime_params['breakout_fail_min_gain_pct']
-                    if elapsed_secs >= (BREAKOUT_FAIL_CHECK_MINUTES * 60 - 15) and gain_bf < bf_min_gain:
-                        logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {bf_min_gain}% in {int(elapsed_secs)}s (regime={regime.value})")
-                        self.portfolio.close_position(pos['id'], current, 'BREAKOUT_FAIL')
-                        self._track_exit(pos, 'BREAKOUT_FAIL')
-                        self._notify_commodity_exit(pos, commodity, current, 'BREAKOUT_FAIL')
-                        continue
+                        # Near timer mark: no movement — exit (no reverse)
+                        # v10.3: Regime-aware min gain threshold
+                        bf_min_gain = regime_params['breakout_fail_min_gain_pct']
+                        if elapsed_secs >= (bf_check_secs - 15) and gain_bf < bf_min_gain:
+                            logger.info(f"  BREAKOUT_FAIL: {pos['id']} peak gain={gain_bf:.1f}% < {bf_min_gain}% in {int(elapsed_secs)}s (regime={regime.value}, bf_timer={bf_check_secs}s)")
+                            self.portfolio.close_position(pos['id'], current, 'BREAKOUT_FAIL')
+                            self._track_exit(pos, 'BREAKOUT_FAIL')
+                            self._notify_commodity_exit(pos, commodity, current, 'BREAKOUT_FAIL')
+                            continue
 
             # ---- TIME-BASED EXIT: Close stale commodity positions (v2.5: >4 hours with <10% profit) ----
             if hours_held > 4:  # v2.5: Reduced from 6 hours
@@ -3220,6 +3441,18 @@ class CommodityPaperTrader:
                 peak = pos.get('peak_premium', current)
                 peak_gain_pct = ((peak - entry_prem) / entry_prem * 100) if entry_prem > 0 else 0
                 profit_from_entry = peak - entry_prem
+
+                # v10.4: Phase 0 — micro-trail for early gains before breakeven lock
+                if (peak_gain_pct >= TSL_MICRO_GAIN_PCT
+                        and peak_gain_pct < TSL_BREAKEVEN_GAIN_PCT
+                        and not pos.get('breakeven_locked')
+                        and elapsed_secs >= TSL_MICRO_MIN_HOLD_SECONDS):
+                    micro_tsl = round(peak - (profit_from_entry * TSL_MICRO_TRAIL_DISTANCE_PCT / 100), 2)
+                    micro_tsl = max(micro_tsl, pos.get('trailing_sl') or 0)
+                    if micro_tsl > (pos.get('trailing_sl') or 0):
+                        pos['trailing_sl'] = micro_tsl
+                        logger.info(f"  TSL_PHASE0: {pos['id']} gain {peak_gain_pct:.0f}% "
+                                   f"SL→Rs {pos['trailing_sl']:.2f} (micro-trail {TSL_MICRO_TRAIL_DISTANCE_PCT}%)")
 
                 # Phase 1: Lock breakeven at 15% premium gain
                 if peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
@@ -3279,6 +3512,17 @@ class CommodityPaperTrader:
                 trough = pos.get('trough_premium', current)
                 trough_gain_pct = ((entry_prem - trough) / entry_prem * 100) if entry_prem > 0 else 0
                 profit_from_entry = entry_prem - trough
+
+                # v10.4: Phase 0 — micro-trail for early SELL gains before breakeven lock
+                if (trough_gain_pct >= TSL_MICRO_GAIN_PCT
+                        and trough_gain_pct < TSL_BREAKEVEN_GAIN_PCT
+                        and not pos.get('breakeven_locked')
+                        and elapsed_secs >= TSL_MICRO_MIN_HOLD_SECONDS):
+                    micro_tsl = round(trough + (profit_from_entry * TSL_MICRO_TRAIL_DISTANCE_PCT / 100), 2)
+                    if pos.get('trailing_sl') is None or micro_tsl < pos['trailing_sl']:
+                        pos['trailing_sl'] = micro_tsl
+                        logger.info(f"  TSL_PHASE0: {pos['id']} SELL gain {trough_gain_pct:.0f}% "
+                                   f"SL→Rs {pos['trailing_sl']:.2f} (micro-trail {TSL_MICRO_TRAIL_DISTANCE_PCT}%)")
 
                 # Phase 1: Lock breakeven at 15% premium gain
                 if trough_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
