@@ -220,7 +220,7 @@ MCX_VIX_BLOCK_LOW = 11
 # v10.6: Greeks Refresh + Theta Decay Exit
 MCX_GREEKS_REFRESH_INTERVAL_SECONDS = 300
 MCX_THETA_BURDEN_TIGHTEN_PCT = 5.0
-MCX_THETA_BURDEN_EXIT_PCT = 10.0
+MCX_THETA_BURDEN_EXIT_PCT = 999.0  # v11.1: Disabled — BS theta kills winners near expiry
 MCX_THETA_TIGHTEN_SL_FACTOR = 0.90
 
 # MCX Trading costs
@@ -965,16 +965,21 @@ class CommodityStrategyEngine:
         self.angel = angel
         self.historical_data = {}
 
-    def select_strike_live(self, commodity, spot, strike_int, T, r, iv, opt_type, min_premium=5.0):
+    def select_strike_live(self, commodity, spot, strike_int, T, r, iv, opt_type, min_premium=5.0, target_strike=None):
         """v10.3d: Strike selection with live API greeks, Black-76 fallback.
 
         Tries Angel optionGreek API first for real delta/gamma/OI/volume.
         Falls back to Black-76 model if API returns no data.
         Includes inline OI liquidity check (MIN_ENTRY_OI=500).
+        v10.7: target_strike param — if set, fetch LTP for that specific strike (for SELL signals).
         """
         MIN_ENTRY_OI = 500
         atm = round(spot / strike_int) * strike_int
         candidates = set(atm + i * strike_int for i in range(-2, 3))
+
+        # v10.7: If target_strike specified, add it to candidates so it can be matched
+        if target_strike:
+            candidates.add(target_strike)
 
         # --- Try live API greeks first ---
         if self.angel and self.angel._connected:
@@ -1007,6 +1012,39 @@ class CommodityStrategyEngine:
 
                 greeks_data = self.angel.get_option_greeks(commodity, expiry)
                 if greeks_data and len(greeks_data) > 0:
+                    # v10.7: If target_strike specified, find that exact strike (SELL signals)
+                    if target_strike:
+                        for item in greeks_data:
+                            try:
+                                item_strike = float(item.get('strikePrice', 0))
+                            except (ValueError, TypeError):
+                                continue
+                            if int(item_strike) != int(target_strike):
+                                continue
+                            item_type = item.get('optionType', '').upper()
+                            if item_type != opt_type:
+                                continue
+                            ltp = float(item.get('ltp', 0) or 0)
+                            if ltp > 0 and ltp >= min_premium:
+                                result = {
+                                    'strike': int(item_strike),
+                                    'greeks': {
+                                        'delta': float(item.get('delta', 0) or 0),
+                                        'gamma': float(item.get('gamma', 0) or 0),
+                                        'theta': float(item.get('theta', 0) or 0),
+                                        'vega': float(item.get('vega', 0) or 0),
+                                        'iv': float(item.get('impliedVolatility', 0) or 0) / 100,
+                                        'price': ltp,
+                                    },
+                                }
+                                logger.info(f"  MCX_LIVE_TARGET: {commodity} {int(target_strike)}{opt_type} "
+                                           f"LTP={ltp:.2f} Delta={result['greeks']['delta']:.3f} [API]")
+                                return result
+                        # target_strike not found in live data — fall through to skip
+                        logger.info(f"  MCX_SKIP_NO_LIVE: {commodity} {int(target_strike)}{opt_type} — "
+                                   f"target strike not found in live API data")
+                        return None
+
                     best_score = -1
                     best = None
                     for item in greeks_data:
@@ -1512,27 +1550,39 @@ class CommodityStrategyEngine:
 
         if ohlc['low'] <= ind['demand_zone'] * 1.01 and spot > ind['demand_zone'] and ind['demand_strength'] >= 2:
             ce_strike = round(spot / strike_int) * strike_int
-            g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
-            if g['price'] > MCX_MIN_PREMIUM_BUY:
-                bounce = (spot - ohlc['low']) / max(atr, 1)
-                signals.append({
-                    'type': 'BUY_CE_GTZ', 'strike': ce_strike,
-                    'premium': g['price'], 'greeks': g,
-                    'reason': f"Ghost Zone: Demand retest bounce={bounce:.2f}x",
-                    'target': g['price'] * 2.5 if bounce > 0.8 else g['price'] * 1.8,
-                    'sl': g['price'] * 0.4,
-                })
+            # v10.7: Live API greeks ONLY — no BS fallback
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
+            if opt:
+                g = opt['greeks']
+                ce_strike = opt['strike']
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    bounce = (spot - ohlc['low']) / max(atr, 1)
+                    signals.append({
+                        'type': 'BUY_CE_GTZ', 'strike': ce_strike,
+                        'premium': g['price'], 'greeks': g,
+                        'reason': f"Ghost Zone: Demand retest bounce={bounce:.2f}x [LIVE]",
+                        'target': g['price'] * 2.5 if bounce > 0.8 else g['price'] * 1.8,
+                        'sl': g['price'] * 0.4,
+                    })
+            else:
+                logger.info(f"  GTZ_SKIP_NO_LIVE: {commodity} CE at {ce_strike:.0f} — no live LTP available")
 
         elif ohlc['high'] >= ind['supply_zone'] * 0.99 and spot < ind['supply_zone'] and ind['supply_strength'] >= 2:
             pe_strike = round(spot / strike_int) * strike_int
-            g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
-            if g['price'] > MCX_MIN_PREMIUM_BUY:
-                signals.append({
-                    'type': 'BUY_PE_GTZ', 'strike': pe_strike,
-                    'premium': g['price'], 'greeks': g,
-                    'reason': f"Ghost Zone: Supply retest",
-                    'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
-                })
+            # v10.7: Live API greeks ONLY — no BS fallback
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
+            if opt:
+                g = opt['greeks']
+                pe_strike = opt['strike']
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    signals.append({
+                        'type': 'BUY_PE_GTZ', 'strike': pe_strike,
+                        'premium': g['price'], 'greeks': g,
+                        'reason': f"Ghost Zone: Supply retest [LIVE]",
+                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
+                    })
+            else:
+                logger.info(f"  GTZ_SKIP_NO_LIVE: {commodity} PE at {pe_strike:.0f} — no live LTP available")
         return signals
 
     def check_pcr_vwap_signals(self, commodity, spot, ohlc, indicators, dow, dte):
@@ -1556,33 +1606,43 @@ class CommodityStrategyEngine:
 
         # BUY CE: PCR > 1.05 (bullish momentum), near VWAP
         if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
-            ce_strike = round(spot / strike_int) * strike_int
-            g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
-                signals.append({
-                    'type': 'BUY_CE_PCRVWAP',
-                    'strike': ce_strike,
-                    'premium': g['price'],
-                    'greeks': g,
-                    'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.5,
-                    'sl': g['price'] * 0.4,
-                })
+            # v10.7: Live API greeks ONLY — no BS fallback
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_BUY)
+            if opt:
+                g = opt['greeks']
+                ce_strike = opt['strike']
+                if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
+                    signals.append({
+                        'type': 'BUY_CE_PCRVWAP',
+                        'strike': ce_strike,
+                        'premium': g['price'],
+                        'greeks': g,
+                        'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f} [LIVE]",
+                        'target': g['price'] * 2.5,
+                        'sl': g['price'] * 0.4,
+                    })
+            else:
+                logger.info(f"  PCRVWAP_SKIP_NO_LIVE: {commodity} CE — no live LTP available")
 
         # BUY PE: PCR < 0.95 (bearish momentum), near VWAP
         elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
-            pe_strike = round(spot / strike_int) * strike_int
-            g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
-                signals.append({
-                    'type': 'BUY_PE_PCRVWAP',
-                    'strike': pe_strike,
-                    'premium': g['price'],
-                    'greeks': g,
-                    'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
-                    'target': g['price'] * 2.5,
-                    'sl': g['price'] * 0.4,
-                })
+            # v10.7: Live API greeks ONLY — no BS fallback
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_BUY)
+            if opt:
+                g = opt['greeks']
+                pe_strike = opt['strike']
+                if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
+                    signals.append({
+                        'type': 'BUY_PE_PCRVWAP',
+                        'strike': pe_strike,
+                        'premium': g['price'],
+                        'greeks': g,
+                        'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f} [LIVE]",
+                        'target': g['price'] * 2.5,
+                        'sl': g['price'] * 0.4,
+                    })
+            else:
+                logger.info(f"  PCRVWAP_SKIP_NO_LIVE: {commodity} PE — no live LTP available")
 
         return signals
 
@@ -1633,34 +1693,46 @@ class CommodityStrategyEngine:
         # PE SELLING — price breaks above resistance (bullish → sell OTM PEs)
         if ohlc['high'] > resistance + gap:
             pe_strike = round((spot - distance) / strike_int) * strike_int
-            g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > MCX_MIN_PREMIUM_SELL:
-                signals.append({
-                    'type': 'SELL_PE_SURV',
-                    'strike': pe_strike,
-                    'premium': g['price'],
-                    'greeks': g,
-                    'reason': f"Survivor: PE sell at {pe_strike:.0f} dist={distance:.0f} "
-                              f"gap={gap:.0f} res={resistance:.0f}",
-                    'target': g['price'] * 0.3,
-                    'sl': g['price'] * 0.8,
-                })
+            # v10.7: Live LTP via select_strike_live with target_strike — no BS fallback
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_SELL, target_strike=pe_strike)
+            if opt:
+                g = opt['greeks']
+                pe_strike = opt['strike']
+                if g['price'] > MCX_MIN_PREMIUM_SELL:
+                    signals.append({
+                        'type': 'SELL_PE_SURV',
+                        'strike': pe_strike,
+                        'premium': g['price'],
+                        'greeks': g,
+                        'reason': f"Survivor: PE sell at {pe_strike:.0f} dist={distance:.0f} "
+                                  f"gap={gap:.0f} res={resistance:.0f} [LIVE]",
+                        'target': g['price'] * 0.3,
+                        'sl': g['price'] * 0.8,
+                    })
+            else:
+                logger.info(f"  SURV_SKIP_NO_LIVE: {commodity} PE sell at {pe_strike:.0f} — no live LTP available")
 
         # CE SELLING — price breaks below support (bearish → sell OTM CEs)
         if ohlc['low'] < support - gap:
             ce_strike = round((spot + distance) / strike_int) * strike_int
-            g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > MCX_MIN_PREMIUM_SELL:
-                signals.append({
-                    'type': 'SELL_CE_SURV',
-                    'strike': ce_strike,
-                    'premium': g['price'],
-                    'greeks': g,
-                    'reason': f"Survivor: CE sell at {ce_strike:.0f} dist={distance:.0f} "
-                              f"gap={gap:.0f} sup={support:.0f}",
-                    'target': g['price'] * 0.3,
-                    'sl': g['price'] * 0.8,
-                })
+            # v10.7: Live LTP via select_strike_live with target_strike — no BS fallback
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_SELL, target_strike=ce_strike)
+            if opt:
+                g = opt['greeks']
+                ce_strike = opt['strike']
+                if g['price'] > MCX_MIN_PREMIUM_SELL:
+                    signals.append({
+                        'type': 'SELL_CE_SURV',
+                        'strike': ce_strike,
+                        'premium': g['price'],
+                        'greeks': g,
+                        'reason': f"Survivor: CE sell at {ce_strike:.0f} dist={distance:.0f} "
+                                  f"gap={gap:.0f} sup={support:.0f} [LIVE]",
+                        'target': g['price'] * 0.3,
+                        'sl': g['price'] * 0.8,
+                    })
+            else:
+                logger.info(f"  SURV_SKIP_NO_LIVE: {commodity} CE sell at {ce_strike:.0f} — no live LTP available")
 
         return signals
 
@@ -3258,23 +3330,28 @@ class CommodityPaperTrader:
 
             spec = COMMODITIES[commodity]
 
-            # ---- v10.6: GREEKS REFRESH — Recalculate every 5 min during hold ----
+            # ---- v10.7: GREEKS REFRESH — Use greeks_from_market_price_b76 with current premium ----
             _last_refresh = pos.get('greeks_refreshed_at')
             _should_refresh = (_last_refresh is None or
                               (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= MCX_GREEKS_REFRESH_INTERVAL_SECONDS)
-            if _should_refresh and pos.get('strike') and pos.get('iv'):
+            if _should_refresh and pos.get('strike'):
                 try:
                     _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
                     _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
                     _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
-                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
-                    _g = black76_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
-                    pos['delta'] = round(_g['delta'], 4)
-                    pos['gamma'] = round(_g['gamma'], 6)
-                    pos['theta'] = round(_g['theta'], 4)
-                    pos['greeks_refreshed_at'] = datetime.now().isoformat()
-                    logger.debug(f"  MCX_GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
-                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr)")
+                    _current_premium = pos.get('current_premium', pos['entry_premium'])
+                    if _current_premium > 0:
+                        _g = greeks_from_market_price_b76(_current_premium, spot, pos['strike'], _T, RISK_FREE_RATE, _opt_type)
+                        if _g:
+                            pos['delta'] = round(_g['delta'], 4)
+                            pos['gamma'] = round(_g['gamma'], 6)
+                            pos['theta'] = round(_g['theta'], 4)
+                            pos['iv'] = round(_g['iv'] * 100, 1) if _g.get('iv') else pos.get('iv', 0)
+                            pos['greeks_refreshed_at'] = datetime.now().isoformat()
+                            logger.debug(f"  MCX_GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
+                                        f"Th={_g['theta']:.3f} IV={_g.get('iv', 0)*100:.1f}% (T={_T:.4f}yr) [LIVE]")
+                        else:
+                            logger.debug(f"  MCX_GREEKS_REFRESH: {pos['id']} IV solve failed for premium={_current_premium:.2f}")
                 except Exception as e:
                     logger.debug(f"  MCX_GREEKS_REFRESH_ERR: {pos.get('id', '?')} — {e}")
 

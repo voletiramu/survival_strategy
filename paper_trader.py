@@ -2164,16 +2164,17 @@ class StrategyEngine:
         except Exception:
             return None
 
-    def _get_strike_from_chain(self, symbol, spot, opt_type, dte):
+    def _get_strike_from_chain(self, symbol, spot, opt_type, dte, target_strike=None):
         """v5: Get optimal strike from live option chain with caching.
 
         Uses Angel option chain API to select strike with best OI/liquidity.
         Falls back to mathematical derivation if API unavailable.
         Caches results for 5 minutes to avoid excessive API calls.
+        v11.2: target_strike param — if set, fetch LTP for that specific strike (for SELL signals).
 
         Returns: (strike, real_ltp, real_iv) tuple
         """
-        cache_key = f"{symbol}_{opt_type}"
+        cache_key = f"{symbol}_{opt_type}" + (f"_{target_strike}" if target_strike else "")
         now = time.time()
 
         # Check cache (5 min TTL for chain hits, 30s for fallbacks — v9.3)
@@ -2193,20 +2194,35 @@ class StrategyEngine:
             try:
                 expiry = self._get_nearest_expiry(symbol)
                 if expiry:
-                    result = self.angel.select_optimal_strike(
-                        symbol, spot, opt_type, expiry_date=expiry
-                    )
-                    if result and result.get('strike', 0) > 0:
-                        self._strike_cache[cache_key] = {
-                            'strike': result['strike'],
-                            'ltp': result.get('ltp', 0),
-                            'iv': result.get('iv', 0),
-                            'time': now,
-                        }
-                        return result['strike'], result.get('ltp', 0), result.get('iv', 0)
+                    if target_strike:
+                        # v11.2: Fetch LTP for specific strike (SELL signals)
+                        token_info = self.angel.find_option_tokens(symbol, None, target_strike, opt_type)
+                        if token_info:
+                            exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
+                            self.angel._throttle()
+                            mkt = self.angel.get_market_data(exchange, str(token_info.get('token', '')))
+                            if mkt:
+                                ltp = float(mkt.get('ltp', 0) or 0)
+                                if ltp > 0:
+                                    self._strike_cache[cache_key] = {
+                                        'strike': target_strike, 'ltp': ltp, 'iv': 0, 'time': now,
+                                    }
+                                    return target_strike, ltp, 0
                     else:
-                        logger.info(f"  ANGEL_STRIKE_EMPTY: {symbol} {opt_type} expiry={expiry} — "
-                                   f"no valid strike from optionGreek API")
+                        result = self.angel.select_optimal_strike(
+                            symbol, spot, opt_type, expiry_date=expiry
+                        )
+                        if result and result.get('strike', 0) > 0:
+                            self._strike_cache[cache_key] = {
+                                'strike': result['strike'],
+                                'ltp': result.get('ltp', 0),
+                                'iv': result.get('iv', 0),
+                                'time': now,
+                            }
+                            return result['strike'], result.get('ltp', 0), result.get('iv', 0)
+                        else:
+                            logger.info(f"  ANGEL_STRIKE_EMPTY: {symbol} {opt_type} expiry={expiry} — "
+                                       f"no valid strike from optionGreek API")
                 else:
                     logger.info(f"  ANGEL_STRIKE_NO_EXPIRY: {symbol} — no future expiry found")
             except Exception as e:
@@ -2218,15 +2234,22 @@ class StrategyEngine:
                 chain = self.market_pipeline.get_option_chain(symbol)
                 if chain:
                     contracts = chain.get(opt_type, [])
-                    # Find ATM contract closest to spot with real LTP
+                    # v11.2: If target_strike specified, find that exact strike
                     best = None
                     best_dist = float('inf')
-                    for c in contracts:
-                        if c.get('ltp', 0) > 0:
-                            dist = abs(c['strike'] - spot)
-                            if dist < best_dist:
-                                best_dist = dist
+                    if target_strike:
+                        for c in contracts:
+                            if c.get('ltp', 0) > 0 and c['strike'] == target_strike:
                                 best = c
+                                break
+                    else:
+                        # Find ATM contract closest to spot with real LTP
+                        for c in contracts:
+                            if c.get('ltp', 0) > 0:
+                                dist = abs(c['strike'] - spot)
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best = c
                     if best:
                         self._strike_cache[cache_key] = {
                             'strike': best['strike'],
@@ -2300,17 +2323,19 @@ class StrategyEngine:
                            f"(body={intraday_body:.0f}, spot={spot:.0f}<VWAP={vwap:.0f})")
             else:
                 ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
-                if premium > MIN_PREMIUM_BUY:
-                    signals.append({
-                        'type': 'BUY_CE_CPR',
-                        'strike': ce_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
-                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                if chain_ltp <= 0:
+                    logger.info(f"  CPR_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
+                else:
+                    use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                    g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                    premium = chain_ltp
+                    if premium > MIN_PREMIUM_BUY:
+                        signals.append({
+                            'type': 'BUY_CE_CPR',
+                            'strike': ce_strike,
+                            'premium': premium,
+                            'greeks': g,
+                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f} [LIVE]",
                         'target': premium * target_hit_mult if ohlc['high'] > ind['cam_r3'] else premium * target_base_mult,
                         'sl': premium * sl_mult,
                     })
@@ -2325,17 +2350,19 @@ class StrategyEngine:
                            f"(body={intraday_body:+.0f}, spot={spot:.0f}>VWAP={vwap:.0f})")
             else:
                 pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
-                if premium > MIN_PREMIUM_BUY:
-                    signals.append({
-                        'type': 'BUY_PE_CPR',
-                        'strike': pe_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
-                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                if chain_ltp <= 0:
+                    logger.info(f"  CPR_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
+                else:
+                    use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                    g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                    premium = chain_ltp
+                    if premium > MIN_PREMIUM_BUY:
+                        signals.append({
+                            'type': 'BUY_PE_CPR',
+                            'strike': pe_strike,
+                            'premium': premium,
+                            'greeks': g,
+                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f} [LIVE]",
                         'target': premium * target_hit_mult if ohlc['low'] < ind['cam_s3'] else premium * target_base_mult,
                         'sl': premium * sl_mult,
                     })
@@ -2345,31 +2372,35 @@ class StrategyEngine:
             margin_ok = self.portfolio.capital >= MARGIN_PER_LOT.get(symbol, 120000)
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_interval) * strike_interval
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-                if g['price'] > MIN_PREMIUM_SELL:
-                    signals.append({
-                        'type': 'SELL_CE_CPR',
-                        'strike': ce_strike,
-                        'premium': g['price'],
-                        'greeks': g,
-                        'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at R3={ind['cam_r3']:.0f}",
-                        'target': g['price'] * 0.3,
-                        'sl': g['price'] * 1.2,
-                    })
+                _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte, target_strike=ce_strike)
+                if sell_ltp > 0:
+                    g = greeks_from_market_price(sell_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE')
+                    if sell_ltp > MIN_PREMIUM_SELL:
+                        signals.append({
+                            'type': 'SELL_CE_CPR',
+                            'strike': ce_strike,
+                            'premium': sell_ltp,
+                            'greeks': g,
+                            'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at R3={ind['cam_r3']:.0f} [LIVE]",
+                            'target': sell_ltp * 0.3,
+                            'sl': sell_ltp * 1.2,
+                        })
 
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_interval) * strike_interval
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-                if g['price'] > MIN_PREMIUM_SELL:
-                    signals.append({
-                        'type': 'SELL_PE_CPR',
-                        'strike': pe_strike,
-                        'premium': g['price'],
-                        'greeks': g,
-                        'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at S3={ind['cam_s3']:.0f}",
-                        'target': g['price'] * 0.3,
-                        'sl': g['price'] * 1.2,
-                    })
+                _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte, target_strike=pe_strike)
+                if sell_ltp > 0:
+                    g = greeks_from_market_price(sell_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE')
+                    if sell_ltp > MIN_PREMIUM_SELL:
+                        signals.append({
+                            'type': 'SELL_PE_CPR',
+                            'strike': pe_strike,
+                            'premium': sell_ltp,
+                            'greeks': g,
+                            'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at S3={ind['cam_s3']:.0f} [LIVE]",
+                            'target': sell_ltp * 0.3,
+                            'sl': sell_ltp * 1.2,
+                        })
 
         return signals
 
@@ -2430,18 +2461,20 @@ class StrategyEngine:
                     logger.info(f"  GAMMA_DIR_SKIP: {symbol} CE up body={body:.0f} but spot={spot:.0f}<VWAP={vwap:.0f}")
                 else:
                     ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                    use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                    g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                    premium = chain_ltp if chain_ltp > 0 else g['price']
-                    if premium > MIN_PREMIUM_BUY:
-                        signals.append({
-                            'type': 'BUY_CE_GAMMA',
-                            'strike': ce_strike,
-                            'premium': premium,
-                            'greeks': g,
-                            'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
-                                      f"ATR={atr:.0f} range={day_range:.2f}x"
-                                      f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                    if chain_ltp <= 0:
+                        logger.info(f"  GAMMA_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
+                    else:
+                        use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                        g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                        premium = chain_ltp
+                        if premium > MIN_PREMIUM_BUY:
+                            signals.append({
+                                'type': 'BUY_CE_GAMMA',
+                                'strike': ce_strike,
+                                'premium': premium,
+                                'greeks': g,
+                                'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
+                                          f"ATR={atr:.0f} range={day_range:.2f}x [LIVE]",
                             'target': premium * target_mult,
                             'sl': premium * sl_mult,
                         })
@@ -2451,18 +2484,20 @@ class StrategyEngine:
                     logger.info(f"  GAMMA_DIR_SKIP: {symbol} PE down body={body:.0f} but spot={spot:.0f}>VWAP={vwap:.0f}")
                 else:
                     pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                    use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                    g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                    premium = chain_ltp if chain_ltp > 0 else g['price']
-                    if premium > MIN_PREMIUM_BUY:
-                        signals.append({
-                            'type': 'BUY_PE_GAMMA',
-                            'strike': pe_strike,
-                            'premium': premium,
-                            'greeks': g,
-                            'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
-                                      f"ATR={atr:.0f} range={day_range:.2f}x"
-                                      f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                    if chain_ltp <= 0:
+                        logger.info(f"  GAMMA_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
+                    else:
+                        use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                        g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                        premium = chain_ltp
+                        if premium > MIN_PREMIUM_BUY:
+                            signals.append({
+                                'type': 'BUY_PE_GAMMA',
+                                'strike': pe_strike,
+                                'premium': premium,
+                                'greeks': g,
+                                'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
+                                          f"ATR={atr:.0f} range={day_range:.2f}x [LIVE]",
                             'target': premium * target_mult,
                             'sl': premium * sl_mult,
                         })
@@ -2577,9 +2612,12 @@ class StrategyEngine:
                 # Entry at 50% of zone (institutional limit order level)
                 entry_at_mid = zone_mid
                 ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+                if chain_ltp <= 0:
+                    logger.info(f"  GTZ_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
+                    continue
                 use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
+                g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp
 
                 if premium > MIN_PREMIUM_BUY:
                     signals.append({
@@ -2589,8 +2627,7 @@ class StrategyEngine:
                         'greeks': g,
                         'reason': f"GTZ v7 Demand: zone={zone_low:.0f}-{zone_high:.0f} "
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
-                                  f"{oi_label}{exhaustion_label}"
-                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                                  f"{oi_label}{exhaustion_label} [LIVE]",
                         'target': premium * 1.5,  # v7.5: realistic intraday target (was 2.5x)
                         'sl': premium * 0.35,      # SL below zone
                     })
@@ -2618,9 +2655,12 @@ class StrategyEngine:
                     continue  # No OI data AND no price-action strength — skip
 
                 pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+                if chain_ltp <= 0:
+                    logger.info(f"  GTZ_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
+                    continue
                 use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                premium = chain_ltp if chain_ltp > 0 else g['price']
+                g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp
 
                 if premium > MIN_PREMIUM_BUY:
                     signals.append({
@@ -2630,8 +2670,7 @@ class StrategyEngine:
                         'greeks': g,
                         'reason': f"GTZ v7 Supply: zone={zone_low:.0f}-{zone_high:.0f} "
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
-                                  f"{oi_label}"
-                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                                  f"{oi_label} [LIVE]",
                         'target': premium * 1.5,  # v7.5: realistic intraday target
                         'sl': premium * 0.35,
                     })
@@ -2663,39 +2702,43 @@ class StrategyEngine:
         # v11: Corrected PCR thresholds — high PCR = institutions selling puts = bullish
         if pcr > 1.10 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
             ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-            use_iv = chain_iv if chain_iv > 0 else ind['iv']
-            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-            premium = chain_ltp if chain_ltp > 0 else g['price']
-            if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
-                signals.append({
-                    'type': 'BUY_CE',
-                    'strike': ce_strike,
-                    'premium': premium,
-                    'greeks': g,
-                    'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
-                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
-                    'target': premium * 1.5,  # v7.5: realistic intraday target
-                    'sl': premium * 0.4,
-                })
+            if chain_ltp <= 0:
+                logger.info(f"  PCR_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
+            else:
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp
+                if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
+                    signals.append({
+                        'type': 'BUY_CE',
+                        'strike': ce_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f} [LIVE]",
+                        'target': premium * 1.5,  # v7.5: realistic intraday target
+                        'sl': premium * 0.4,
+                    })
 
         # BUY PE: PCR < 0.80 (bearish — call writers dominating), near VWAP
         # v11: Corrected PCR thresholds — low PCR = institutions selling calls = bearish
         elif pcr < 0.80 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
             pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-            use_iv = chain_iv if chain_iv > 0 else ind['iv']
-            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-            premium = chain_ltp if chain_ltp > 0 else g['price']
-            if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
-                signals.append({
-                    'type': 'BUY_PE',
-                    'strike': pe_strike,
-                    'premium': premium,
-                    'greeks': g,
-                    'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
-                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
-                    'target': premium * 1.5,  # v7.5: realistic intraday target
-                    'sl': premium * 0.4,
-                })
+            if chain_ltp <= 0:
+                logger.info(f"  PCR_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
+            else:
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp
+                if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
+                    signals.append({
+                        'type': 'BUY_PE',
+                        'strike': pe_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f} [LIVE]",
+                        'target': premium * 1.5,  # v7.5: realistic intraday target
+                        'sl': premium * 0.4,
+                    })
 
         return signals
 
@@ -2799,41 +2842,45 @@ class StrategyEngine:
         # Generate signal
         if bear_score >= TR_MIN_SCORE:
             pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-            use_iv = chain_iv if chain_iv > 0 else ind['iv']
-            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-            premium = chain_ltp if chain_ltp > 0 else g['price']
-            if premium > MIN_PREMIUM_BUY:
-                reason_str = '+'.join(bear_r)
-                signals.append({
-                    'type': 'BUY_PE',
-                    'strike': pe_strike,
-                    'premium': premium,
-                    'greeks': g,
-                    'reason': f"TrendRider DN {reason_str} sc={bear_score}"
-                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
-                    'target': premium * TR_TARGET_MULT,
-                    'sl': premium * TR_SL_MULT,
-                    'trend_rider_score': bear_score,
-                })
+            if chain_ltp <= 0:
+                logger.info(f"  TR_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
+            else:
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp
+                if premium > MIN_PREMIUM_BUY:
+                    reason_str = '+'.join(bear_r)
+                    signals.append({
+                        'type': 'BUY_PE',
+                        'strike': pe_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"TrendRider DN {reason_str} sc={bear_score} [LIVE]",
+                        'target': premium * TR_TARGET_MULT,
+                        'sl': premium * TR_SL_MULT,
+                        'trend_rider_score': bear_score,
+                    })
 
         elif bull_score >= TR_MIN_SCORE:
             ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-            use_iv = chain_iv if chain_iv > 0 else ind['iv']
-            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-            premium = chain_ltp if chain_ltp > 0 else g['price']
-            if premium > MIN_PREMIUM_BUY:
-                reason_str = '+'.join(bull_r)
-                signals.append({
-                    'type': 'BUY_CE',
-                    'strike': ce_strike,
-                    'premium': premium,
-                    'greeks': g,
-                    'reason': f"TrendRider UP {reason_str} sc={bull_score}"
-                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
-                    'target': premium * TR_TARGET_MULT,
-                    'sl': premium * TR_SL_MULT,
-                    'trend_rider_score': bull_score,
-                })
+            if chain_ltp <= 0:
+                logger.info(f"  TR_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
+            else:
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp
+                if premium > MIN_PREMIUM_BUY:
+                    reason_str = '+'.join(bull_r)
+                    signals.append({
+                        'type': 'BUY_CE',
+                        'strike': ce_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"TrendRider UP {reason_str} sc={bull_score} [LIVE]",
+                        'target': premium * TR_TARGET_MULT,
+                        'sl': premium * TR_SL_MULT,
+                        'trend_rider_score': bull_score,
+                    })
 
         return signals
 
@@ -2873,33 +2920,35 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         if ohlc['high'] > ind['resistance'] + gap:
             pe_strike = round((spot - distance) / strike_interval) * strike_interval
-            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
-            if g['price'] > MIN_PREMIUM_SELL:
+            _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte, target_strike=pe_strike)
+            if sell_ltp > 0 and sell_ltp > MIN_PREMIUM_SELL:
+                g = greeks_from_market_price(sell_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE')
                 signals.append({
                     'type': 'SELL_PE',
                     'strike': pe_strike,
-                    'premium': g['price'],
+                    'premium': sell_ltp,
                     'greeks': g,
                     'reason': f"Survivor: PE sell at {pe_strike:.0f} "
-                              f"dist={distance:.0f} gap={gap:.0f} res={ind['resistance']:.0f}",
-                    'target': g['price'] * 0.3,
-                    'sl': g['price'] * 0.8,
+                              f"dist={distance:.0f} gap={gap:.0f} res={ind['resistance']:.0f} [LIVE]",
+                    'target': sell_ltp * 0.3,
+                    'sl': sell_ltp * 0.8,
                 })
 
         # CE SELLING - price breaks below support
         if ohlc['low'] < ind['support'] - gap:
             ce_strike = round((spot + distance) / strike_interval) * strike_interval
-            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
-            if g['price'] > MIN_PREMIUM_SELL:
+            _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte, target_strike=ce_strike)
+            if sell_ltp > 0 and sell_ltp > MIN_PREMIUM_SELL:
+                g = greeks_from_market_price(sell_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE')
                 signals.append({
                     'type': 'SELL_CE',
                     'strike': ce_strike,
-                    'premium': g['price'],
+                    'premium': sell_ltp,
                     'greeks': g,
                     'reason': f"Survivor: CE sell at {ce_strike:.0f} "
-                              f"dist={distance:.0f} gap={gap:.0f} sup={ind['support']:.0f}",
-                    'target': g['price'] * 0.3,
-                    'sl': g['price'] * 0.8,
+                              f"dist={distance:.0f} gap={gap:.0f} sup={ind['support']:.0f} [LIVE]",
+                    'target': sell_ltp * 0.3,
+                    'sl': sell_ltp * 0.8,
                 })
 
         return signals
@@ -4522,13 +4571,19 @@ class PaperTrader:
             _last_refresh = pos.get('greeks_refreshed_at')
             _should_refresh = (_last_refresh is None or
                               (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= GREEKS_REFRESH_INTERVAL_SECONDS)
-            if _should_refresh and pos.get('strike') and pos.get('iv'):
+            if _should_refresh and pos.get('strike'):
                 try:
                     _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
                     _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
                     _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
-                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
-                    _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                    # v11.2: Use live LTP for greeks instead of stale BS model
+                    _curr_prem_for_greeks = pos.get('current_premium', pos['entry_premium'])
+                    if _curr_prem_for_greeks > 0:
+                        _g = greeks_from_market_price(_curr_prem_for_greeks, spot, pos['strike'], _T, RISK_FREE_RATE, _opt_type)
+                    else:
+                        _iv = pos.get('iv', 0.15)
+                        _iv = _iv / 100 if _iv > 1 else _iv
+                        _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
                     pos['delta'] = round(_g['delta'], 4)
                     pos['gamma'] = round(_g['gamma'], 6)
                     pos['theta'] = round(_g['theta'], 4)
@@ -4588,12 +4643,15 @@ class PaperTrader:
                 current_premium = real_option_ltp
                 premium_source = 'MARKET'
             else:
-                # Fallback: delta+gamma+theta approximation
+                # v11.2: Fallback approximation — only for premium tracking, NOT for entry/exit decisions
                 premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
                 theta_val = pos.get('theta', 0)
                 time_decay = theta_val * (hours_held / 24)
                 current_premium = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
                 premium_source = 'APPROX'
+                if hours_held > 0.5:  # Only warn after 30 min without live data
+                    logger.warning(f"  NO_LIVE_LTP: {pos['id']} using approx premium Rs {current_premium:.2f} "
+                                  f"(no market data for {hours_held:.1f}h)")
 
             self.portfolio.update_position(pos['id'], current_premium)
 

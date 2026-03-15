@@ -116,7 +116,7 @@ VIX_BLOCK_LOW = 11
 # v10.6: Greeks Refresh + Theta Decay Exit
 GREEKS_REFRESH_INTERVAL_SECONDS = 300
 THETA_BURDEN_TIGHTEN_PCT = 5.0
-THETA_BURDEN_EXIT_PCT = 10.0
+THETA_BURDEN_EXIT_PCT = 999.0  # v11.1: Disabled — BS theta kills winners near expiry (same fix as equity bot)
 THETA_TIGHTEN_SL_FACTOR = 0.90
 
 # Cooldowns & Limits
@@ -2591,19 +2591,29 @@ class StockPaperTrader:
             _last_refresh = pos.get('greeks_refreshed_at')
             _should_refresh = (_last_refresh is None or
                               (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= GREEKS_REFRESH_INTERVAL_SECONDS)
-            if _should_refresh and pos.get('strike') and pos.get('iv'):
+            if _should_refresh and pos.get('strike'):
                 try:
                     _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
                     _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
                     _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
-                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
-                    _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                    # v11.3: Use greeks_from_market_price with current_premium instead of
+                    # bs_greeks with stale entry IV — gives accurate real-time greeks
+                    _curr_prem = pos.get('current_premium', pos['entry_premium'])
+                    _g = greeks_from_market_price(_curr_prem, spot, pos['strike'], _T, RISK_FREE_RATE, _opt_type)
+                    if _g is None:
+                        # IV solve failed — fallback to bs_greeks with stored IV
+                        _iv = pos['iv'] / 100 if pos.get('iv', 0) > 1 else pos.get('iv', 0.25)
+                        _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                        logger.debug(f"  GREEKS_REFRESH_IVFAIL: {pos['id']} — IV solve failed, using stored IV={_iv:.3f}")
+                    else:
+                        # Update stored IV with freshly solved value
+                        pos['iv'] = round(_g.get('iv', pos.get('iv', 0.25)), 6)
                     pos['delta'] = round(_g['delta'], 4)
                     pos['gamma'] = round(_g['gamma'], 6)
                     pos['theta'] = round(_g['theta'], 4)
                     pos['greeks_refreshed_at'] = datetime.now().isoformat()
-                    logger.debug(f"  GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
-                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr)")
+                    logger.debug(f"  GREEKS_REFRESH: {pos['id']} [LIVE] D={_g['delta']:.3f} G={_g['gamma']:.5f} "
+                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr, prem={_curr_prem:.2f})")
                 except Exception as e:
                     logger.debug(f"  GREEKS_REFRESH_ERR: {pos.get('id', '?')} — {e}")
 
@@ -3571,19 +3581,26 @@ class StockPaperTrader:
                 skipped += 1
                 continue
 
-            # Compute Greeks for the selected strike
+            # Compute Greeks for the selected strike — v11.3: use greeks_from_market_price
+            # with live entry_premium instead of bs_greeks with stale IV
             dte = get_dte_monthly()
             T = max(dte, 1) / 365
-            iv_for_greeks = entry_iv if entry_iv > 0 else 0.25
-            if iv_for_greeks < 1:
-                pass  # already in decimal
-            else:
-                iv_for_greeks = iv_for_greeks / 100  # convert from pct
 
             try:
-                g = bs_greeks(spot, strike, T, RISK_FREE_RATE, iv_for_greeks, opt_type)
+                g = greeks_from_market_price(entry_premium, spot, strike, T, RISK_FREE_RATE, opt_type)
+                if g is None:
+                    # IV solve failed — use entry_iv as fallback for greeks only
+                    iv_for_greeks = entry_iv if entry_iv > 0 else 0.25
+                    if iv_for_greeks >= 1:
+                        iv_for_greeks = iv_for_greeks / 100
+                    g = bs_greeks(spot, strike, T, RISK_FREE_RATE, iv_for_greeks, opt_type)
+                    logger.debug(f"  GREEKS_IV_SOLVE_FAIL: {symbol} {strike}{opt_type} — "
+                                f"using bs_greeks with entry_iv={iv_for_greeks:.3f}")
             except Exception:
                 g = {'delta': 0.5, 'gamma': 0, 'theta': 0, 'price': entry_premium}
+            iv_for_greeks = g.get('iv', entry_iv if entry_iv > 0 else 0.25)
+            if iv_for_greeks >= 1:
+                iv_for_greeks = iv_for_greeks / 100
 
             # Set target and SL from signal
             target_mult = sig.get('target_mult', 1.5)
@@ -3809,9 +3826,9 @@ class StockPaperTrader:
                 symbol = sig.get('symbol', '')
                 sig_key = f"{sig.get('strategy', '')}_{symbol}_{sig.get('strike', 0)}"
 
-                # Determine data source (real chain vs Black-Scholes)
+                # Determine data source (real chain vs no-data)
                 oi_val = sig.get('oi', 0)
-                data_source = 'REAL_CHAIN' if oi_val and oi_val > 0 else 'BLACK_SCHOLES'
+                data_source = 'LIVE' if oi_val and oi_val > 0 else 'NO_OI_DATA'
 
                 rows.append({
                     'timestamp': datetime.now().isoformat(),
