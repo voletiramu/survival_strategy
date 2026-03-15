@@ -685,6 +685,7 @@ class StockAngelConnection:
         self._auth_time = 0           # v9.2: Track when we last authenticated
         self._app_type = 'Historical' # v9.2: Remember app type for reconnect
         self.market_pipeline = None   # v10.5: NSE pipeline for stock option chain fallback
+        self.truedata = None          # v11.2: TrueData feed (set by StockPaperTrader)
         self._reconnecting = False    # v9.2: Prevent recursive reconnect loops
 
     def load_credentials(self):
@@ -1184,11 +1185,87 @@ class StockAngelConnection:
         best = None
         best_score = -1
 
+        # v11.2: Data source priority: 1) TrueData, 2) NSE/BSE pipeline, 3) Angel API
+
+        # Source 1: TrueData option chain (primary)
+        if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
+            try:
+                td_chain = self.truedata.get_option_chain(name)
+                if td_chain:
+                    contracts = td_chain.get(opt_type, [])
+                    td_best = None
+                    td_best_oi = -1
+                    for c in contracts:
+                        c_strike = c.get('strike', 0)
+                        if c_strike not in candidates:
+                            continue
+                        c_ltp = c.get('ltp', 0)
+                        c_oi = c.get('oi', 0)
+                        if c_ltp <= 0:
+                            continue
+                        if c_oi > td_best_oi:
+                            td_best_oi = c_oi
+                            td_best = {
+                                'strike': c_strike,
+                                'ltp': c_ltp,
+                                'oi': c_oi,
+                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
+                                'volume': c.get('volume', 0),
+                            }
+                    if td_best:
+                        token_info = self.find_option_tokens(name, None, td_best['strike'], opt_type)
+                        if token_info:
+                            td_best['token'] = str(token_info.get('token', ''))
+                            td_best['symbol'] = token_info.get('symbol', '')
+                        logger.info(f"  TRUEDATA_STRIKE: {name} {opt_type} ATM={atm_strike} "
+                                    f"Selected={td_best['strike']} OI={td_best['oi']:,.0f} "
+                                    f"LTP={td_best['ltp']:.2f} [TrueData]")
+                        return td_best
+            except Exception as e:
+                logger.debug(f"[TrueData] Strike lookup failed for {name}: {e}")
+
+        # Source 2: NSE/BSE pipeline (most reliable, no API auth needed)
+        if hasattr(self, 'market_pipeline') and self.market_pipeline:
+            try:
+                chain = self.market_pipeline.get_stock_option_chain(name)
+                if chain:
+                    contracts = chain.get(opt_type, [])
+                    nse_best = None
+                    nse_best_oi = -1
+                    for c in contracts:
+                        c_strike = c.get('strike', 0)
+                        if c_strike not in candidates:
+                            continue
+                        c_ltp = c.get('ltp', 0)
+                        c_oi = c.get('oi', 0)
+                        if c_ltp <= 0:
+                            continue
+                        if c_oi > nse_best_oi:
+                            nse_best_oi = c_oi
+                            nse_best = {
+                                'strike': c_strike,
+                                'ltp': c_ltp,
+                                'oi': c_oi,
+                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
+                                'volume': c.get('volume', 0),
+                            }
+                    if nse_best:
+                        # Find token for this strike
+                        token_info = self.find_option_tokens(name, None, nse_best['strike'], opt_type)
+                        if token_info:
+                            nse_best['token'] = str(token_info.get('token', ''))
+                            nse_best['symbol'] = token_info.get('symbol', '')
+                        logger.info(f"  NSE_STRIKE: {name} {opt_type} ATM={atm_strike} "
+                                    f"Selected={nse_best['strike']} OI={nse_best['oi']:,.0f} "
+                                    f"LTP={nse_best['ltp']:.2f} [NSE Pipeline]")
+                        return nse_best
+            except Exception as e:
+                logger.debug(f"  NSE_STRIKE_ERR: {name} {opt_type} — {e}")
+
+        # Source 3: Angel API option chain (fallback when TrueData + NSE/BSE pipeline unavailable)
         # v10.3: Try NFO first, then BFO if optionGreek returns empty
-        # Some stocks (SUNPHARMA, LAURUSLABS) return empty from NFO API
         exchanges_to_try = ['NFO']
         if not expiry_date:
-            # If no expiry provided, try to get one from NFO first, then BFO
             expiry_date = self._get_nearest_expiry(name, exchange='NFO')
             if not expiry_date:
                 expiry_date = self._get_nearest_expiry(name, exchange='BFO')
@@ -1293,44 +1370,6 @@ class StockAngelConnection:
 
         except Exception as e:
             logger.error(f"Option chain strike selection error for {name}: {e}")
-
-        # v10.5: NSE pipeline fallback — try NSE option chain when Angel fails
-        if hasattr(self, 'market_pipeline') and self.market_pipeline:
-            try:
-                chain = self.market_pipeline.get_stock_option_chain(name)
-                if chain:
-                    contracts = chain.get(opt_type, [])
-                    nse_best = None
-                    nse_best_oi = -1
-                    for c in contracts:
-                        c_strike = c.get('strike', 0)
-                        if c_strike not in candidates:
-                            continue
-                        c_ltp = c.get('ltp', 0)
-                        c_oi = c.get('oi', 0)
-                        if c_ltp <= 0:
-                            continue
-                        if c_oi > nse_best_oi:
-                            nse_best_oi = c_oi
-                            nse_best = {
-                                'strike': c_strike,
-                                'ltp': c_ltp,
-                                'oi': c_oi,
-                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
-                                'volume': c.get('volume', 0),
-                            }
-                    if nse_best:
-                        # Find token for this strike
-                        token_info = self.find_option_tokens(name, None, nse_best['strike'], opt_type)
-                        if token_info:
-                            nse_best['token'] = str(token_info.get('token', ''))
-                            nse_best['symbol'] = token_info.get('symbol', '')
-                        logger.info(f"  NSE_FALLBACK: {name} {opt_type} ATM={atm_strike} "
-                                    f"Selected={nse_best['strike']} OI={nse_best['oi']:,.0f} "
-                                    f"LTP={nse_best['ltp']:.2f} [NSE Pipeline]")
-                        return nse_best
-            except Exception as e:
-                logger.debug(f"  NSE_FALLBACK_ERR: {name} {opt_type} — {e}")
 
         # No live data available — SKIP this stock (NO Black-Scholes fallback)
         logger.warning(f"  SKIP_NO_LIVE_DATA: {name} {opt_type} ATM={atm_strike} — "
@@ -2013,6 +2052,22 @@ class StockPaperTrader:
         self.data_logger = None  # v10.2e: Live data logger for backtesting
         self.market_pipeline = None  # v10.5: NSE pipeline for stock option chain fallback
 
+        # v11.2: TrueData as Source 1 for option chain + LTP
+        self.truedata = None
+        try:
+            from truedata_feed import TrueDataFeed
+            self.truedata = TrueDataFeed()
+            if self.truedata.connect():
+                logger.info("[TrueData] Initialized as Source 1 for stock option chain + LTP")
+            else:
+                self.truedata = None
+                logger.warning("[TrueData] Connection failed — falling back to NSE/BSE + Angel")
+        except Exception as e:
+            logger.warning(f"[TrueData] Not available: {e} — falling back to NSE/BSE + Angel")
+
+        # Wire TrueData into StockAngelConnection for select_optimal_strike
+        self.angel.truedata = self.truedata
+
         # v10.5b: Regime detector (same as equity/commodity)
         self.regime_detector = RegimeDetector()
         self._last_logged_regime = {}
@@ -2238,6 +2293,19 @@ class StockPaperTrader:
         if cached and (datetime.now() - cached['time']).total_seconds() < 15:
             return cached['ltp']
 
+        # v11.2: Source 1 — TrueData option LTP (primary)
+        if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
+            try:
+                symbol = pos.get('stock_symbol', pos.get('symbol', ''))
+                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                td_ltp = self.truedata.get_option_ltp(symbol, pos['strike'], opt_type)
+                if td_ltp and td_ltp > 0:
+                    self._option_ltp_cache[cache_key] = {'ltp': td_ltp, 'time': datetime.now()}
+                    return td_ltp
+            except Exception as e:
+                logger.debug(f"  [TrueData] Option LTP failed: {e}")
+
+        # Source 2: Angel API LTP
         try:
             ltp = self.angel.get_ltp(exchange, option_token)
             if ltp and ltp > 0:
@@ -2246,7 +2314,7 @@ class StockPaperTrader:
         except Exception as e:
             logger.debug(f"  Option LTP fetch failed for {cache_key}: {e}")
 
-        # v10.5: NSE pipeline fallback for exit LTP
+        # v10.5: Source 3 — NSE pipeline fallback for exit LTP
         if hasattr(self, 'market_pipeline') and self.market_pipeline:
             try:
                 symbol = pos.get('stock_symbol', pos.get('symbol', ''))

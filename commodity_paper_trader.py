@@ -981,7 +981,74 @@ class CommodityStrategyEngine:
         if target_strike:
             candidates.add(target_strike)
 
-        # --- Try live API greeks first ---
+        # --- Source 1: TrueData option chain (primary) ---
+        if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
+            try:
+                td_chain = self.truedata.get_option_chain(commodity)
+                if td_chain:
+                    contracts = td_chain.get(opt_type, [])
+                    if target_strike:
+                        # v10.7: If target_strike specified, find that exact strike (SELL signals)
+                        for c in contracts:
+                            if int(c['strike']) == int(target_strike) and c.get('ltp', 0) >= min_premium:
+                                result = {
+                                    'strike': int(c['strike']),
+                                    'greeks': {
+                                        'delta': 0,
+                                        'gamma': 0,
+                                        'theta': 0,
+                                        'vega': 0,
+                                        'iv': c.get('iv', 0),
+                                        'price': c['ltp'],
+                                    },
+                                }
+                                logger.info(f"  MCX_TD_TARGET: {commodity} {int(target_strike)}{opt_type} "
+                                           f"LTP={c['ltp']:.2f} IV={c.get('iv', 0):.3f} [TrueData]")
+                                return result
+                    else:
+                        # Score candidates same way as Angel API
+                        best_score = -1
+                        best = None
+                        for c in contracts:
+                            if c['strike'] not in candidates:
+                                continue
+                            ltp = c.get('ltp', 0)
+                            if ltp < min_premium:
+                                continue
+                            oi = c.get('oi', 0)
+                            volume = c.get('volume', 0)
+                            if oi < MIN_ENTRY_OI:
+                                logger.debug(f"  MCX_TD_SKIP_LOW_OI: {commodity} {int(c['strike'])}{opt_type} OI={oi:.0f}")
+                                continue
+                            # Without delta from TrueData chain, use ATM proximity as proxy
+                            moneyness = abs(c['strike'] - spot) / spot
+                            delta_proxy = max(0, 1 - moneyness * 20)  # ~0.5 at ATM, 0 at 5% OTM
+                            if delta_proxy < 0.1:
+                                continue
+                            oi_norm = min(oi / 100000, 1.0)
+                            vol_norm = min(volume / 10000, 1.0)
+                            score = (delta_proxy * 50) + (oi_norm * 30) + (vol_norm * 20)
+                            if score > best_score and ltp > 0:
+                                best_score = score
+                                best = {
+                                    'strike': int(c['strike']),
+                                    'greeks': {
+                                        'delta': 0,
+                                        'gamma': 0,
+                                        'theta': 0,
+                                        'vega': 0,
+                                        'iv': c.get('iv', 0),
+                                        'price': ltp,
+                                    },
+                                }
+                        if best:
+                            logger.info(f"  MCX_TD_STRIKE: {commodity} {opt_type} ATM={atm} "
+                                       f"Selected={best['strike']} LTP={best['greeks']['price']:.2f} [TrueData]")
+                            return best
+            except Exception as e:
+                logger.debug(f"  MCX_TD_CHAIN_ERR: {commodity} {opt_type} — {e}")
+
+        # --- Source 2: Angel API greeks ---
         if self.angel and self.angel._connected:
             try:
                 # v10.3d-3: Get nearest MCX expiry for API call (was missing → "Invalid expiry date")
@@ -2046,6 +2113,19 @@ class CommodityPaperTrader:
         self.engine = CommodityStrategyEngine(self.portfolio, self.angel)
         self._running = False
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
+        # v11.2: TrueData as Source 1 for MCX option chain + LTP
+        self.truedata = None
+        try:
+            from truedata_feed import TrueDataFeed
+            self.truedata = TrueDataFeed()
+            if self.truedata.connect():
+                logger.info("[TrueData] Initialized as Source 1 for MCX option chain + LTP")
+                self.engine.truedata = self.truedata
+            else:
+                self.truedata = None
+                logger.warning("[TrueData] Connection failed — falling back to Angel API")
+        except Exception as e:
+            logger.warning(f"[TrueData] Not available: {e} — falling back to Angel API")
         # Caches to reduce REST API calls
         self._option_ltp_cache = {}  # {cache_key: {'ltp': float, 'time': datetime}}
         self._ohlc_cache = {}  # v2.5.2: {commodity: {'data': ohlc_dict, 'time': datetime}}
@@ -2123,20 +2203,29 @@ class CommodityPaperTrader:
 
     def get_spot(self, commodity):
         """Get current spot price for commodity.
-        Priority: WebSocket cache -> REST API -> historical close.
+        Priority: TrueData -> WebSocket cache -> REST API -> historical close.
         """
-        # 1. Try WebSocket cache (instant, no API call)
+        # v11.2 Source 1: TrueData spot (primary)
+        if self.truedata and self.truedata.is_connected:
+            try:
+                td_spot = self.truedata.get_spot(commodity)
+                if td_spot and td_spot > 0:
+                    return td_spot
+            except Exception:
+                pass
+
+        # Source 2: WebSocket cache (instant, no API call)
         if self.ws_feed and commodity in self.angel._futures_tokens:
             ws_ltp = self.ws_feed.get_ltp(self.angel._futures_tokens[commodity])
             if ws_ltp:
                 return ws_ltp
 
-        # 2. Fallback: REST API
+        # Source 3: REST API
         ltp = self.angel.get_ltp(commodity)
         if ltp:
             return ltp
 
-        # 3. Fallback: historical close
+        # Source 4: historical close
         df = self.engine.historical_data.get(commodity)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
@@ -2213,16 +2302,27 @@ class CommodityPaperTrader:
                     if self.ws_feed and option_token:
                         self.ws_feed.subscribe_mcx_options([option_token])
 
+        # v11.2 Source 1: TrueData option LTP (primary, no rate limit)
+        if self.truedata and self.truedata.is_connected:
+            try:
+                commodity = pos['commodity']
+                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                td_ltp = self.truedata.get_option_ltp(commodity, pos['strike'], opt_type)
+                if td_ltp and td_ltp > 0:
+                    return td_ltp
+            except Exception:
+                pass
+
         if not option_token:
             return None
 
-        # v10.5 Source 1: WebSocket real-time LTP (instant, no rate limit)
+        # v10.5 Source 2: WebSocket real-time LTP (instant, no rate limit)
         if self.ws_feed:
             ws_ltp = self.ws_feed.get_ltp(str(option_token))
             if ws_ltp and ws_ltp > 0:
                 return ws_ltp
 
-        # Source 2: REST API with 5s cache
+        # Source 3: REST API with 5s cache
         cache_key = f"MCX_{option_token}"
         cached = self._option_ltp_cache.get(cache_key)
         if cached and (datetime.now() - cached['time']).total_seconds() < 5:

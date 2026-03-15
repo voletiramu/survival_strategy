@@ -1683,6 +1683,7 @@ class StrategyEngine:
         self.portfolio = portfolio
         self.historical_data = {}  # symbol -> DataFrame
         self.market_pipeline = None  # v9.6d: Set by PaperTrader if available
+        self.truedata = None  # v11.2: Set by PaperTrader if available
 
     def load_historical(self, symbol):
         """Load historical data for indicators. Auto-download if missing/stale."""
@@ -2189,7 +2190,78 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 50)
         fallback_strike = round(spot / strike_interval) * strike_interval
 
-        # Source 1: Angel API option chain (best for strike selection with OI/liquidity)
+        # v11.2: Data source priority: 1) TrueData, 2) NSE/BSE pipeline, 3) Angel API
+
+        # Source 1: TrueData option chain (primary — real-time WebSocket data)
+        if self.truedata and self.truedata.is_connected:
+            try:
+                td_chain = self.truedata.get_option_chain(symbol)
+                if td_chain:
+                    contracts = td_chain.get(opt_type, [])
+                    td_best = None
+                    td_best_dist = float('inf')
+                    if target_strike:
+                        for c in contracts:
+                            if c.get('ltp', 0) > 0 and c['strike'] == target_strike:
+                                td_best = c
+                                break
+                    else:
+                        for c in contracts:
+                            if c.get('ltp', 0) > 0:
+                                dist = abs(c['strike'] - spot)
+                                if dist < td_best_dist:
+                                    td_best_dist = dist
+                                    td_best = c
+                    if td_best:
+                        self._strike_cache[cache_key] = {
+                            'strike': td_best['strike'],
+                            'ltp': td_best['ltp'],
+                            'iv': td_best.get('iv', 0),
+                            'time': now,
+                        }
+                        logger.info(f"  TRUEDATA_STRIKE: {symbol} {opt_type} "
+                                   f"strike={td_best['strike']} LTP={td_best['ltp']:.2f} "
+                                   f"IV={td_best.get('iv', 0)*100:.1f}% [TrueData]")
+                        return td_best['strike'], td_best['ltp'], td_best.get('iv', 0)
+            except Exception as e:
+                logger.debug(f"[TrueData] Strike lookup failed for {symbol}: {e}")
+
+        # Source 2: Pipeline chain from NSE/BSE (fallback when TrueData unavailable)
+        if self.market_pipeline:
+            try:
+                chain = self.market_pipeline.get_option_chain(symbol)
+                if chain:
+                    contracts = chain.get(opt_type, [])
+                    # v11.2: If target_strike specified, find that exact strike
+                    best = None
+                    best_dist = float('inf')
+                    if target_strike:
+                        for c in contracts:
+                            if c.get('ltp', 0) > 0 and c['strike'] == target_strike:
+                                best = c
+                                break
+                    else:
+                        # Find ATM contract closest to spot with real LTP
+                        for c in contracts:
+                            if c.get('ltp', 0) > 0:
+                                dist = abs(c['strike'] - spot)
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best = c
+                    if best:
+                        self._strike_cache[cache_key] = {
+                            'strike': best['strike'],
+                            'ltp': best['ltp'],
+                            'iv': best.get('iv', 0),
+                            'time': now,
+                        }
+                        logger.info(f"  PIPELINE_STRIKE: {symbol} {opt_type} "
+                                   f"strike={best['strike']} LTP={best['ltp']:.2f} (from NSE/BSE chain)")
+                        return best['strike'], best['ltp'], best.get('iv', 0)
+            except Exception as e:
+                logger.debug(f"Pipeline strike lookup failed for {symbol}: {e}")
+
+        # Source 3: Angel API option chain (last resort)
         if self.angel and self.angel._connected:
             try:
                 expiry = self._get_nearest_expiry(symbol)
@@ -2227,41 +2299,6 @@ class StrategyEngine:
                     logger.info(f"  ANGEL_STRIKE_NO_EXPIRY: {symbol} — no future expiry found")
             except Exception as e:
                 logger.info(f"  ANGEL_STRIKE_ERR: {symbol} {opt_type} — {e}")
-
-        # Source 2: v9.4 — Pipeline chain from NSE/BSE (get real LTP for ATM strike)
-        if self.market_pipeline:
-            try:
-                chain = self.market_pipeline.get_option_chain(symbol)
-                if chain:
-                    contracts = chain.get(opt_type, [])
-                    # v11.2: If target_strike specified, find that exact strike
-                    best = None
-                    best_dist = float('inf')
-                    if target_strike:
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0 and c['strike'] == target_strike:
-                                best = c
-                                break
-                    else:
-                        # Find ATM contract closest to spot with real LTP
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0:
-                                dist = abs(c['strike'] - spot)
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    best = c
-                    if best:
-                        self._strike_cache[cache_key] = {
-                            'strike': best['strike'],
-                            'ltp': best['ltp'],
-                            'iv': best.get('iv', 0),
-                            'time': now,
-                        }
-                        logger.info(f"  PIPELINE_STRIKE: {symbol} {opt_type} "
-                                   f"strike={best['strike']} LTP={best['ltp']:.2f} (from NSE/BSE chain)")
-                        return best['strike'], best['ltp'], best.get('iv', 0)
-            except Exception as e:
-                logger.debug(f"Pipeline strike lookup failed for {symbol}: {e}")
 
         # Fallback — v9.3: Short cache (30s) for ltp=0 so we retry quickly at market open
         self._strike_cache[cache_key] = {
@@ -2968,6 +3005,19 @@ class PaperTrader:
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         self.market_pipeline = market_pipeline  # v9: Real-time NSE/BSE option chain pipeline
         self.engine.market_pipeline = market_pipeline  # v9.6d: Share pipeline with engine
+        # v11.2: TrueData as primary data source
+        self.truedata = None
+        try:
+            from truedata_feed import TrueDataFeed
+            self.truedata = TrueDataFeed()
+            if self.truedata.connect():
+                self.engine.truedata = self.truedata
+                logger.info("[TrueData] Initialized as Source 1 for option chain + LTP")
+            else:
+                self.truedata = None
+                logger.warning("[TrueData] Connection failed — falling back to NSE/BSE + Angel")
+        except Exception as e:
+            logger.warning(f"[TrueData] Not available: {e} — falling back to NSE/BSE + Angel")
         self._index_tokens = {
             'NIFTY': {'exchange': 'NSE', 'token': '99926000'},
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
@@ -3103,13 +3153,22 @@ class PaperTrader:
     def _get_option_ltp(self, pos):
         """Get real-time option LTP for a position. 3-source fallback.
 
-        v9.4: Pipeline chain LTP is primary source (NSE/BSE website data).
-        Angel API is secondary. Returns None if both unavailable.
+        v11.2: TrueData is primary, NSE/BSE pipeline secondary, Angel API tertiary.
+        Returns None if all unavailable.
         """
         symbol = pos['symbol']
         opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
 
-        # Source 1: Pipeline chain LTP from NSE/BSE (most reliable, no API auth needed)
+        # Source 1: TrueData option LTP (primary — real-time WebSocket)
+        if self.truedata and self.truedata.is_connected:
+            try:
+                td_ltp = self.truedata.get_option_ltp(symbol, pos['strike'], opt_type)
+                if td_ltp and td_ltp > 0:
+                    return td_ltp
+            except Exception as e:
+                logger.debug(f"[TrueData] Option LTP failed for {symbol} {pos['strike']}{opt_type}: {e}")
+
+        # Source 2: Pipeline chain LTP from NSE/BSE (fallback when TrueData unavailable)
         # v10.5: Skip stale BSE data for SENSEX (> 5 min old → fall through to Angel BFO)
         try:
             if self.market_pipeline:
@@ -3134,7 +3193,7 @@ class PaperTrader:
         except Exception as e:
             logger.debug(f"  Pipeline exit LTP failed for {symbol} {pos['strike']}{opt_type}: {e}")
 
-        # Source 2: Angel API with 15s cache
+        # Source 3: Angel API with 15s cache (last resort)
         details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
         option_token = details.get('option_token')
         exchange = details.get('option_exchange')
@@ -3941,23 +4000,35 @@ class PaperTrader:
             real_ltp = None
             opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
 
-            # Source 1: Pipeline chain LTP from NSE/BSE website (most reliable)
-            try:
-                if self.market_pipeline:
-                    chain = self.market_pipeline.get_option_chain(sig['symbol'])
-                    if chain:
-                        contracts = chain.get(opt_type, [])
-                        for c in contracts:
-                            if c.get('strike') == sig['strike'] and c.get('ltp', 0) > 0:
-                                real_ltp = c['ltp']
-                                entry_oi = float(c.get('oi', 0) or 0)
-                                logger.info(f"  PIPELINE_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
-                                           f"LTP={real_ltp:.2f} OI={entry_oi} (from NSE/BSE chain)")
-                                break
-            except Exception as e:
-                logger.debug(f"  Pipeline chain lookup failed for {sig['symbol']}: {e}")
+            # Source 1: TrueData LTP (primary)
+            if self.truedata and self.truedata.is_connected:
+                try:
+                    td_ltp = self.truedata.get_option_ltp(sig['symbol'], sig['strike'], opt_type)
+                    if td_ltp and td_ltp > 0:
+                        real_ltp = td_ltp
+                        logger.info(f"  TRUEDATA_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                                   f"LTP={real_ltp:.2f} [TrueData]")
+                except Exception as e:
+                    logger.debug(f"[TrueData] Entry LTP failed for {sig['symbol']}: {e}")
 
-            # Source 2: Angel API (fallback if pipeline didn't have LTP)
+            # Source 2: Pipeline chain LTP from NSE/BSE website
+            if not real_ltp:
+                try:
+                    if self.market_pipeline:
+                        chain = self.market_pipeline.get_option_chain(sig['symbol'])
+                        if chain:
+                            contracts = chain.get(opt_type, [])
+                            for c in contracts:
+                                if c.get('strike') == sig['strike'] and c.get('ltp', 0) > 0:
+                                    real_ltp = c['ltp']
+                                    entry_oi = float(c.get('oi', 0) or 0)
+                                    logger.info(f"  PIPELINE_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                                               f"LTP={real_ltp:.2f} OI={entry_oi} (from NSE/BSE chain)")
+                                    break
+                except Exception as e:
+                    logger.debug(f"  Pipeline chain lookup failed for {sig['symbol']}: {e}")
+
+            # Source 3: Angel API (fallback if TrueData + pipeline didn't have LTP)
             try:
                 expiry = self._get_nearest_expiry(sig['symbol'])
                 if expiry:
