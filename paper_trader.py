@@ -4103,6 +4103,7 @@ class PaperTrader:
             else:
                 sig['_lot_tier'] = 'BASE'       # 10% capital allocation (minimum)
             logger.info(f"  DCI: {sig['symbol']} {sig['type']} DCI={dci:.0f}/100 tier={sig['_lot_tier']}")
+            sig["_dci"] = dci  # Store DCI for trade_intelligence gate
 
 
             # ---- v12.0: PHYSICS GATE — mathematical signal quality filter ----
