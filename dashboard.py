@@ -7,6 +7,7 @@ import json
 import os
 import csv
 import io
+import re
 import glob
 from datetime import datetime, date, timedelta
 from flask import Flask, jsonify, render_template, Response, request
@@ -1179,6 +1180,90 @@ def api_signals_today():
     return jsonify({'signals': signals[:30], 'total': len(signals)})
 
 
+@app.route('/api/physics_gate')
+def api_physics_gate():
+    """Parse PHYSICS_BLOCK and PHYSICS_PASS entries from today's log files."""
+    today_str = datetime.now().strftime('%Y%m%d')
+    gates = []
+
+    # Log file paths for all 3 bots
+    log_files = [
+        (os.path.join(BASE_DIR, 'logs', f'unified_paper_{today_str}.log'), 'equity'),
+        (os.path.join(BASE_DIR, 'logs', f'stock_paper_{today_str}.log'), 'stocks'),
+        (os.path.join(BASE_DIR, 'logs', f'commodity_paper_{today_str}.log'), 'commodity'),
+    ]
+
+    # Regex patterns for PHYSICS_BLOCK and PHYSICS_PASS
+    block_pattern = re.compile(
+        r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\S*\s+.*?'
+        r'PHYSICS_BLOCK:\s+(\S+)\s+(\S+)\s+'
+        r'score=([-\d]+)\s+\[([^\]]*)\]\s+'
+        r'accel=([\d.?\-]+)\s+wave=([\d.?\-]+)\s+'
+        r'vwap=([\d.?\-]+)\s+rsi=([\d.?\-]+)'
+    )
+    pass_pattern = re.compile(
+        r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\S*\s+.*?'
+        r'PHYSICS_PASS:\s+(\S+)\s+(\S+)\s+'
+        r'score=([-\d]+)\s+accel=([\d.?\-]+)\s+wave=([\d.?\-]+)'
+    )
+
+    for log_path, market in log_files:
+        if not os.path.exists(log_path):
+            continue
+        try:
+            with open(log_path, 'r', errors='ignore') as f:
+                for line in f:
+                    if 'PHYSICS_BLOCK' in line:
+                        m = block_pattern.search(line)
+                        if m:
+                            warnings_str = m.group(5)
+                            gates.append({
+                                'timestamp': m.group(1),
+                                'symbol': m.group(2),
+                                'type': m.group(3),
+                                'action': 'BLOCK',
+                                'score': int(m.group(4)),
+                                'warnings': warnings_str.split(',') if warnings_str else [],
+                                'accel': m.group(6),
+                                'wave': m.group(7),
+                                'vwap': m.group(8),
+                                'rsi': m.group(9),
+                                'market': market,
+                            })
+                    elif 'PHYSICS_PASS' in line:
+                        m = pass_pattern.search(line)
+                        if m:
+                            gates.append({
+                                'timestamp': m.group(1),
+                                'symbol': m.group(2),
+                                'type': m.group(3),
+                                'action': 'PASS',
+                                'score': int(m.group(4)),
+                                'warnings': [],
+                                'accel': m.group(5),
+                                'wave': m.group(6),
+                                'vwap': '',
+                                'rsi': '',
+                                'market': market,
+                            })
+        except Exception:
+            pass
+
+    # Sort by timestamp descending
+    gates.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+
+    # Compute summary stats
+    blocked = sum(1 for g in gates if g['action'] == 'BLOCK')
+    passed = sum(1 for g in gates if g['action'] == 'PASS')
+
+    return jsonify({
+        'gates': gates[:50],
+        'total': len(gates),
+        'blocked': blocked,
+        'passed': passed,
+    })
+
+
 @app.route('/api/daily_pnl_history')
 def api_daily_pnl_history():
     """Daily PnL history from all state files, last 30 days."""
@@ -1261,6 +1346,585 @@ def api_live_indicators():
         'last_updated': last_updated,
         'markets': result,
     })
+
+
+# ====================================================================
+# CHART DATA + RECOMMENDATIONS ENGINE
+# ====================================================================
+
+# Symbol mapping: dashboard symbol -> TrueData CSV name / live_data_logger name
+TRUEDATA_SYMBOL_MAP = {
+    'NIFTY': 'NIFTY_50',
+    'BANKNIFTY': 'NIFTY_BANK',
+    'SENSEX': 'SENSEX',
+}
+
+# In-memory price history accumulator (filled from live_scan_data on each request)
+_price_history = {}  # symbol -> deque of {time, price}
+_indicator_history = {}  # symbol -> deque of {time, pcr, vwap, ...}
+from collections import deque
+
+PRICE_HISTORY_MAX = 400  # ~6.5 hours of 1-min data
+
+
+def _load_intraday_candles(symbol, date_str=None):
+    """Load 1-min intraday candles from best available source.
+
+    Priority:
+    1. live_data_logger spot_1min CSVs (VPS runtime)
+    2. TrueData 1-min CSVs (local/backtest)
+    3. In-memory accumulated prices
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+
+    candles = []
+
+    # Source 1: live_data_logger spot ticks -> convert to 1-min candles
+    live_csv = os.path.join(BASE_DIR, 'data', 'live', date_str, f'spot_1min_{symbol}.csv')
+    if os.path.exists(live_csv):
+        try:
+            with open(live_csv, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ts = row.get('timestamp', '')
+                    ltp = float(row.get('ltp', 0))
+                    if ts and ltp > 0:
+                        candles.append({'time': ts, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp})
+        except Exception:
+            pass
+
+    # Source 2: TrueData 1-min CSVs (OHLC candles)
+    if not candles:
+        td_sym = TRUEDATA_SYMBOL_MAP.get(symbol, symbol)
+        td_paths = [
+            os.path.join(BASE_DIR, '..', 'data', 'truedata', f'{td_sym}_1min.csv'),
+            os.path.join(BASE_DIR, '..', 'data', 'truedata', f'{td_sym}_1min_extended.csv'),
+        ]
+        for td_path in td_paths:
+            if os.path.exists(td_path):
+                try:
+                    with open(td_path, 'r') as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            ts = row.get('time', '')
+                            if date_str not in ts:
+                                continue
+                            candles.append({
+                                'time': ts,
+                                'open': float(row.get('o', 0)),
+                                'high': float(row.get('h', 0)),
+                                'low': float(row.get('l', 0)),
+                                'close': float(row.get('c', 0)),
+                            })
+                    if candles:
+                        break
+                except Exception:
+                    pass
+
+    # Source 3: In-memory accumulated prices (fallback — builds pseudo candles)
+    if not candles and symbol in _price_history:
+        for entry in _price_history[symbol]:
+            p = entry['price']
+            candles.append({
+                'time': entry['time'],
+                'open': p, 'high': p, 'low': p, 'close': p,
+            })
+
+    # Sort by time ascending
+    candles.sort(key=lambda c: c['time'])
+
+    # Convert time strings to Unix timestamps for Lightweight Charts
+    for c in candles:
+        try:
+            dt = datetime.strptime(c['time'][:16], '%Y-%m-%d %H:%M')
+            c['time'] = int(dt.timestamp())
+        except Exception:
+            pass
+
+    # Deduplicate by timestamp
+    seen = set()
+    deduped = []
+    for c in candles:
+        if c['time'] not in seen:
+            seen.add(c['time'])
+            deduped.append(c)
+    return deduped
+
+
+def _load_market_indicators_history(symbol, date_str=None):
+    """Load PCR/spot history from live_data_logger market_indicators CSV."""
+    if date_str is None:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+
+    history = []
+    ind_csv = os.path.join(BASE_DIR, 'data', 'live', date_str, f'market_indicators.csv')
+    if os.path.exists(ind_csv):
+        try:
+            with open(ind_csv, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get('symbol', '') != symbol:
+                        continue
+                    ts = row.get('timestamp', '')
+                    try:
+                        dt = datetime.strptime(ts[:16], '%Y-%m-%d %H:%M')
+                        unix_ts = int(dt.timestamp())
+                    except Exception:
+                        continue
+                    history.append({
+                        'time': unix_ts,
+                        'pcr': float(row.get('pcr', 0) or 0),
+                        'spot': float(row.get('spot', 0) or 0),
+                    })
+        except Exception:
+            pass
+    return history
+
+
+def _compute_vwap_line(candles):
+    """Compute intraday VWAP from candle data (using typical price)."""
+    vwap_data = []
+    cum_tp_vol = 0
+    cum_vol = 0
+    for c in candles:
+        tp = (c['high'] + c['low'] + c['close']) / 3
+        # Use 1 as pseudo-volume since we may not have real volume
+        vol = 1
+        cum_tp_vol += tp * vol
+        cum_vol += vol
+        vwap_val = cum_tp_vol / cum_vol if cum_vol > 0 else tp
+        vwap_data.append({'time': c['time'], 'value': round(vwap_val, 2)})
+    return vwap_data
+
+
+def _generate_recommendations(symbol, indicators, candles, cpr, positions):
+    """Generate trading recommendations based on indicator confluence."""
+    recs = []
+    if not indicators:
+        return recs
+
+    spot = indicators.get('spot', 0)
+    pcr = indicators.get('pcr', 0)
+    pcr_direction = indicators.get('pcr_shift', indicators.get('pcr_direction', ''))
+    oi_sentiment = indicators.get('oi_sentiment', '')
+    vwap = indicators.get('vwap', 0)
+    iv = indicators.get('iv', 0)
+    hv = indicators.get('hv', 0)
+    atr = indicators.get('atr', 0)
+    pivot = indicators.get('pivot', 0)
+    tc = indicators.get('tc', 0)
+    bc = indicators.get('bc', 0)
+    cpr_width = indicators.get('cpr_width', 0)
+    resistance = indicators.get('resistance', 0)
+    support = indicators.get('support', 0)
+    demand_zone = indicators.get('demand_zone', {})
+    if not isinstance(demand_zone, dict):
+        demand_zone = {}
+    supply_zone = indicators.get('supply_zone', {})
+    if not isinstance(supply_zone, dict):
+        supply_zone = {}
+    cam_r3 = indicators.get('cam_r3', 0)
+    cam_r4 = indicators.get('cam_r4', 0)
+    cam_s3 = indicators.get('cam_s3', 0)
+    cam_s4 = indicators.get('cam_s4', 0)
+
+    if not spot or not pivot:
+        return recs
+
+    # --- 1. CPR Position Analysis ---
+    if spot > tc > 0:
+        recs.append({
+            'type': 'bullish',
+            'category': 'CPR',
+            'title': 'Price Above TC — Bullish Breakout Zone',
+            'detail': f'Spot {spot:.0f} is above Top CPR {tc:.0f}. Favors BUY CE on pullback to TC.',
+            'strength': 'strong',
+        })
+    elif spot < bc > 0:
+        recs.append({
+            'type': 'bearish',
+            'category': 'CPR',
+            'title': 'Price Below BC — Bearish Breakdown Zone',
+            'detail': f'Spot {spot:.0f} is below Bottom CPR {bc:.0f}. Favors BUY PE on pullback to BC.',
+            'strength': 'strong',
+        })
+    elif tc > 0 and bc > 0:
+        recs.append({
+            'type': 'neutral',
+            'category': 'CPR',
+            'title': 'Price Inside CPR — Range-Bound',
+            'detail': f'Spot {spot:.0f} is between TC {tc:.0f} and BC {bc:.0f}. Wait for breakout.',
+            'strength': 'moderate',
+        })
+
+    # Narrow CPR = high breakout probability
+    if 0 < cpr_width < 0.3:
+        recs.append({
+            'type': 'alert',
+            'category': 'CPR',
+            'title': f'Narrow CPR ({cpr_width:.3f}%) — Breakout Expected',
+            'detail': 'CPR width < 0.3% signals a trending day. Prepare for directional move.',
+            'strength': 'strong',
+        })
+
+    # --- 2. PCR Analysis ---
+    if pcr > 0:
+        if pcr > 1.3:
+            recs.append({
+                'type': 'bullish',
+                'category': 'PCR',
+                'title': f'High PCR ({pcr:.2f}) — Bullish Sentiment',
+                'detail': 'Heavy put writing indicates strong support. Favors calls.',
+                'strength': 'strong',
+            })
+        elif pcr > 1.0:
+            recs.append({
+                'type': 'bullish',
+                'category': 'PCR',
+                'title': f'PCR ({pcr:.2f}) Above 1 — Mildly Bullish',
+                'detail': 'More puts than calls being written. Market has support.',
+                'strength': 'moderate',
+            })
+        elif pcr < 0.7:
+            recs.append({
+                'type': 'bearish',
+                'category': 'PCR',
+                'title': f'Low PCR ({pcr:.2f}) — Bearish Sentiment',
+                'detail': 'Heavy call writing indicates resistance overhead. Favors puts.',
+                'strength': 'strong',
+            })
+        elif pcr < 1.0:
+            recs.append({
+                'type': 'bearish',
+                'category': 'PCR',
+                'title': f'PCR ({pcr:.2f}) Below 1 — Mildly Bearish',
+                'detail': 'More calls than puts being written. Some resistance.',
+                'strength': 'moderate',
+            })
+
+    # --- 3. VWAP Position ---
+    if vwap > 0 and spot > 0:
+        pct_from_vwap = (spot - vwap) / vwap * 100
+        if pct_from_vwap > 0.15:
+            recs.append({
+                'type': 'bullish',
+                'category': 'VWAP',
+                'title': f'Price Above VWAP (+{pct_from_vwap:.2f}%)',
+                'detail': f'Spot {spot:.0f} is above VWAP {vwap:.0f}. Intraday buyers in control.',
+                'strength': 'moderate',
+            })
+        elif pct_from_vwap < -0.15:
+            recs.append({
+                'type': 'bearish',
+                'category': 'VWAP',
+                'title': f'Price Below VWAP ({pct_from_vwap:.2f}%)',
+                'detail': f'Spot {spot:.0f} is below VWAP {vwap:.0f}. Intraday sellers in control.',
+                'strength': 'moderate',
+            })
+
+    # --- 4. IV vs HV Analysis ---
+    if iv > 0 and hv > 0:
+        iv_pct = iv * 100 if iv < 1 else iv
+        hv_pct = hv * 100 if hv < 1 else hv
+        iv_premium = iv_pct - hv_pct
+        if iv_premium > 5:
+            recs.append({
+                'type': 'alert',
+                'category': 'Volatility',
+                'title': f'IV Premium ({iv_premium:.1f}pts) — Options Expensive',
+                'detail': f'IV {iv_pct:.1f}% > HV {hv_pct:.1f}%. Consider selling strategies or tighter targets.',
+                'strength': 'moderate',
+            })
+        elif iv_premium < -3:
+            recs.append({
+                'type': 'alert',
+                'category': 'Volatility',
+                'title': f'IV Discount ({iv_premium:.1f}pts) — Options Cheap',
+                'detail': f'IV {iv_pct:.1f}% < HV {hv_pct:.1f}%. Options are relatively cheap. Favor buying.',
+                'strength': 'moderate',
+            })
+
+    # --- 5. Ghost Zone Proximity ---
+    if demand_zone and spot > 0:
+        dz_high = demand_zone.get('high', 0)
+        dz_low = demand_zone.get('low', 0)
+        if dz_high and dz_low:
+            dist_to_dz = ((spot - dz_high) / spot * 100) if dz_high else 999
+            if 0 < dist_to_dz < 0.5:
+                recs.append({
+                    'type': 'bullish',
+                    'category': 'Ghost Zone',
+                    'title': f'Near Demand Zone ({dz_low:.0f}-{dz_high:.0f})',
+                    'detail': f'Spot is {dist_to_dz:.2f}% above demand zone. Institutional buying support nearby.',
+                    'strength': 'strong',
+                })
+
+    if supply_zone and spot > 0:
+        sz_low = supply_zone.get('low', 0)
+        sz_high = supply_zone.get('high', 0)
+        if sz_low and sz_high:
+            dist_to_sz = ((sz_low - spot) / spot * 100) if sz_low else 999
+            if 0 < dist_to_sz < 0.5:
+                recs.append({
+                    'type': 'bearish',
+                    'category': 'Ghost Zone',
+                    'title': f'Near Supply Zone ({sz_low:.0f}-{sz_high:.0f})',
+                    'detail': f'Spot is {dist_to_sz:.2f}% below supply zone. Institutional selling pressure nearby.',
+                    'strength': 'strong',
+                })
+
+    # --- 6. Camarilla Level Signals ---
+    if cam_s3 and cam_r3 and spot:
+        if spot <= cam_s3:
+            recs.append({
+                'type': 'bullish',
+                'category': 'Camarilla',
+                'title': f'At Cam S3 ({cam_s3:.0f}) — Reversal Buy Zone',
+                'detail': 'Price at Camarilla S3 support. Potential bounce with SL below S4.',
+                'strength': 'moderate',
+            })
+        elif spot >= cam_r3:
+            recs.append({
+                'type': 'bearish',
+                'category': 'Camarilla',
+                'title': f'At Cam R3 ({cam_r3:.0f}) — Reversal Sell Zone',
+                'detail': 'Price at Camarilla R3 resistance. Potential rejection with SL above R4.',
+                'strength': 'moderate',
+            })
+
+    # --- 7. Confluence Score ---
+    bullish_count = sum(1 for r in recs if r['type'] == 'bullish')
+    bearish_count = sum(1 for r in recs if r['type'] == 'bearish')
+    strong_bull = sum(1 for r in recs if r['type'] == 'bullish' and r['strength'] == 'strong')
+    strong_bear = sum(1 for r in recs if r['type'] == 'bearish' and r['strength'] == 'strong')
+
+    if bullish_count >= 3 or strong_bull >= 2:
+        confluence = 'STRONG BULLISH'
+        conf_type = 'bullish'
+        conf_detail = f'{bullish_count} bullish signals ({strong_bull} strong). High confluence for BUY CE.'
+    elif bearish_count >= 3 or strong_bear >= 2:
+        confluence = 'STRONG BEARISH'
+        conf_type = 'bearish'
+        conf_detail = f'{bearish_count} bearish signals ({strong_bear} strong). High confluence for BUY PE.'
+    elif bullish_count > bearish_count:
+        confluence = 'LEAN BULLISH'
+        conf_type = 'bullish'
+        conf_detail = f'{bullish_count} bullish vs {bearish_count} bearish. Mild bullish bias.'
+    elif bearish_count > bullish_count:
+        confluence = 'LEAN BEARISH'
+        conf_type = 'bearish'
+        conf_detail = f'{bearish_count} bearish vs {bullish_count} bullish. Mild bearish bias.'
+    else:
+        confluence = 'NEUTRAL'
+        conf_type = 'neutral'
+        conf_detail = 'No clear directional bias. Wait for confirmation.'
+
+    # Insert confluence as first recommendation
+    recs.insert(0, {
+        'type': conf_type,
+        'category': 'Confluence',
+        'title': confluence,
+        'detail': conf_detail,
+        'strength': 'strong' if 'STRONG' in confluence else 'moderate',
+    })
+
+    return recs
+
+
+def _accumulate_price(symbol, spot):
+    """Accumulate spot price into in-memory history for chart fallback."""
+    if not spot or spot <= 0:
+        return
+    now = datetime.now()
+    ts = now.strftime('%Y-%m-%d %H:%M')
+    if symbol not in _price_history:
+        _price_history[symbol] = deque(maxlen=PRICE_HISTORY_MAX)
+    hist = _price_history[symbol]
+    # Avoid duplicate minute entries
+    if hist and hist[-1]['time'] == ts:
+        return
+    hist.append({'time': ts, 'price': spot})
+
+
+@app.route('/api/chart/<symbol>')
+def api_chart(symbol):
+    """Chart data endpoint — returns candles, CPR, VWAP, PCR, trades, recommendations."""
+    symbol = symbol.upper()
+    date_str = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+
+    # Load candle data
+    candles = _load_intraday_candles(symbol, date_str)
+
+    # Load live indicators for this symbol
+    eq_scan = load_json(os.path.join(BASE_DIR, 'paper_trades', 'live_scan_data.json'))
+    cm_scan = load_json(os.path.join(BASE_DIR, 'paper_trades_commodity', 'live_scan_data.json'))
+    stk_scan = load_json(os.path.join(BASE_DIR, 'stock_paper_trades', 'live_scan_data.json'))
+
+    indicators = {}
+    vix = None
+    for scan in [eq_scan, cm_scan, stk_scan]:
+        if scan and isinstance(scan, dict):
+            syms = scan.get('symbols', {})
+            if symbol in syms:
+                indicators = syms[symbol]
+            if scan.get('vix'):
+                vix = scan['vix']
+
+    # Accumulate price for in-memory fallback
+    if indicators.get('spot'):
+        _accumulate_price(symbol, indicators['spot'])
+
+    # CPR levels
+    cpr = {
+        'pivot': indicators.get('pivot', 0),
+        'tc': indicators.get('tc', 0),
+        'bc': indicators.get('bc', 0),
+    }
+
+    # Extended levels
+    levels = {
+        'resistance': indicators.get('resistance', 0),
+        'support': indicators.get('support', 0),
+        'cam_r3': indicators.get('cam_r3', 0),
+        'cam_r4': indicators.get('cam_r4', 0),
+        'cam_s3': indicators.get('cam_s3', 0),
+        'cam_s4': indicators.get('cam_s4', 0),
+        'vwap': indicators.get('vwap', 0),
+    }
+
+    # Compute VWAP line from candles (intraday computed)
+    vwap_line = _compute_vwap_line(candles) if candles else []
+
+    # Load PCR history
+    pcr_history = _load_market_indicators_history(symbol, date_str)
+
+    # Trade markers (entries/exits on this symbol today)
+    trade_markers = []
+    for market, state_path in [('equity', EQUITY_STATE), ('commodity', COMMODITY_STATE),
+                                ('stocks', STOCK_STATE), ('oi', OI_STATE)]:
+        state_data = load_json(state_path)
+        if not state_data:
+            continue
+        # Open positions
+        for pos in state_data.get('positions', []):
+            pos_sym = pos.get('symbol', pos.get('commodity', ''))
+            if pos_sym != symbol:
+                continue
+            ts = pos.get('timestamp', '')
+            try:
+                dt = datetime.fromisoformat(ts)
+                unix_ts = int(dt.timestamp())
+            except Exception:
+                continue
+            trade_markers.append({
+                'time': unix_ts,
+                'position': 'belowBar' if 'CE' in pos.get('signal_type', '') else 'aboveBar',
+                'color': '#00d26a' if 'CE' in pos.get('signal_type', '') else '#ff3b5c',
+                'shape': 'arrowUp' if 'CE' in pos.get('signal_type', '') else 'arrowDown',
+                'text': f"{pos.get('strategy', '')} {pos.get('signal_type', '')} @ {pos.get('entry_premium', 0):.1f}",
+                'type': 'entry',
+                'strategy': pos.get('strategy', ''),
+            })
+        # Closed trades today
+        today_str = date_str
+        for t in state_data.get('closed_trades', []):
+            t_sym = t.get('symbol', t.get('commodity', ''))
+            if t_sym != symbol:
+                continue
+            exit_ts = t.get('exit_time', t.get('closed_at', ''))
+            entry_ts = t.get('timestamp', '')
+            if today_str not in exit_ts and today_str not in entry_ts:
+                continue
+            # Entry marker
+            try:
+                dt = datetime.fromisoformat(entry_ts)
+                unix_ts = int(dt.timestamp())
+                trade_markers.append({
+                    'time': unix_ts,
+                    'position': 'belowBar' if 'CE' in t.get('signal_type', '') else 'aboveBar',
+                    'color': '#3b82f6',
+                    'shape': 'arrowUp' if 'CE' in t.get('signal_type', '') else 'arrowDown',
+                    'text': f"ENTRY {t.get('strategy', '')} @ {t.get('entry_premium', 0):.1f}",
+                    'type': 'entry',
+                    'strategy': t.get('strategy', ''),
+                })
+            except Exception:
+                pass
+            # Exit marker
+            try:
+                dt = datetime.fromisoformat(exit_ts)
+                unix_ts = int(dt.timestamp())
+                pnl = t.get('pnl', 0)
+                trade_markers.append({
+                    'time': unix_ts,
+                    'position': 'aboveBar' if 'CE' in t.get('signal_type', '') else 'belowBar',
+                    'color': '#00d26a' if pnl >= 0 else '#ff3b5c',
+                    'shape': 'circle',
+                    'text': f"EXIT {t.get('exit_reason', '')} P&L:{pnl:+.0f}",
+                    'type': 'exit',
+                    'pnl': pnl,
+                })
+            except Exception:
+                pass
+
+    # Get open positions for this symbol (for recommendations context)
+    open_positions = []
+    for state_path in [EQUITY_STATE, COMMODITY_STATE, STOCK_STATE, OI_STATE]:
+        state_data = load_json(state_path)
+        if state_data:
+            for pos in state_data.get('positions', []):
+                if pos.get('symbol', pos.get('commodity', '')) == symbol:
+                    open_positions.append(pos)
+
+    # Generate recommendations
+    recommendations = _generate_recommendations(symbol, indicators, candles, cpr, open_positions)
+
+    # Current indicator snapshot
+    current_indicators = {
+        'spot': indicators.get('spot', 0),
+        'pcr': indicators.get('pcr', 0),
+        'pcr_direction': indicators.get('pcr_shift', indicators.get('pcr_direction', '')),
+        'oi_sentiment': indicators.get('oi_sentiment', ''),
+        'iv': indicators.get('iv', 0),
+        'hv': indicators.get('hv', 0),
+        'atr': indicators.get('atr', 0),
+        'vwap': indicators.get('vwap', 0),
+        'cpr_width': indicators.get('cpr_width', 0),
+        'vix': vix,
+    }
+
+    return jsonify({
+        'symbol': symbol,
+        'date': date_str,
+        'candles': candles,
+        'cpr': cpr,
+        'levels': levels,
+        'vwap_line': vwap_line,
+        'pcr_history': pcr_history,
+        'trade_markers': trade_markers,
+        'indicators': current_indicators,
+        'recommendations': recommendations,
+        'candle_count': len(candles),
+    })
+
+
+@app.route('/api/chart/symbols')
+def api_chart_symbols():
+    """Return available symbols for chart selection."""
+    symbols = ['NIFTY', 'BANKNIFTY', 'SENSEX']
+    # Add commodity symbols if data exists
+    cm_scan = load_json(os.path.join(BASE_DIR, 'paper_trades_commodity', 'live_scan_data.json'))
+    if cm_scan and cm_scan.get('symbols'):
+        symbols += list(cm_scan['symbols'].keys())
+    # Add stock symbols from open positions
+    stk_data = load_json(STOCK_STATE)
+    if stk_data:
+        for pos in stk_data.get('positions', []):
+            sym = pos.get('symbol', '')
+            if sym and sym not in symbols:
+                symbols.append(sym)
+    return jsonify({'symbols': symbols})
 
 
 if __name__ == '__main__':
