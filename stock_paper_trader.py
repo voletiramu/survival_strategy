@@ -80,11 +80,11 @@ HOLD_SCORE_WEAK = 40
 HOLD_SCORE_MIN_HOLD_MINS = 30
 
 # Trailing Stop Loss config (same proven system as paper_trader.py)
-TSL_BREAKEVEN_GAIN_PCT = 15    # Phase 1: Lock breakeven at +15%
-TSL_TRAIL_GAIN_PCT = 25        # Phase 2: Start trailing at +25%
-TSL_TRAIL_DISTANCE_PCT = 30    # Phase 2: 30% below peak profit
-TSL_TIGHT_GAIN_PCT = 40        # Phase 3: Tight trail at +40%
-TSL_TIGHT_DISTANCE_PCT = 20    # Phase 3: 20% below peak profit
+TSL_BREAKEVEN_GAIN_PCT = 10    # v13: Lock breakeven at +10% (was 15% — too late)
+TSL_TRAIL_GAIN_PCT = 20        # v13: Start trailing at +20% (was 25%)
+TSL_TRAIL_DISTANCE_PCT = 20    # v13: 20% below peak (was 30% — too loose)
+TSL_TIGHT_GAIN_PCT = 35        # v13: Tight trail at +35% (was 40%)
+TSL_TIGHT_DISTANCE_PCT = 12    # v13: 12% below peak (was 20%)
 
 # v10.1: Trailing Target (replaces hard TARGET_HIT exit)
 TARGET_TRAIL_ENABLED = True
@@ -92,10 +92,10 @@ TARGET_TRAIL_EXTEND_PCT = 20          # Extend target by 20% of current premium 
 TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
 TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 
-# v10.1: Breakout Failure Detection
-BREAKOUT_FAIL_CHECK_MINUTES = 5
-BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
-BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
+# v13.0: Breakout Failure Detection — RELAXED (was causing premature exits)
+BREAKOUT_FAIL_CHECK_MINUTES = 20       # v13: Extended from 5 min — stocks need time to develop
+BREAKOUT_FAIL_MIN_GAIN_PCT = 1        # v13: Reduced from 2%
+BREAKOUT_FAIL_REVERSE_DROP_PCT = 25   # v13: Increased from 15% — only reverse on severe failures
 BREAKOUT_FAIL_REVERSE_ENABLED = True
 
 # OI/IV exit thresholds
@@ -529,12 +529,16 @@ class StockCPRScanner:
         pcr_proxy = 1 + (close_chg.tail(5).mean() * 10)
         pcr_proxy = max(0.5, min(2.0, pcr_proxy))
 
-        # VWAP (rolling 5-day)
-        if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
-            tp = (df['High'] + df['Low'] + df['Close']) / 3
-            vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
-        else:
-            vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()  # v10.2c: Fixed VWAP fallback
+        # v13.0: Intraday VWAP (integral calculus) — replaces stale 5-day VWAP
+        vwap = None
+        if hasattr(self, 'calculus'):
+            vwap = self.calculus.get_intraday_vwap_for_indicators(symbol)
+        if vwap is None:
+            if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
+                tp = (df['High'] + df['Low'] + df['Close']) / 3
+                vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
+            else:
+                vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()
 
         return {
             'pivot': pivot,
@@ -685,6 +689,7 @@ class StockAngelConnection:
         self._auth_time = 0           # v9.2: Track when we last authenticated
         self._app_type = 'Historical' # v9.2: Remember app type for reconnect
         self.market_pipeline = None   # v10.5: NSE pipeline for stock option chain fallback
+        self.zerodha = None           # v12.0: Zerodha Kite feed (set by StockPaperTrader)
         self.truedata = None          # v11.2: TrueData feed (set by StockPaperTrader)
         self._reconnecting = False    # v9.2: Prevent recursive reconnect loops
 
@@ -1185,9 +1190,46 @@ class StockAngelConnection:
         best = None
         best_score = -1
 
-        # v11.2: Data source priority: 1) TrueData, 2) NSE/BSE pipeline, 3) Angel API
+        # v12.0: Data source priority: 1) Zerodha, 2) TrueData, 3) NSE/BSE pipeline, 4) Angel API
 
-        # Source 1: TrueData option chain (primary)
+        # Source 1: Zerodha Kite option chain (primary)
+        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
+            try:
+                zd_chain = self.zerodha.get_option_chain(name)
+                if zd_chain:
+                    contracts = zd_chain.get(opt_type, [])
+                    zd_best = None
+                    zd_best_oi = -1
+                    for c in contracts:
+                        c_strike = c.get('strike', 0)
+                        if c_strike not in candidates:
+                            continue
+                        c_ltp = c.get('ltp', 0)
+                        c_oi = c.get('oi', 0)
+                        if c_ltp <= 0:
+                            continue
+                        if c_oi > zd_best_oi:
+                            zd_best_oi = c_oi
+                            zd_best = {
+                                'strike': c_strike,
+                                'ltp': c_ltp,
+                                'oi': c_oi,
+                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
+                                'volume': c.get('volume', 0),
+                            }
+                    if zd_best:
+                        token_info = self.find_option_tokens(name, None, zd_best['strike'], opt_type)
+                        if token_info:
+                            zd_best['token'] = str(token_info.get('token', ''))
+                            zd_best['symbol'] = token_info.get('symbol', '')
+                        logger.info(f"  ZERODHA_STRIKE: {name} {opt_type} ATM={atm_strike} "
+                                    f"Selected={zd_best['strike']} OI={zd_best['oi']:,.0f} "
+                                    f"LTP={zd_best['ltp']:.2f} [Zerodha]")
+                        return zd_best
+            except Exception as e:
+                logger.debug(f"[Zerodha] Strike lookup failed for {name}: {e}")
+
+        # Source 2: TrueData option chain (secondary)
         if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
             try:
                 td_chain = self.truedata.get_option_chain(name)
@@ -1831,10 +1873,11 @@ class StockStrategyEngine:
             list of signal dicts.
         """
         try:
-            # v11.1: Skip CPR signals on ultra-narrow CPR days
+            # v13.0: Lower CPR narrow threshold for stocks (was 0.03%, same as indices — too aggressive)
+            # Stocks naturally have much narrower CPR (CIPLA=0.023%, ADANIGREEN=0.002%)
             cpr_w = indicators.get('cpr_width', 1.0)
-            if cpr_w < 0.03:
-                logger.info(f"  CPR_NARROW_SKIP: {symbol} CPR width {cpr_w:.4f}% < 0.03% — signals unreliable")
+            if cpr_w < 0.005:
+                logger.info(f"  CPR_NARROW_SKIP: {symbol} CPR width {cpr_w:.4f}% < 0.005% — signals unreliable")
                 return []
             signals = check_cpr_breakout(spot, ohlc, indicators, config)
             # v10.1: VWAP direction filtering for CPR signals
@@ -2052,21 +2095,45 @@ class StockPaperTrader:
         self.data_logger = None  # v10.2e: Live data logger for backtesting
         self.market_pipeline = None  # v10.5: NSE pipeline for stock option chain fallback
 
-        # v11.2: TrueData as Source 1 for option chain + LTP
+        # v12.0: Zerodha Kite Connect as Source 1 (primary)
+        self.zerodha = None
+        try:
+            from zerodha_feed import ZerodhaFeed
+            self.zerodha = ZerodhaFeed()
+            if self.zerodha.connect():
+                logger.info("[Zerodha] ✅ Initialized as Source 1 for stock option chain + LTP")
+            else:
+                self.zerodha = None
+                logger.warning("[Zerodha] Connection failed — trying TrueData as Source 2")
+        except Exception as e:
+            logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
+
+        # v11.2: TrueData as Source 2 for option chain + LTP
         self.truedata = None
         try:
             from truedata_feed import TrueDataFeed
             self.truedata = TrueDataFeed()
             if self.truedata.connect():
-                logger.info("[TrueData] Initialized as Source 1 for stock option chain + LTP")
+                src_num = "2" if self.zerodha else "1 (Zerodha unavailable)"
+                logger.info(f"[TrueData] Initialized as Source {src_num} for stock option chain + LTP")
             else:
                 self.truedata = None
                 logger.warning("[TrueData] Connection failed — falling back to NSE/BSE + Angel")
         except Exception as e:
             logger.warning(f"[TrueData] Not available: {e} — falling back to NSE/BSE + Angel")
 
-        # Wire TrueData into StockAngelConnection for select_optimal_strike
+        # Wire data sources into StockAngelConnection for select_optimal_strike
+        self.angel.zerodha = self.zerodha
         self.angel.truedata = self.truedata
+
+        # v13.0: Calculus engine — intraday VWAP + momentum direction
+        from market_calculus import MarketCalculus
+        self.calculus = MarketCalculus()
+        self.engine.calculus = self.calculus
+
+        # v14.0: Trade Intelligence engine
+        from trade_intelligence import TradeIntelligence
+        self.trade_intel = TradeIntelligence()
 
         # v10.5b: Regime detector (same as equity/commodity)
         self.regime_detector = RegimeDetector()
@@ -2293,7 +2360,19 @@ class StockPaperTrader:
         if cached and (datetime.now() - cached['time']).total_seconds() < 15:
             return cached['ltp']
 
-        # v11.2: Source 1 — TrueData option LTP (primary)
+        # v12.0: Source 1 — Zerodha Kite option LTP (primary)
+        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
+            try:
+                symbol = pos.get('stock_symbol', pos.get('symbol', ''))
+                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                zd_ltp = self.zerodha.get_option_ltp(symbol, pos['strike'], opt_type)
+                if zd_ltp and zd_ltp > 0:
+                    self._option_ltp_cache[cache_key] = {'ltp': zd_ltp, 'time': datetime.now()}
+                    return zd_ltp
+            except Exception as e:
+                logger.debug(f"  [Zerodha] Option LTP failed: {e}")
+
+        # Source 2: TrueData option LTP (secondary)
         if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
             try:
                 symbol = pos.get('stock_symbol', pos.get('symbol', ''))
@@ -2305,7 +2384,7 @@ class StockPaperTrader:
             except Exception as e:
                 logger.debug(f"  [TrueData] Option LTP failed: {e}")
 
-        # Source 2: Angel API LTP
+        # Source 3: Angel API LTP
         try:
             ltp = self.angel.get_ltp(exchange, option_token)
             if ltp and ltp > 0:
@@ -3235,6 +3314,10 @@ class StockPaperTrader:
             if self.data_logger and spot:
                 self.data_logger.log_spot_tick(symbol, spot)
 
+            # v13.0: Feed spot tick to calculus engine
+            if hasattr(self, 'calculus'):
+                self.calculus.add_spot_tick(symbol, spot)
+
             # Compute indicators
             indicators = stock_info.get('indicators')
             if not indicators:
@@ -3492,8 +3575,9 @@ class StockPaperTrader:
                 skipped += 1
                 continue
 
-            # ---- v10.1: DIRECTION VALIDATION — the primary filter ----
+            # ---- v13.0: CALCULUS-BASED DIRECTION VALIDATION (replaces v10.1 static checks) ----
             dir_spot = self.get_stock_spot(symbol) or sig.get('spot', 0)
+            dir_adj = 0
             if dir_spot:
                 intra = self.engine.intraday_data.get(symbol)
                 if intra is not None and len(intra) > 0:
@@ -3507,21 +3591,48 @@ class StockPaperTrader:
                     dir_ohlc = {'open': dir_spot, 'high': dir_spot, 'low': dir_spot,
                                 'close': dir_spot, 'volume': 0}
                 dir_indicators = self.engine.compute_indicators(symbol, dir_ohlc)
-                if dir_indicators:
+
+                # v13.0: Use calculus engine as PRIMARY direction gate
+                if hasattr(self, 'calculus') and self.calculus.bar_count(symbol) >= 15:
+                    calc_allowed, calc_reason, calc_data = self.calculus.should_allow_direction(
+                        symbol, signal_type, dir_spot)
+                    logger.info(f"  CALC_DIR: {symbol} {signal_type} — {calc_reason}")
+
+                    if not calc_allowed:
+                        orig_type = signal_type
+                        flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
+                        calc_dir = calc_data.get('direction')
+                        flipped_opt = 'CE' if 'CE' in flipped_type else 'PE'
+
+                        if calc_dir and flipped_opt == calc_dir:
+                            existing_flipped = [p for p in self.portfolio.positions
+                                if p['symbol'] == symbol
+                                and ('CE' if 'CE' in p.get('signal_type', '') else 'PE') == flipped_opt]
+                            if existing_flipped:
+                                logger.info(f"  DIR_REJECT: {symbol} {orig_type} — calculus says {calc_dir} "
+                                           f"but already holding {flipped_opt}")
+                                skipped += 1; continue
+                            logger.info(f"  CALC_DIR_FLIP: {symbol} {orig_type} -> {flipped_type} "
+                                       f"(score={calc_data['score']:+.0f}, mom={calc_data['momentum']:+.2f})")
+                            signal_type = flipped_type
+                            sig['type'] = flipped_type
+                            dir_adj = 5
+                        else:
+                            logger.info(f"  DIR_REJECT: {symbol} {orig_type} — calculus blocks "
+                                       f"(score={calc_data['score']:+.0f})")
+                            skipped += 1; continue
+                    else:
+                        dir_adj = min(calc_data.get('confidence', 0) // 10, 10)
+                elif dir_indicators:
+                    # Fallback: old multi-factor validation
                     dir_valid, dir_reason, dir_adj = validate_signal_direction(
                         signal_type, dir_spot, dir_ohlc, dir_indicators)
                     if not dir_valid:
-                        # v10.2b: Direction Flip — trade correct direction instead of just blocking
-                        # Guard: Don't flip AGAINST the daily EMA trend
-                        # If EMA bullish (9>20), only flip to CE, never to PE
-                        # If EMA bearish (9<20), only flip to PE, never to CE
                         orig_type = signal_type
                         ema_9 = dir_indicators.get('ema_9', 0)
                         ema_20 = dir_indicators.get('ema_20', 0)
-
                         flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
                         flip_to_pe = 'PE' in flipped_type
-
                         if ema_9 > 0 and ema_20 > 0:
                             daily_bullish = ema_9 > ema_20
                             if (daily_bullish and flip_to_pe) or (not daily_bullish and not flip_to_pe):
@@ -3576,6 +3687,25 @@ class StockPaperTrader:
                 sig['_lot_tier'] = 'BASE'
             logger.info(f"  DCI: {symbol} {signal_type} DCI={dci:.0f}/100 tier={sig['_lot_tier']}")
 
+
+            # ---- v12.0: PHYSICS GATE — mathematical signal quality filter ----
+            if hasattr(self, 'calculus') and self.calculus.bar_count(symbol) >= 6:
+                sig_dir = 'CE' if 'CE' in signal_type else 'PE'
+                phy_score, phy_diag = self.calculus.physics_gate(symbol, sig_dir)
+                sig['_physics_score'] = phy_score
+                if phy_score < 0:
+                    warnings_list = []
+                    if phy_diag.get('mom_dying'): warnings_list.append('MOM_DYING')
+                    if phy_diag.get('wave_peak'): warnings_list.append('WAVE_PEAK')
+                    if phy_diag.get('stretched'): warnings_list.append('VWAP_STRETCHED')
+                    if phy_diag.get('rsi_extreme'): warnings_list.append('RSI_EXTREME')
+                    logger.info(f"  PHYSICS_BLOCK: {symbol} {signal_type} "
+                               f"score={phy_score} [{','.join(warnings_list)}] "
+                               f"accel={phy_diag.get('accel','?')} wave={phy_diag.get('wave_risk','?')}")
+                    skipped += 1
+                    continue
+                else:
+                    logger.info(f"  PHYSICS_PASS: {symbol} {signal_type} score={phy_score}")
             # Get spot and determine strike
             spot = self.get_stock_spot(symbol)
             if not spot:
@@ -3680,6 +3810,17 @@ class StockPaperTrader:
             else:
                 target = round(entry_premium * target_mult, 2)
                 sl_price = round(entry_premium * sl_mult, 2)
+
+            # v14.0: Trade Intelligence entry filter
+            if hasattr(self, 'trade_intel'):
+                ti_allowed, ti_reason, ti_quality = self.trade_intel.should_enter(
+                    sig, existing_positions=self.portfolio.positions
+                )
+                if not ti_allowed:
+                    logger.info(f"  TI_BLOCK: {sig.get('symbol','')} {sig.get('type','')} \u2014 {ti_reason}")
+                    skipped += 1
+                    continue
+                logger.info(f"  TI_PASS: {sig.get('symbol','')} {sig.get('type','')} \u2014 {ti_reason}")
 
             # Open position
             position = self.portfolio.add_signal(
