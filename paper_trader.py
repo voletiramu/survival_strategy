@@ -79,7 +79,8 @@ STRATEGY_ALLOCATION = {
     'Gamma Blast':  0.30,    # 30% target — best risk-adjusted (Sharpe 4.42)
     'Ghost Zone':   0.15,    # 15% target — v7 institutional methodology
     'PCR+VWAP':     0.10,    # 10% target — needs live OI data to prove
-    'Trend Rider':  0.20,    # 20% target — NEW: trend day riding (PF 5.56 in backtest)
+    'Trend Rider':  0.20,    # 20% target
+    'Liquidity Sweep': 0.15,  # 15% target — SL hunt reversal (PF 2.95, WR 78%) — NEW: trend day riding (PF 5.56 in backtest)
     # 'Survivor':   0.00,    # HALTED — needs Rs 1L+ per symbol
 }
 
@@ -121,7 +122,8 @@ STRATEGY_EXIT_MULT = {
     'Gamma Blast':  {'oi': 1.0, 'iv': 1.0},
     'Ghost Zone':   {'oi': 0.7, 'iv': 0.8},    # 30% LOWER threshold → exits faster
     'PCR+VWAP':     {'oi': 1.0, 'iv': 1.0},
-    'Trend Rider':  {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold — let trends run
+    'Trend Rider':  {'oi': 2.0, 'iv': 2.0},
+    'Liquidity Sweep': {'oi': 1.5, 'iv': 1.5},  # Medium tolerance — fast trades    # 2x HIGHER threshold — let trends run
     'Survivor':     {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold → tolerates swings
 }
 
@@ -3605,6 +3607,67 @@ class PaperTrader:
                                f"Strike={sig['strike']:.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
 
+        
+            # ---- v13.1: LIQUIDITY SWEEP (SL Hunt Reversal) ----
+            # Detects institutional stop-loss hunts and trades the reversal
+            # Hybrid sizing: Q>=45 half-lot, Q>=60 full-lot
+            # Backtested 6 days: PF=1.98-2.95, WR=70-78%, DD<1%
+            # Timing: 09:20 to 15:15 (needs 5+ bars of data)
+            if hasattr(self, 'calculus') and not choppy_blocked:
+                ls_start = now.replace(hour=9, minute=20, second=0)
+                ls_end = now.replace(hour=15, minute=15, second=0)
+                if ls_start <= now <= ls_end:
+                    for symbol in symbols_to_scan:
+                        if self.calculus.bar_count(symbol) >= 25:
+                            sweeps = self.calculus.detect_liquidity_sweep(symbol)
+                            for sw in sweeps:
+                                if sw['quality'] < 45:
+                                    continue
+                                # Get option chain for the sweep direction
+                                sw_spot = self.latest_spot.get(symbol, 0)
+                                if sw_spot <= 0:
+                                    continue
+                                sw_dte = dte  # Use same DTE as other strategies
+                                T = max(sw_dte / 365.0, 1/365.0)
+                                sw_type = f"BUY_{sw['direction']}_SWEEP"
+                                sw_strike, sw_ltp, sw_iv = self._get_strike_from_chain(
+                                    symbol, sw_spot, sw['direction'], sw_dte)
+                                if sw_ltp <= 0:
+                                    continue
+                                g = greeks_from_market_price(
+                                    sw_ltp, sw_spot, sw_strike, T, RISK_FREE_RATE,
+                                    sw['direction'])
+                                if sw_ltp > MIN_PREMIUM_BUY:
+                                    # SL at spike peak + 30%
+                                    sl_buffer = sw['spike_size'] * 0.3
+                                    # Target: 80% of spike retrace
+                                    target_move = sw['spike_size'] * 0.8 * 0.5  # delta-adjusted
+                                    sig = {
+                                        'type': sw_type,
+                                        'strike': sw_strike,
+                                        'premium': sw_ltp,
+                                        'greeks': g,
+                                        'reason': (f"Liquidity Sweep: {sw['spike_dir']} spike "
+                                                  f"{sw['spike_pct']:.3f}% Z={sw['z_score']:.1f} "
+                                                  f"rev={sw['reversal_ratio']:.0%} "
+                                                  f"{'AccFlip ' if sw['accel_flip'] else ''}"
+                                                  f"Q={sw['quality']} [LIVE]"),
+                                        'target': sw_ltp + target_move,
+                                        'sl': max(sw_ltp * 0.5, sw_ltp - sl_buffer * 0.5),
+                                        'strategy': 'Liquidity Sweep',
+                                        'symbol': symbol,
+                                        'spot': sw_spot,
+                                        'dte': sw_dte,
+                                        'quality_score': sw['quality'],
+                                        '_sweep_quality': sw['quality'],
+                                        '_sweep_half_lot': sw['quality'] < 60,
+                                    }
+                                    all_signals.append(sig)
+                                    logger.info(f"  SIGNAL [Liquidity Sweep]: {sw_type} "
+                                              f"Strike={sw_strike:.0f} Premium=Rs {sw_ltp:.2f} "
+                                              f"| {sig['reason']}")
+
+
         # v10: Write live scan data for dashboard
         self._write_live_scan_data(scan_data, vix)
 
@@ -4290,6 +4353,11 @@ class PaperTrader:
                     skipped += 1
                     continue
                 logger.info(f"  TI_PASS: {sig.get('symbol','')} {sig.get('type','')} \u2014 {ti_reason}")
+
+# v13.1: Liquidity Sweep sizing — Q<60: 1 lot (min), Q>=60: full tier
+            if sig.get('_sweep_half_lot'):
+                sig['_lot_tier'] = 'BASE'  # 1 lot only for lower quality sweeps
+                logger.info(f"  SWEEP_MIN_LOT: {sig.get('symbol','')} Q={sig.get('_sweep_quality',0)} < 60 -- 1 lot")
 
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],

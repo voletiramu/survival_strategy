@@ -2910,6 +2910,58 @@ class CommodityPaperTrader:
                                f"Strike={sig['strike']:,.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
 
+        
+            # ---- v13.1: LIQUIDITY SWEEP for commodities ----
+            if hasattr(self, 'calculus') and not choppy_blocked:
+                ls_start = now.replace(hour=9, minute=20, second=0)
+                ls_end = now.replace(hour=23, minute=15, second=0)
+                if ls_start <= now <= ls_end:
+                    for commodity in commodities_to_scan:
+                        if self.calculus.bar_count(commodity) >= 25:
+                            sweeps = self.calculus.detect_liquidity_sweep(commodity)
+                            for sw in sweeps:
+                                if sw['quality'] < 45:
+                                    continue
+                                sw_spot = self.latest_spot.get(commodity, 0)
+                                if sw_spot <= 0:
+                                    continue
+                                sw_dte = dte
+                                T = max(sw_dte / 365.0, 1/365.0)
+                                sw_type = f"BUY_{sw['direction']}_SWEEP"
+                                sw_strike, sw_ltp, sw_iv = self._get_strike_from_chain(
+                                    commodity, sw_spot, sw['direction'], sw_dte)
+                                if sw_ltp <= 0:
+                                    continue
+                                g = greeks_from_market_price(
+                                    sw_ltp, sw_spot, sw_strike, T, RISK_FREE_RATE,
+                                    sw['direction'])
+                                if sw_ltp > MIN_PREMIUM_BUY:
+                                    sl_buffer = sw['spike_size'] * 0.3
+                                    target_move = sw['spike_size'] * 0.8 * 0.5
+                                    sig = {
+                                        'type': sw_type,
+                                        'commodity': commodity,
+                                        'strike': sw_strike,
+                                        'premium': sw_ltp,
+                                        'greeks': g,
+                                        'reason': (f"Liquidity Sweep: {sw['spike_dir']} spike "
+                                                  f"{sw['spike_pct']:.3f}% Z={sw['z_score']:.1f} "
+                                                  f"Q={sw['quality']} [LIVE]"),
+                                        'target': sw_ltp + target_move,
+                                        'sl': max(sw_ltp * 0.5, sw_ltp - sl_buffer * 0.5),
+                                        'strategy': 'Liquidity Sweep',
+                                        'spot': sw_spot,
+                                        'dte': sw_dte,
+                                        'quality_score': sw['quality'],
+                                        '_sweep_quality': sw['quality'],
+                                        '_sweep_half_lot': sw['quality'] < 60,
+                                    }
+                                    all_signals.append(sig)
+                                    logger.info(f"  SIGNAL [Liquidity Sweep]: {sw_type} "
+                                              f"Strike={sw_strike:.0f} Premium=Rs {sw_ltp:.2f} "
+                                              f"| {sig['reason']}")
+
+
         # v10: Write live scan data for dashboard
         self._write_live_scan_data(scan_data)
 
@@ -3307,9 +3359,9 @@ class CommodityPaperTrader:
             # ---- v12.0: PHYSICS GATE — mathematical signal quality filter ----
             # Blocks entries where: momentum dying, wave peak, VWAP stretched, RSI extreme
             # Backtested: PF 2.65 -> 3.18, blocks wrong-direction entries mathematically
-            if hasattr(self, 'calculus') and self.calculus.bar_count(sig['symbol']) >= 6:
+            if hasattr(self, 'calculus') and self.calculus.bar_count(sig['commodity']) >= 6:
                 sig_dir = 'CE' if 'CE' in sig['type'] else 'PE'
-                phy_score, phy_diag = self.calculus.physics_gate(sig['symbol'], sig_dir, sig['spot'])
+                phy_score, phy_diag = self.calculus.physics_gate(sig['commodity'], sig_dir, sig['spot'])
                 sig['_physics_score'] = phy_score
                 sig['_physics_diag'] = phy_diag
                 if phy_score < 0:
@@ -3318,14 +3370,14 @@ class CommodityPaperTrader:
                     if phy_diag.get('wave_peak'): warnings_list.append('WAVE_PEAK')
                     if phy_diag.get('stretched'): warnings_list.append('VWAP_STRETCHED')
                     if phy_diag.get('rsi_extreme'): warnings_list.append('RSI_EXTREME')
-                    logger.info(f"  PHYSICS_BLOCK: {sig['symbol']} {sig['type']} "
+                    logger.info(f"  PHYSICS_BLOCK: {sig['commodity']} {sig['type']} "
                                f"score={phy_score} [{','.join(warnings_list)}] "
                                f"accel={phy_diag.get('accel','?')} wave={phy_diag.get('wave_risk','?')} "
                                f"vwap={phy_diag.get('vwap_stretch','?')} rsi={phy_diag.get('rsi','?')}")
                     skipped += 1
                     continue
                 else:
-                    logger.info(f"  PHYSICS_PASS: {sig['symbol']} {sig['type']} "
+                    logger.info(f"  PHYSICS_PASS: {sig['commodity']} {sig['type']} "
                                f"score={phy_score} accel={phy_diag.get('accel','?')} "
                                f"wave={phy_diag.get('wave_risk','?')}")
             # ---- v10.4: IV + DTE hard gate ----
