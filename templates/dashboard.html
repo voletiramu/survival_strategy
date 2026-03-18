@@ -1196,7 +1196,67 @@
     <div class="dashboard-layout">
         <!-- MAIN COLUMN -->
         <div class="main-column">
-            <!-- Live Market Scanner (indicator boxes for all symbols) -->
+            <!-- 1. Open Positions (Rich Cards) — TOP for instant visibility -->
+            <div class="section">
+                <div class="section-header">
+                    <span class="section-title">Open Positions <span class="badge" id="openBadge">0</span></span>
+                </div>
+                <div id="positionCards">
+                    <div class="loading">Loading positions...</div>
+                </div>
+            </div>
+
+            <!-- 2. Greeks Bar -->
+            <div class="greeks-bar" id="greeksBar" style="display:none"></div>
+
+            <!-- 3. Physics Gate v12 — signal quality decisions -->
+            <div class="section" id="physicsGateSection" style="display:none">
+                <div class="section-header">
+                    <span class="section-title">
+                        <span style="margin-right:6px">&#9889;</span>Physics Gate v12
+                        <span class="badge" id="physicsGateBadge" style="background:var(--accent-purple-bg);color:var(--accent-purple)">0</span>
+                    </span>
+                    <div style="display:flex;gap:8px;align-items:center;font-size:12px">
+                        <span id="physicsPassCount" style="color:var(--accent-green)">0 passed</span>
+                        <span style="color:var(--text-muted)">|</span>
+                        <span id="physicsBlockCount" style="color:var(--accent-red)">0 blocked</span>
+                    </div>
+                </div>
+                <!-- Physics Gate Summary Bar -->
+                <div id="physicsGateBar" style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin:0 16px 12px 16px;background:var(--border)">
+                    <div id="physicsPassBar" style="background:var(--accent-green);transition:width 0.5s"></div>
+                    <div id="physicsBlockBar" style="background:var(--accent-red);transition:width 0.5s"></div>
+                </div>
+                <div id="physicsGateContent" style="padding:0 12px 12px 12px"></div>
+            </div>
+
+            <!-- 4. Signals Today -->
+            <div class="section" id="signalSection" style="display:none">
+                <div class="section-header">
+                    <span class="section-title">Signals Today <span class="badge" id="signalBadge">0</span></span>
+                </div>
+                <div class="table-wrap">
+                    <table class="trades-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Strategy</th>
+                                <th>Symbol</th>
+                                <th>Type</th>
+                                <th>Strike</th>
+                                <th>Premium</th>
+                                <th>Market</th>
+                                <th>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="signalTableBody">
+                            <tr><td colspan="8" class="loading">Loading signals...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 5. Live Market Scanner -->
             <div class="section" id="scannerSection" style="display:none">
                 <div class="section-header">
                     <span class="section-title">Live Market Scanner <span class="badge" id="scannerBadge">0</span></span>
@@ -1205,7 +1265,7 @@
                 <div class="scanner-grid" id="scannerGrid"></div>
             </div>
 
-            <!-- ====== INTERACTIVE CHART WITH CPR/VWAP/INDICATORS ====== -->
+            <!-- 6. Interactive Chart -->
             <div class="chart-section" id="chartSection">
                 <div class="chart-header">
                     <div class="chart-title-area">
@@ -1261,26 +1321,13 @@
                 </div>
             </div>
 
-            <!-- Greeks Bar -->
-            <div class="greeks-bar" id="greeksBar" style="display:none"></div>
-
-            <!-- Open Positions (Rich Cards) -->
-            <div class="section">
-                <div class="section-header">
-                    <span class="section-title">Open Positions <span class="badge" id="openBadge">0</span></span>
-                </div>
-                <div id="positionCards">
-                    <div class="loading">Loading positions...</div>
-                </div>
-            </div>
-
-            <!-- Daily P&L Chart (Main Column — larger) -->
+            <!-- 7. Daily P&L Chart -->
             <div class="pnl-chart-main" id="pnlChartMain" style="display:none">
                 <div class="pnl-chart-title">Daily P&L History</div>
                 <div class="pnl-chart-large" id="pnlChartLarge"></div>
             </div>
 
-            <!-- Closed Trades (Full Table) -->
+            <!-- 8. Closed Trades (Full Table) -->
             <div class="section">
                 <div class="section-header">
                     <span class="section-title">Closed Trades <span class="badge" id="closedBadge">0</span></span>
@@ -1325,53 +1372,6 @@
                     </table>
                 </div>
                 <div id="closedCards" style="display:none"></div>
-            </div>
-
-            <!-- Signals Today -->
-            <div class="section" id="signalSection" style="display:none">
-                <div class="section-header">
-                    <span class="section-title">Signals Today <span class="badge" id="signalBadge">0</span></span>
-                </div>
-                <div class="table-wrap">
-                    <table class="trades-table">
-                        <thead>
-                            <tr>
-                                <th>Time</th>
-                                <th>Strategy</th>
-                                <th>Symbol</th>
-                                <th>Type</th>
-                                <th>Strike</th>
-                                <th>Premium</th>
-                                <th>Market</th>
-                                <th>Reason</th>
-                            </tr>
-                        </thead>
-                        <tbody id="signalTableBody">
-                            <tr><td colspan="8" class="loading">Loading signals...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Physics Gate v12 -->
-            <div class="section" id="physicsGateSection" style="display:none">
-                <div class="section-header">
-                    <span class="section-title">
-                        <span style="margin-right:6px">&#9889;</span>Physics Gate v12
-                        <span class="badge" id="physicsGateBadge" style="background:var(--accent-purple-bg);color:var(--accent-purple)">0</span>
-                    </span>
-                    <div style="display:flex;gap:8px;align-items:center;font-size:12px">
-                        <span id="physicsPassCount" style="color:var(--accent-green)">0 passed</span>
-                        <span style="color:var(--text-muted)">|</span>
-                        <span id="physicsBlockCount" style="color:var(--accent-red)">0 blocked</span>
-                    </div>
-                </div>
-                <!-- Physics Gate Summary Bar -->
-                <div id="physicsGateBar" style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin:0 16px 12px 16px;background:var(--border)">
-                    <div id="physicsPassBar" style="background:var(--accent-green);transition:width 0.5s"></div>
-                    <div id="physicsBlockBar" style="background:var(--accent-red);transition:width 0.5s"></div>
-                </div>
-                <div id="physicsGateContent" style="padding:0 12px 12px 12px"></div>
             </div>
         </div>
 
