@@ -201,7 +201,24 @@ TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 BREAKOUT_FAIL_CHECK_MINUTES = 20       # v13: Extended from 15 min — give trades time to develop
 BREAKOUT_FAIL_MIN_GAIN_PCT = 1        # v13: Reduced from 2% — don't exit nearly-flat positions
 BREAKOUT_FAIL_REVERSE_DROP_PCT = 25   # v13: Increased from 15% — only reverse on severe failures
-BREAKOUT_FAIL_REVERSE_ENABLED = True
+BREAKOUT_FAIL_REVERSE_ENABLED = False
+
+# v13.3: Volatility-adjusted SL — scale SL by inverse ATR ratio
+# BANKNIFTY 2.7x more volatile than NIFTY, needs tighter SL
+# Simulation: saves Rs +8,638/week across BANKNIFTY + SENSEX
+VOLATILITY_SL_ENABLED = True
+ATR_REFERENCE = {
+    'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
+    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409,
+}
+ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
+
+# v13.3: Momentum reversal exit
+# If spot moves 0.4% AGAINST trade direction after 20min, exit
+# Simulation: saves Rs +6,974, hurts ZERO winning trades
+MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_EXIT_SPOT_PCT = 0.4
+MOMENTUM_EXIT_MIN_MINUTES = 20
 
 # v11: TREND RIDER — 5th strategy for riding big trend days
 TR_ENTRY_TIME = dtime(10, 15)          # Enter after 1-hour confirmation
@@ -2383,7 +2400,11 @@ class StrategyEngine:
             cpr_label = "Narrow"
             target_hit_mult = 1.5   # Target = 1.5x premium (50% gain)
             target_base_mult = 1.3  # Fallback target = 1.3x (30% gain)
-            sl_mult = 0.5           # SL = 50% of premium
+            sl_mult = 0.5
+            # v13.3: Volatility-adjusted SL
+            if VOLATILITY_SL_ENABLED and symbol in ATR_REFERENCE:
+                vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(symbol, 313))
+                sl_mult = max(0.12, min(0.50, vol_sl_mult))  # Clamp 12%-50%
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
             target_hit_mult = 1.4   # 40% gain

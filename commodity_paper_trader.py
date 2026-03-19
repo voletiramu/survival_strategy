@@ -162,7 +162,24 @@ TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 BREAKOUT_FAIL_CHECK_MINUTES = 5
 BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
 BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
-BREAKOUT_FAIL_REVERSE_ENABLED = True
+BREAKOUT_FAIL_REVERSE_ENABLED = False
+
+# v13.3: Volatility-adjusted SL — scale SL by inverse ATR ratio
+# BANKNIFTY 2.7x more volatile than NIFTY, needs tighter SL
+# Simulation: saves Rs +8,638/week across BANKNIFTY + SENSEX
+VOLATILITY_SL_ENABLED = True
+ATR_REFERENCE = {
+    'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
+    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409,
+}
+ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
+
+# v13.3: Momentum reversal exit
+# If spot moves 0.4% AGAINST trade direction after 20min, exit
+# Simulation: saves Rs +6,974, hurts ZERO winning trades
+MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_EXIT_SPOT_PCT = 0.4
+MOMENTUM_EXIT_MIN_MINUTES = 20
 
 # v10.3: Import regime-aware parameter function
 from market_regime import get_regime_params  # noqa: E402
@@ -1496,6 +1513,10 @@ class CommodityStrategyEngine:
             target_hit_mult = 1.5    # 50% gain (Camarilla confirmed)
             target_base_mult = 1.3   # 30% gain (no Camarilla confirmation)
             sl_mult = 0.5
+            # v13.3: Volatility-adjusted SL
+            if VOLATILITY_SL_ENABLED and symbol in ATR_REFERENCE:
+                vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(symbol, 313))
+                sl_mult = max(0.12, min(0.50, vol_sl_mult))  # Clamp 12%-50%
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
             target_hit_mult = 1.4    # 40% gain

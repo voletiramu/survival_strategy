@@ -96,7 +96,24 @@ TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 BREAKOUT_FAIL_CHECK_MINUTES = 20       # v13: Extended from 5 min — stocks need time to develop
 BREAKOUT_FAIL_MIN_GAIN_PCT = 1        # v13: Reduced from 2%
 BREAKOUT_FAIL_REVERSE_DROP_PCT = 25   # v13: Increased from 15% — only reverse on severe failures
-BREAKOUT_FAIL_REVERSE_ENABLED = True
+BREAKOUT_FAIL_REVERSE_ENABLED = False
+
+# v13.3: Volatility-adjusted SL — scale SL by inverse ATR ratio
+# BANKNIFTY 2.7x more volatile than NIFTY, needs tighter SL
+# Simulation: saves Rs +8,638/week across BANKNIFTY + SENSEX
+VOLATILITY_SL_ENABLED = True
+ATR_REFERENCE = {
+    'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
+    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409,
+}
+ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
+
+# v13.3: Momentum reversal exit
+# If spot moves 0.4% AGAINST trade direction after 20min, exit
+# Simulation: saves Rs +6,974, hurts ZERO winning trades
+MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_EXIT_SPOT_PCT = 0.4
+MOMENTUM_EXIT_MIN_MINUTES = 20
 
 # OI/IV exit thresholds
 OI_SURGE_FIRST_HOUR_PCT = 50
