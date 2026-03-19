@@ -18,6 +18,10 @@ Usage:
 """
 
 import sys
+
+# v13.7: Consecutive error counters for auto-recovery
+_eq_err_count = 0
+_cm_err_count = 0
 import os
 import time
 import signal
@@ -285,6 +289,12 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
                                 pass
                 except Exception as e:
                     logger.error(f"[EquityThread] Scan error: {e}")
+                    global _eq_err_count
+                    _eq_err_count += 1
+                    if _eq_err_count >= 10:
+                        logger.error(f"[EquityThread] AUTO-RECOVERY: {_eq_err_count} consecutive errors — restarting")
+                        import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                        break
                     import traceback
                     traceback.print_exc()
                     # v7.2: Send Telegram notification for scan failure
@@ -405,7 +415,13 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                                 except Exception:
                                     pass
                 except Exception as e:
-                    logger.error(f"[CommodityThread] Scan error: {e}")
+                    logger.error(f"[CommodityThread] Scan error: {e}", exc_info=True)
+                    global _cm_err_count
+                    _cm_err_count += 1
+                    if _cm_err_count >= 10:
+                        logger.error(f"[CommodityThread] AUTO-RECOVERY: {_cm_err_count} consecutive errors — restarting")
+                        import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                        break
                     import traceback
                     traceback.print_exc()
                     # v7.2: Send Telegram notification for scan failure

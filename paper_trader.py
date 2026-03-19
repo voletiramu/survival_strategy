@@ -3663,6 +3663,7 @@ class PaperTrader:
                         if _bc > 0 and _bc % 20 == 1: logger.info(f"  SWEEP_BARS: {symbol} has {_bc} bars")
                         if self.calculus.bar_count(symbol) >= 25:
                             sweeps = self.calculus.detect_liquidity_sweep(symbol)
+                            if not sweeps: continue
                             for sw in sweeps:
                                 if sw['quality'] < 45:
                                     continue
@@ -3673,7 +3674,7 @@ class PaperTrader:
                                 sw_dte = dte  # Use same DTE as other strategies
                                 T = max(sw_dte / 365.0, 1/365.0)
                                 sw_type = f"BUY_{sw['direction']}_SWEEP"
-                                sw_strike, sw_ltp, sw_iv = self._get_strike_from_chain(
+                                sw_strike, sw_ltp, sw_iv = self.engine._get_strike_from_chain(
                                     symbol, sw_spot, sw['direction'], sw_dte)
                                 if sw_ltp <= 0:
                                     continue

@@ -452,6 +452,13 @@ class MarketCalculus:
     # Hybrid: Q>=45 half-lot, Q>=60 full-lot
 
     def detect_liquidity_sweep(self, symbol, spot=None):
+        """Safe wrapper — returns [] on any error."""
+        try:
+            return self._detect_liquidity_sweep_inner(symbol, spot)
+        except Exception:
+            return []
+
+    def _detect_liquidity_sweep_inner(self, symbol, spot=None):
         """Detect SL hunt / liquidity sweep in real-time from bar data.
 
         Returns list of sweep signals with quality scores.

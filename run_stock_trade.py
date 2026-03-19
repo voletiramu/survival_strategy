@@ -20,6 +20,9 @@ Deployment:
 """
 
 import sys
+
+_stk_err_count = 0  # v13.7: Auto-recovery counter
+
 import os
 import time
 import signal
@@ -157,6 +160,16 @@ def stock_loop(interval_sec=30, stop_event=None):
 
     trader = StockPaperTrader()
 
+    # v10.5: Start market data pipeline for NSE stock option chain fallback
+    try:
+        from market_data_pipeline import MarketDataPipeline
+        pipeline = MarketDataPipeline()
+        pipeline.start()
+        trader.set_market_pipeline(pipeline)
+        logger.info("[StockLoop] MarketDataPipeline ACTIVE — NSE stock option chain fallback enabled")
+    except Exception as e:
+        logger.warning(f"[StockLoop] MarketDataPipeline failed: {e} — NSE fallback disabled")
+
     # v10.2e: Live data logger for backtesting
     try:
         from live_data_logger import LiveDataLogger
@@ -231,6 +244,12 @@ def stock_loop(interval_sec=30, stop_event=None):
                 trader.run_once()
             except Exception as e:
                 logger.error(f"[StockLoop] Scan error: {e}", exc_info=True)
+                global _stk_err_count
+                _stk_err_count += 1
+                if _stk_err_count >= 10:
+                    logger.error(f"[StockLoop] AUTO-RECOVERY: {_stk_err_count} consecutive errors — restarting")
+                    import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-stock-trading'])
+                    break
 
             if stop_event:
                 stop_event.wait(interval_sec)

@@ -2940,6 +2940,7 @@ class CommodityPaperTrader:
                     for commodity in ['GOLDM', 'SILVERM', 'CRUDEOILM']:
                         if self.calculus.bar_count(commodity) >= 25:
                             sweeps = self.calculus.detect_liquidity_sweep(commodity)
+                            if not sweeps: continue
                             for sw in sweeps:
                                 if sw['quality'] < 45:
                                     continue

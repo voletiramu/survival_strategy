@@ -3424,42 +3424,51 @@ class StockPaperTrader:
 
         
         # ---- v13.1: LIQUIDITY SWEEP for stocks ----
-        if hasattr(self, 'calculus'):
-            _ls_now = datetime.now()
-            _ls_s = _ls_now.replace(hour=9, minute=16, second=0)
-            _ls_e = _ls_now.replace(hour=15, minute=15, second=0)
-            if _ls_s <= _ls_now <= _ls_e:
-                for _si in watchlist:
-                    _sym = _si.get('symbol', '')
-                    if self.calculus.bar_count(_sym) >= 25:
-                        _sweeps = self.calculus.detect_liquidity_sweep(_sym)
-                        for _sw in _sweeps:
-                            if _sw['quality'] < 45:
-                                continue
-                            _sw_spot = self.get_stock_spot(_sym) or 0
-                            if _sw_spot <= 0:
-                                continue
-                            _sw_dir = _sw['direction']
-                            _sw_type = 'BUY_' + _sw_dir + '_SWEEP'
-                            _sw_strike, _sw_ltp, _sw_iv = self.engine._get_strike_from_chain(_sym, _sw_spot, _sw_dir, dte)
-                            if _sw_ltp > 5:
-                                _T = max(dte, 1) / 365.0
-                                _g = greeks_from_market_price(_sw_ltp, _sw_spot, _sw_strike, _T, RISK_FREE_RATE, _sw_dir)
-                                _q = _sw['quality']
-                                all_signals.append({
-                                    'type': _sw_type,
-                                    'strike': _sw_strike,
-                                    'premium': _sw_ltp,
-                                    'greeks': _g,
-                                    'symbol': _sym,
-                                    'spot': _sw_spot,
-                                    'strategy': 'Liquidity Sweep',
-                                    'reason': 'Liquidity Sweep: ' + _sw['spike_dir'] + ' spike Q=' + str(_q) + ' [LIVE]',
-                                    'target': _sw_ltp * 1.5,
-                                    'sl': _sw_ltp * 0.5,
-                                    'quality_score': _q,
-                                })
-                                logger.info('  SIGNAL [Liquidity Sweep]: ' + _sym + ' ' + _sw_type + ' Q=' + str(_q))
+        try:
+            if hasattr(self, 'calculus'):
+                _ls_now = datetime.now()
+                _ls_s = _ls_now.replace(hour=9, minute=16, second=0)
+                _ls_e = _ls_now.replace(hour=15, minute=15, second=0)
+                if _ls_s <= _ls_now <= _ls_e:
+                    for _si in watchlist:
+                        _sym = _si.get('symbol', '')
+                        if self.calculus.bar_count(_sym) >= 25:
+                            _sweeps = self.calculus.detect_liquidity_sweep(_sym)
+                            for _sw in _sweeps:
+                                if _sw['quality'] < 45:
+                                    continue
+                                _sw_spot = self.get_stock_spot(_sym) or 0
+                                if _sw_spot <= 0:
+                                    continue
+                                _sw_dir = _sw['direction']
+                                _sw_type = 'BUY_' + _sw_dir + '_SWEEP'
+                                _opt = self.engine.select_optimal_strike(_sym, _sw_spot, _sw_dir)
+                                if not _opt:
+                                    continue
+                                _sw_strike = _opt.get('strike', 0)
+                                _sw_ltp = _opt.get('ltp', 0)
+                                _sw_iv = _opt.get('iv', 0)
+                                if _sw_ltp > 5:
+                                    _T = max(dte, 1) / 365.0
+                                    _g = greeks_from_market_price(_sw_ltp, _sw_spot, _sw_strike, _T, RISK_FREE_RATE, _sw_dir)
+                                    _q = _sw['quality']
+                                    all_signals.append({
+                                        'type': _sw_type,
+                                        'strike': _sw_strike,
+                                        'premium': _sw_ltp,
+                                        'greeks': _g,
+                                        'symbol': _sym,
+                                        'spot': _sw_spot,
+                                        'strategy': 'Liquidity Sweep',
+                                        'reason': 'Liquidity Sweep: ' + _sw['spike_dir'] + ' spike Q=' + str(_q) + ' [LIVE]',
+                                        'target': _sw_ltp * 1.5,
+                                        'sl': _sw_ltp * 0.5,
+                                        'quality_score': _q,
+                                    })
+                                    logger.info('  SIGNAL [Liquidity Sweep]: ' + _sym + ' ' + _sw_type + ' Q=' + str(_q))
+
+        except Exception as _sweep_err:
+            logger.debug(f"  SWEEP_SKIP: {_sweep_err}")
 
         # v9.6: Build indicators lookup from watchlist (signals don't carry indicators)
         ind_lookup = {si['symbol']: si.get('indicators', {}) for si in watchlist}
