@@ -1538,7 +1538,7 @@ class CommodityStrategyEngine:
                     logger.info(f"  CPR_DIR_SKIP: {commodity} CE breakout but body={intraday_body:.1f} & spot<VWAP={vwap:.0f}")
                 else:
                     # v10.5: Live API greeks ONLY — no B76 fallback
-                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
+                    opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
                     if opt:
                         ce_strike = opt['strike']
                         g = opt['greeks']
@@ -1557,7 +1557,7 @@ class CommodityStrategyEngine:
                     logger.info(f"  CPR_DIR_SKIP: {commodity} PE breakdown but body={intraday_body:.1f} & spot>VWAP={vwap:.0f}")
                 else:
                     # v10.5: Live API greeks ONLY — no B76 fallback
-                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
+                    opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
                     if opt:
                         pe_strike = opt['strike']
                         g = opt['greeks']
@@ -1577,7 +1577,7 @@ class CommodityStrategyEngine:
             margin_ok = self.portfolio.capital >= spec['margin']
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_int) * strike_int
-                opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_SELL)
+                opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_SELL)
                 if opt:
                     g = opt['greeks']
                     ce_strike = opt['strike']
@@ -1590,7 +1590,7 @@ class CommodityStrategyEngine:
                         })
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_int) * strike_int
-                opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_SELL)
+                opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_SELL)
                 if opt:
                     g = opt['greeks']
                     pe_strike = opt['strike']
@@ -1649,7 +1649,7 @@ class CommodityStrategyEngine:
                 else:
                     # v9.5: Greeks-based strike selection (best delta + highest gamma)
                     # v10.5: Live API greeks ONLY — no Black-76 fallback
-                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'CE', MCX_MIN_PREMIUM_BUY)
+                    opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'CE', MCX_MIN_PREMIUM_BUY)
                     if opt:
                         ce_strike = opt['strike']
                         g = opt['greeks']
@@ -1669,7 +1669,7 @@ class CommodityStrategyEngine:
                     logger.info(f"  GAMMA_DIR_SKIP: {commodity} PE but spot={spot:.0f} > VWAP={gamma_vwap:.0f}")
                 else:
                     # v10.5: Live API greeks ONLY — no Black-76 fallback
-                    opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'PE', MCX_MIN_PREMIUM_BUY)
+                    opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv * iv_mult, 'PE', MCX_MIN_PREMIUM_BUY)
                     if opt:
                         pe_strike = opt['strike']
                         g = opt['greeks']
@@ -1698,7 +1698,7 @@ class CommodityStrategyEngine:
         if ohlc['low'] <= ind['demand_zone'] * 1.01 and spot > ind['demand_zone'] and ind['demand_strength'] >= 2:
             ce_strike = round(spot / strike_int) * strike_int
             # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
+            opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
             if opt:
                 g = opt['greeks']
                 ce_strike = opt['strike']
@@ -1717,7 +1717,7 @@ class CommodityStrategyEngine:
         elif ohlc['high'] >= ind['supply_zone'] * 0.99 and spot < ind['supply_zone'] and ind['supply_strength'] >= 2:
             pe_strike = round(spot / strike_int) * strike_int
             # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
+            opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
             if opt:
                 g = opt['greeks']
                 pe_strike = opt['strike']
@@ -1754,7 +1754,7 @@ class CommodityStrategyEngine:
         # BUY CE: PCR > 1.05 (bullish momentum), near VWAP
         if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
             # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_BUY)
+            opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_BUY)
             if opt:
                 g = opt['greeks']
                 ce_strike = opt['strike']
@@ -1774,7 +1774,7 @@ class CommodityStrategyEngine:
         # BUY PE: PCR < 0.95 (bearish momentum), near VWAP
         elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
             # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_BUY)
+            opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_BUY)
             if opt:
                 g = opt['greeks']
                 pe_strike = opt['strike']
@@ -1841,7 +1841,7 @@ class CommodityStrategyEngine:
         if ohlc['high'] > resistance + gap:
             pe_strike = round((spot - distance) / strike_int) * strike_int
             # v10.7: Live LTP via select_strike_live with target_strike — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_SELL, target_strike=pe_strike)
+            opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_SELL, target_strike=pe_strike)
             if opt:
                 g = opt['greeks']
                 pe_strike = opt['strike']
@@ -1863,7 +1863,7 @@ class CommodityStrategyEngine:
         if ohlc['low'] < support - gap:
             ce_strike = round((spot + distance) / strike_int) * strike_int
             # v10.7: Live LTP via select_strike_live with target_strike — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_SELL, target_strike=ce_strike)
+            opt = self.engine.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_SELL, target_strike=ce_strike)
             if opt:
                 g = opt['greeks']
                 ce_strike = opt['strike']
@@ -2952,7 +2952,8 @@ class CommodityPaperTrader:
                                 sw_type = f"BUY_{sw['direction']}_SWEEP"
                                 spec = COMMODITIES[commodity]
                                 _si = spec['strike_interval']
-                                _opt = self.select_strike_live(commodity, sw_spot, _si, T, RISK_FREE_RATE, 0.30, sw['direction'], MCX_MIN_PREMIUM_BUY)
+                                _eng = getattr(self, 'engine', self)
+                                _opt = _eng.select_strike_live(commodity, sw_spot, _si, T, RISK_FREE_RATE, 0.30, sw['direction'], MCX_MIN_PREMIUM_BUY)
                                 if not _opt or _opt.get('price', 0) <= 0:
                                     continue
                                 sw_strike = _opt['strike']
