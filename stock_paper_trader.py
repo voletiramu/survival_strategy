@@ -2941,7 +2941,7 @@ class StockPaperTrader:
                         drop_bf = (current_premium - entry_prem_bf) / entry_prem_bf * 100
 
                     # Rapid drop: exit + queue reverse
-                    if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
+                    if BREAKOUT_FAIL_REVERSE_ENABLED and drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
                         logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s")
                         self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL_REVERSE')
                         self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
@@ -3218,6 +3218,27 @@ class StockPaperTrader:
                         f"Hold: {hold_score}/{hold_label}")
 
             exit_reason = None
+
+            # ---- v13.8: MOMENTUM EXIT — spot reverses against direction ----
+            if MOMENTUM_EXIT_ENABLED and exit_reason is None:
+                _me_entry_spot = pos.get('details', {}).get('spot', 0) if isinstance(pos.get('details'), dict) else 0
+                _me_spot_now = self.get_stock_spot(pos.get('symbol', pos.get('stock_symbol', ''))) or 0
+                _me_entry_ts = pos.get('timestamp', '')
+                if _me_entry_spot > 0 and _me_spot_now > 0 and _me_entry_ts:
+                    try:
+                        _me_entry_dt = datetime.fromisoformat(_me_entry_ts)
+                        _me_hold_min = (datetime.now() - _me_entry_dt).total_seconds() / 60
+                        if _me_hold_min >= MOMENTUM_EXIT_MIN_MINUTES:
+                            _me_change = (_me_spot_now - _me_entry_spot) / _me_entry_spot * 100
+                            _me_is_ce = 'CE' in pos.get('signal_type', '')
+                            _me_against = (_me_is_ce and _me_change < -MOMENTUM_EXIT_SPOT_PCT) or                                           (not _me_is_ce and _me_change > MOMENTUM_EXIT_SPOT_PCT)
+                            if _me_against and pos.get('unrealized_pnl', 0) <= 0:
+                                exit_reason = 'MOMENTUM_EXIT'
+                                logger.info(f"  MOMENTUM_EXIT: {pos['id']} spot {_me_entry_spot:.0f}->{_me_spot_now:.0f} "
+                                           f"({_me_change:+.2f}%) after {_me_hold_min:.0f}min")
+                    except Exception:
+                        pass
+
 
             if not pos['is_sell']:
                 # BUY positions
