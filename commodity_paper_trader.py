@@ -1514,8 +1514,8 @@ class CommodityStrategyEngine:
             target_base_mult = 1.3   # 30% gain (no Camarilla confirmation)
             sl_mult = 0.5
             # v13.3: Volatility-adjusted SL
-            if VOLATILITY_SL_ENABLED and symbol in ATR_REFERENCE:
-                vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(symbol, 313))
+            if VOLATILITY_SL_ENABLED and commodity in ATR_REFERENCE:
+                vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(commodity, 313))
                 sl_mult = max(0.12, min(0.50, vol_sl_mult))  # Clamp 12%-50%
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
@@ -2934,10 +2934,10 @@ class CommodityPaperTrader:
         
             # ---- v13.1: LIQUIDITY SWEEP for commodities ----
             if hasattr(self, 'calculus') and not choppy_blocked:
-                ls_start = now.replace(hour=9, minute=20, second=0)
+                ls_start = now.replace(hour=9, minute=16, second=0)
                 ls_end = now.replace(hour=23, minute=15, second=0)
                 if ls_start <= now <= ls_end:
-                    for commodity in commodities_to_scan:
+                    for commodity in ['GOLDM', 'SILVERM', 'CRUDEOILM']:
                         if self.calculus.bar_count(commodity) >= 25:
                             sweeps = self.calculus.detect_liquidity_sweep(commodity)
                             for sw in sweeps:

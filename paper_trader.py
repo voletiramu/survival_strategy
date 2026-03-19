@@ -3655,10 +3655,10 @@ class PaperTrader:
             # Backtested 6 days: PF=1.98-2.95, WR=70-78%, DD<1%
             # Timing: 09:20 to 15:15 (needs 5+ bars of data)
             if hasattr(self, 'calculus') and not choppy_blocked:
-                ls_start = now.replace(hour=9, minute=20, second=0)
+                ls_start = now.replace(hour=9, minute=16, second=0)
                 ls_end = now.replace(hour=15, minute=15, second=0)
                 if ls_start <= now <= ls_end:
-                    for symbol in symbols_to_scan:
+                    for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
                         if self.calculus.bar_count(symbol) >= 25:
                             sweeps = self.calculus.detect_liquidity_sweep(symbol)
                             for sw in sweeps:

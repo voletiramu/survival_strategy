@@ -36,9 +36,29 @@
             --accent-orange-bg: rgba(245,158,11,0.1);
             --accent-purple: #a855f7;
             --accent-purple-bg: rgba(168,85,247,0.1);
+            --score-5: #00a854;
+            --score-5-bg: rgba(0,168,84,0.12);
+            --score-4: #00d26a;
+            --score-4-bg: rgba(0,210,106,0.12);
+            --score-3: #d4a017;
+            --score-3-bg: rgba(212,160,23,0.12);
+            --score-2: #f57c00;
+            --score-2-bg: rgba(245,124,0,0.12);
+            --score-1: #ff3b5c;
+            --score-1-bg: rgba(255,59,92,0.12);
             --radius: 10px;
             --radius-sm: 6px;
         }
+        .sc-5 { color: var(--score-5) !important; }
+        .sc-4 { color: var(--score-4) !important; }
+        .sc-3 { color: var(--score-3) !important; }
+        .sc-2 { color: var(--score-2) !important; }
+        .sc-1 { color: var(--score-1) !important; }
+        .sc-bg-5 { background: var(--score-5-bg); color: var(--score-5); }
+        .sc-bg-4 { background: var(--score-4-bg); color: var(--score-4); }
+        .sc-bg-3 { background: var(--score-3-bg); color: var(--score-3); }
+        .sc-bg-2 { background: var(--score-2-bg); color: var(--score-2); }
+        .sc-bg-1 { background: var(--score-1-bg); color: var(--score-1); }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
@@ -171,15 +191,54 @@
         .negative { color: var(--accent-red); }
         .neutral { color: var(--text-primary); }
 
-        /* ====== TWO-COLUMN LAYOUT ====== */
+        /* ====== TWO-COLUMN LAYOUT (legacy, hidden) ====== */
         .dashboard-layout {
-            display: grid;
+            display: none;
             grid-template-columns: 1fr 380px;
             gap: 0;
             padding: 14px 20px;
         }
         .main-column { min-width: 0; }
         .sidebar { padding-left: 14px; }
+
+        /* ====== GRID DASHBOARD ====== */
+        .grid-dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+            gap: 12px;
+            padding: 12px 20px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        .grid-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 14px;
+            transition: border-color 0.2s;
+        }
+        .grid-card:hover { border-color: var(--border-hover); }
+        .grid-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+        .grid-card-title {
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }
+        .grid-full { grid-column: 1 / -1; }
+        .grid-half { grid-column: span 2; }
+        @media (max-width: 768px) {
+            .grid-dashboard { grid-template-columns: 1fr; padding: 8px; gap: 8px; }
+            .grid-half { grid-column: span 1; }
+        }
 
         /* ====== SECTION ====== */
         .section { margin-bottom: 14px; }
@@ -1192,218 +1251,213 @@
         <button class="market-tab" onclick="switchMarketTab('oi')" data-tab="oi">OI Strats<span class="tab-count" id="tabCountOi"></span></button>
     </div>
 
-    <!-- TWO-COLUMN LAYOUT -->
-    <div class="dashboard-layout">
-        <!-- MAIN COLUMN -->
-        <div class="main-column">
-            <!-- 1. Open Positions (Rich Cards) — TOP for instant visibility -->
-            <div class="section">
-                <div class="section-header">
-                    <span class="section-title">Open Positions <span class="badge" id="openBadge">0</span></span>
-                </div>
-                <div id="positionCards">
-                    <div class="loading">Loading positions...</div>
-                </div>
+    <!-- GRID DASHBOARD -->
+    <div class="grid-dashboard">
+        <!-- 1. Open Positions (full width) -->
+        <div class="grid-full section">
+            <div class="section-header">
+                <span class="section-title">Open Positions <span class="badge" id="openBadge">0</span></span>
             </div>
-
-            <!-- 2. Greeks Bar -->
-            <div class="greeks-bar" id="greeksBar" style="display:none"></div>
-
-            <!-- 3. Physics Gate v12 — signal quality decisions -->
-            <div class="section" id="physicsGateSection" style="display:none">
-                <div class="section-header">
-                    <span class="section-title">
-                        <span style="margin-right:6px">&#9889;</span>Physics Gate v12
-                        <span class="badge" id="physicsGateBadge" style="background:var(--accent-purple-bg);color:var(--accent-purple)">0</span>
-                    </span>
-                    <div style="display:flex;gap:8px;align-items:center;font-size:12px">
-                        <span id="physicsPassCount" style="color:var(--accent-green)">0 passed</span>
-                        <span style="color:var(--text-muted)">|</span>
-                        <span id="physicsBlockCount" style="color:var(--accent-red)">0 blocked</span>
-                    </div>
-                </div>
-                <!-- Physics Gate Summary Bar -->
-                <div id="physicsGateBar" style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin:0 16px 12px 16px;background:var(--border)">
-                    <div id="physicsPassBar" style="background:var(--accent-green);transition:width 0.5s"></div>
-                    <div id="physicsBlockBar" style="background:var(--accent-red);transition:width 0.5s"></div>
-                </div>
-                <div id="physicsGateContent" style="padding:0 12px 12px 12px"></div>
-            </div>
-
-            <!-- 4. Signals Today -->
-            <div class="section" id="signalSection" style="display:none">
-                <div class="section-header">
-                    <span class="section-title">Signals Today <span class="badge" id="signalBadge">0</span></span>
-                </div>
-                <div class="table-wrap">
-                    <table class="trades-table">
-                        <thead>
-                            <tr>
-                                <th>Time</th>
-                                <th>Strategy</th>
-                                <th>Symbol</th>
-                                <th>Type</th>
-                                <th>Strike</th>
-                                <th>Premium</th>
-                                <th>Market</th>
-                                <th>Reason</th>
-                            </tr>
-                        </thead>
-                        <tbody id="signalTableBody">
-                            <tr><td colspan="8" class="loading">Loading signals...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- 5. Live Market Scanner -->
-            <div class="section" id="scannerSection" style="display:none">
-                <div class="section-header">
-                    <span class="section-title">Live Market Scanner <span class="badge" id="scannerBadge">0</span></span>
-                    <span style="font-size:10px;color:var(--text-muted)" id="scannerUpdated"></span>
-                </div>
-                <div class="scanner-grid" id="scannerGrid"></div>
-            </div>
-
-            <!-- 6. Interactive Chart -->
-            <div class="chart-section" id="chartSection">
-                <div class="chart-header">
-                    <div class="chart-title-area">
-                        <span class="chart-title">Live Chart</span>
-                        <div class="chart-symbol-tabs" id="chartSymbolTabs"></div>
-                    </div>
-                    <div class="chart-controls">
-                        <span class="chart-spot-price" id="chartSpotPrice">--</span>
-                        <span class="chart-spot-change" id="chartSpotChange"></span>
-                    </div>
-                </div>
-                <div class="chart-body">
-                    <div class="chart-canvas-wrap">
-                        <div class="chart-legend">
-                            <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-red)"></div>TC</div>
-                            <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-blue)"></div>Pivot</div>
-                            <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-green)"></div>BC</div>
-                            <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-purple)"></div>VWAP</div>
-                            <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-orange)"></div>Resistance</div>
-                            <div class="chart-legend-item"><div class="chart-legend-dot" style="background:#f472b6"></div>Support</div>
-                        </div>
-                        <div id="chartContainer"></div>
-                    </div>
-                    <div class="chart-sidebar">
-                        <!-- Current Indicators -->
-                        <div class="chart-ind-panel">
-                            <div class="chart-ind-title">Live Indicators</div>
-                            <div class="chart-ind-grid" id="chartIndGrid">
-                                <div class="chart-ind-item"><div class="chart-ind-label">PCR</div><div class="chart-ind-val" id="ciPcr">--</div></div>
-                                <div class="chart-ind-item"><div class="chart-ind-label">OI Sent</div><div class="chart-ind-val" id="ciOiSent">--</div></div>
-                                <div class="chart-ind-item"><div class="chart-ind-label">IV</div><div class="chart-ind-val" id="ciIv">--</div></div>
-                                <div class="chart-ind-item"><div class="chart-ind-label">ATR</div><div class="chart-ind-val" id="ciAtr">--</div></div>
-                                <div class="chart-ind-item"><div class="chart-ind-label">VWAP</div><div class="chart-ind-val" id="ciVwap">--</div></div>
-                                <div class="chart-ind-item"><div class="chart-ind-label">CPR Width</div><div class="chart-ind-val" id="ciCprW">--</div></div>
-                                <div class="chart-ind-item"><div class="chart-ind-label">VIX</div><div class="chart-ind-val" id="ciVix">--</div></div>
-                                <div class="chart-ind-item"><div class="chart-ind-label">HV</div><div class="chart-ind-val" id="ciHv">--</div></div>
-                            </div>
-                            <div class="pcr-mini-chart" id="pcrMiniChart"></div>
-                        </div>
-                        <!-- CPR Levels -->
-                        <div class="chart-ind-panel">
-                            <div class="chart-ind-title">CPR & Key Levels</div>
-                            <div class="cpr-levels-mini" id="cprLevelsMini"></div>
-                        </div>
-                        <!-- Recommendations -->
-                        <div class="rec-panel">
-                            <div class="chart-ind-title">Recommendations</div>
-                            <div id="recContent">
-                                <div style="text-align:center;color:var(--text-muted);font-size:12px;padding:20px">Select a symbol to see recommendations</div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 7. Daily P&L Chart -->
-            <div class="pnl-chart-main" id="pnlChartMain" style="display:none">
-                <div class="pnl-chart-title">Daily P&L History</div>
-                <div class="pnl-chart-large" id="pnlChartLarge"></div>
-            </div>
-
-            <!-- 8. Closed Trades (Full Table) -->
-            <div class="section">
-                <div class="section-header">
-                    <span class="section-title">Closed Trades <span class="badge" id="closedBadge">0</span></span>
-                    <div class="date-picker-wrap">
-                        <input type="date" class="date-picker-input" id="tradesDatePicker" onchange="onTradesDateChange()" title="View trades for a specific date">
-                    </div>
-                </div>
-                <div class="filter-bar" id="closedFilters">
-                    <button class="filter-btn active" onclick="filterClosed('all')" data-filter="all">All</button>
-                    <button class="filter-btn filter-profit" onclick="filterClosed('profit')" data-filter="profit">Profit</button>
-                    <button class="filter-btn filter-loss" onclick="filterClosed('loss')" data-filter="loss">Loss</button>
-                    <button class="filter-btn" onclick="filterClosed('CPR')" data-filter="CPR">CPR</button>
-                    <button class="filter-btn" onclick="filterClosed('GAMMA_BLAST')" data-filter="GAMMA_BLAST">Gamma</button>
-                    <button class="filter-btn" onclick="filterClosed('GHOST_ZONE')" data-filter="GHOST_ZONE">Ghost</button>
-                    <button class="filter-btn" onclick="filterClosed('PCR_VWAP')" data-filter="PCR_VWAP">PCR+VWAP</button>
-                </div>
-                <div class="table-wrap">
-                    <table class="trades-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Strategy</th>
-                                <th>Type</th>
-                                <th>Lots</th>
-                                <th>Strike</th>
-                                <th>Expiry</th>
-                                <th>Entry Price</th>
-                                <th>Exit Price</th>
-                                <th>Invested</th>
-                                <th>P&L</th>
-                                <th>P&L %</th>
-                                <th>Balance</th>
-                                <th>Entry Date</th>
-                                <th>Exit Date</th>
-                                <th>Exit Reason</th>
-                                <th>Hold</th>
-                            </tr>
-                        </thead>
-                        <tbody id="closedTableBody">
-                            <tr><td colspan="16" class="loading">Loading...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-                <div id="closedCards" style="display:none"></div>
+            <div id="positionCards">
+                <div class="loading">Loading positions...</div>
             </div>
         </div>
 
-        <!-- SIDEBAR -->
-        <div class="sidebar">
-            <!-- VIX / Sentiment Panel -->
-            <div class="sidebar-card" id="vixPanel" style="display:none">
-                <div class="sidebar-title">India VIX</div>
-                <div class="vix-panel-value" id="vixPanelValue">--</div>
-                <div class="vix-panel-regime" id="vixPanelRegime">--</div>
-                <div class="vix-meter">
-                    <div class="vix-meter-fill" id="vixMeterFill" style="width:0%"></div>
+        <!-- 2. Greeks Bar -->
+        <div class="grid-full greeks-bar" id="greeksBar" style="display:none"></div>
+
+        <!-- 3. Physics Gate v12 (half width) -->
+        <div class="grid-half section" id="physicsGateSection" style="display:none">
+            <div class="section-header">
+                <span class="section-title">
+                    <span style="margin-right:6px">&#9889;</span>Physics Gate v12
+                    <span class="badge" id="physicsGateBadge" style="background:var(--accent-purple-bg);color:var(--accent-purple)">0</span>
+                </span>
+                <div style="display:flex;gap:8px;align-items:center;font-size:12px">
+                    <span id="physicsPassCount" style="color:var(--accent-green)">0 passed</span>
+                    <span style="color:var(--text-muted)">|</span>
+                    <span id="physicsBlockCount" style="color:var(--accent-red)">0 blocked</span>
                 </div>
             </div>
-
-            <!-- Strategy Performance + Donut -->
-            <div class="sidebar-card" id="strategyPanel" style="display:none">
-                <div class="sidebar-title">Strategy Performance</div>
-                <div id="strategyDonut"></div>
-                <div id="strategyList"></div>
+            <!-- Physics Gate Summary Bar -->
+            <div id="physicsGateBar" style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin:0 16px 12px 16px;background:var(--border)">
+                <div id="physicsPassBar" style="background:var(--accent-green);transition:width 0.5s"></div>
+                <div id="physicsBlockBar" style="background:var(--accent-red);transition:width 0.5s"></div>
             </div>
+            <div id="physicsGateContent" style="padding:0 12px 12px 12px"></div>
+        </div>
 
-            <!-- Capital Summary -->
-            <div class="sidebar-card" id="capitalPanel">
-                <div class="sidebar-title">Capital Allocation</div>
-                <div id="capitalContent"></div>
+        <!-- 4. Signals Today (half width) -->
+        <div class="grid-half section" id="signalSection" style="display:none">
+            <div class="section-header">
+                <span class="section-title">Signals Today <span class="badge" id="signalBadge">0</span></span>
             </div>
+            <div class="table-wrap">
+                <table class="trades-table">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Strategy</th>
+                            <th>Symbol</th>
+                            <th>Type</th>
+                            <th>Strike</th>
+                            <th>Premium</th>
+                            <th>Score</th>
+                            <th>Market</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="signalTableBody">
+                        <tr><td colspan="9" class="loading">Loading signals...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
 
-            <!-- Stock Watchlist -->
-            <div class="sidebar-card" id="watchlistPanel" style="display:none">
-                <div class="sidebar-title">Stock CPR Watchlist <span class="badge" id="watchlistBadge">0</span></div>
-                <div id="watchlistContent"></div>
+        <!-- 5. VIX Panel (was sidebar) -->
+        <div class="grid-card sidebar-card" id="vixPanel" style="display:none">
+            <div class="sidebar-title">India VIX</div>
+            <div class="vix-panel-value" id="vixPanelValue">--</div>
+            <div class="vix-panel-regime" id="vixPanelRegime">--</div>
+            <div class="vix-meter">
+                <div class="vix-meter-fill" id="vixMeterFill" style="width:0%"></div>
+            </div>
+        </div>
+
+        <!-- 6. Strategy Performance (was sidebar) -->
+        <div class="grid-card sidebar-card" id="strategyPanel" style="display:none">
+            <div class="sidebar-title">Strategy Performance</div>
+            <div id="strategyDonut"></div>
+            <div id="strategyList"></div>
+        </div>
+
+        <!-- 7. Capital Summary (was sidebar) -->
+        <div class="grid-card sidebar-card" id="capitalPanel">
+            <div class="sidebar-title">Capital Allocation</div>
+            <div id="capitalContent"></div>
+        </div>
+
+        <!-- 8. Stock Watchlist (was sidebar) -->
+        <div class="grid-card sidebar-card" id="watchlistPanel" style="display:none">
+            <div class="sidebar-title">Stock CPR Watchlist <span class="badge" id="watchlistBadge">0</span></div>
+            <div id="watchlistContent"></div>
+        </div>
+
+        <!-- 9. Daily P&L Chart (full width) -->
+        <div class="grid-full pnl-chart-main" id="pnlChartMain" style="display:none">
+            <div class="pnl-chart-title">Daily P&L History</div>
+            <div class="pnl-chart-large" id="pnlChartLarge"></div>
+        </div>
+
+        <!-- 10. Closed Trades (full width) -->
+        <div class="grid-full section">
+            <div class="section-header">
+                <span class="section-title">Closed Trades <span class="badge" id="closedBadge">0</span></span>
+                <div class="date-picker-wrap">
+                    <input type="date" class="date-picker-input" id="tradesDatePicker" onchange="onTradesDateChange()" title="View trades for a specific date">
+                </div>
+            </div>
+            <div class="filter-bar" id="closedFilters">
+                <button class="filter-btn active" onclick="filterClosed('all')" data-filter="all">All</button>
+                <button class="filter-btn filter-profit" onclick="filterClosed('profit')" data-filter="profit">Profit</button>
+                <button class="filter-btn filter-loss" onclick="filterClosed('loss')" data-filter="loss">Loss</button>
+                <button class="filter-btn" onclick="filterClosed('CPR')" data-filter="CPR">CPR</button>
+                <button class="filter-btn" onclick="filterClosed('GAMMA_BLAST')" data-filter="GAMMA_BLAST">Gamma</button>
+                <button class="filter-btn" onclick="filterClosed('GHOST_ZONE')" data-filter="GHOST_ZONE">Ghost</button>
+                <button class="filter-btn" onclick="filterClosed('PCR_VWAP')" data-filter="PCR_VWAP">PCR+VWAP</button>
+            </div>
+            <div class="table-wrap">
+                <table class="trades-table">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Strategy</th>
+                            <th>Type</th>
+                            <th>Lots</th>
+                            <th>Strike</th>
+                            <th>Expiry</th>
+                            <th>Entry Price</th>
+                            <th>Exit Price</th>
+                            <th>Invested</th>
+                            <th>P&L</th>
+                            <th>P&L %</th>
+                            <th>Balance</th>
+                            <th>Entry Date</th>
+                            <th>Exit Date</th>
+                            <th>Exit Reason</th>
+                            <th>Hold</th>
+                        </tr>
+                    </thead>
+                    <tbody id="closedTableBody">
+                        <tr><td colspan="16" class="loading">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="closedCards" style="display:none"></div>
+        </div>
+
+        <!-- 11. Live Market Scanner (full width) -->
+        <div class="grid-full section" id="scannerSection" style="display:none">
+            <div class="section-header">
+                <span class="section-title">Live Market Scanner <span class="badge" id="scannerBadge">0</span></span>
+                <span style="font-size:10px;color:var(--text-muted)" id="scannerUpdated"></span>
+            </div>
+            <div class="scanner-grid" id="scannerGrid"></div>
+        </div>
+
+        <!-- 12. Interactive Chart (full width) -->
+        <div class="grid-full chart-section" id="chartSection">
+            <div class="chart-header">
+                <div class="chart-title-area">
+                    <span class="chart-title">Live Chart</span>
+                    <div class="chart-symbol-tabs" id="chartSymbolTabs"></div>
+                </div>
+                <div class="chart-controls">
+                    <span class="chart-spot-price" id="chartSpotPrice">--</span>
+                    <span class="chart-spot-change" id="chartSpotChange"></span>
+                </div>
+            </div>
+            <div class="chart-body">
+                <div class="chart-canvas-wrap">
+                    <div class="chart-legend">
+                        <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-red)"></div>TC</div>
+                        <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-blue)"></div>Pivot</div>
+                        <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-green)"></div>BC</div>
+                        <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-purple)"></div>VWAP</div>
+                        <div class="chart-legend-item"><div class="chart-legend-dot" style="background:var(--accent-orange)"></div>Resistance</div>
+                        <div class="chart-legend-item"><div class="chart-legend-dot" style="background:#f472b6"></div>Support</div>
+                    </div>
+                    <div id="chartContainer"></div>
+                </div>
+                <div class="chart-sidebar">
+                    <!-- Current Indicators -->
+                    <div class="chart-ind-panel">
+                        <div class="chart-ind-title">Live Indicators</div>
+                        <div class="chart-ind-grid" id="chartIndGrid">
+                            <div class="chart-ind-item"><div class="chart-ind-label">PCR</div><div class="chart-ind-val" id="ciPcr">--</div></div>
+                            <div class="chart-ind-item"><div class="chart-ind-label">OI Sent</div><div class="chart-ind-val" id="ciOiSent">--</div></div>
+                            <div class="chart-ind-item"><div class="chart-ind-label">IV</div><div class="chart-ind-val" id="ciIv">--</div></div>
+                            <div class="chart-ind-item"><div class="chart-ind-label">ATR</div><div class="chart-ind-val" id="ciAtr">--</div></div>
+                            <div class="chart-ind-item"><div class="chart-ind-label">VWAP</div><div class="chart-ind-val" id="ciVwap">--</div></div>
+                            <div class="chart-ind-item"><div class="chart-ind-label">CPR Width</div><div class="chart-ind-val" id="ciCprW">--</div></div>
+                            <div class="chart-ind-item"><div class="chart-ind-label">VIX</div><div class="chart-ind-val" id="ciVix">--</div></div>
+                            <div class="chart-ind-item"><div class="chart-ind-label">HV</div><div class="chart-ind-val" id="ciHv">--</div></div>
+                        </div>
+                        <div class="pcr-mini-chart" id="pcrMiniChart"></div>
+                    </div>
+                    <!-- CPR Levels -->
+                    <div class="chart-ind-panel">
+                        <div class="chart-ind-title">CPR & Key Levels</div>
+                        <div class="cpr-levels-mini" id="cprLevelsMini"></div>
+                    </div>
+                    <!-- Recommendations -->
+                    <div class="rec-panel">
+                        <div class="chart-ind-title">Recommendations</div>
+                        <div id="recContent">
+                            <div style="text-align:center;color:var(--text-muted);font-size:12px;padding:20px">Select a symbol to see recommendations</div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -1478,6 +1532,35 @@
             } catch(e) { return '--'; }
         }
 
+        // ====== SCORE HELPER FUNCTIONS ======
+        function scoreColor(val, max) {
+            max = max || 100;
+            var pct = (val / max) * 100;
+            if (pct >= 80) return 'var(--score-5)';
+            if (pct >= 60) return 'var(--score-4)';
+            if (pct >= 40) return 'var(--score-3)';
+            if (pct >= 20) return 'var(--score-2)';
+            return 'var(--score-1)';
+        }
+        function scoreClass(val, max) {
+            max = max || 100;
+            var pct = (val / max) * 100;
+            if (pct >= 80) return 'sc-5';
+            if (pct >= 60) return 'sc-4';
+            if (pct >= 40) return 'sc-3';
+            if (pct >= 20) return 'sc-2';
+            return 'sc-1';
+        }
+        function scoreBg(val, max) {
+            max = max || 100;
+            var pct = (val / max) * 100;
+            if (pct >= 80) return 'sc-bg-5';
+            if (pct >= 60) return 'sc-bg-4';
+            if (pct >= 40) return 'sc-bg-3';
+            if (pct >= 20) return 'sc-bg-2';
+            return 'sc-bg-1';
+        }
+
         // ====== GLOBAL STATE ======
         let liveIndicators = {};
         let allPositionsGlobal = [];
@@ -1530,16 +1613,20 @@
 
             animateValue(el('scWinRate'), s.win_rate + '%');
             el('scWinRate').className = 'sc-value ' + (s.win_rate >= 50 ? 'positive' : 'negative');
+            el('scWinRate').style.color = scoreColor(s.win_rate, 60);
             el('scWinLoss').textContent = `${s.wins}W / ${s.losses}L (${s.total_trades || (s.wins + s.losses)} trades)`;
 
             const pf = s.profit_factor || 0;
             animateValue(el('scProfitFactor'), pf >= 999 ? 'Perfect' : pf.toFixed(2));
             el('scProfitFactor').className = 'sc-value ' + (pf >= 1.5 ? 'positive' : (pf >= 1 ? 'neutral' : 'negative'));
+            el('scProfitFactor').style.color = scoreColor(pf, 2.5);
             el('scPFBreakdown').textContent = `Win: ${fmtK(s.gross_wins || 0)} / Loss: ${fmtK(s.gross_losses || 0)}`;
 
             const mdd = s.max_drawdown || 0;
+            const dd_pct = s.max_drawdown_pct || (mdd > 0 ? mdd / 300000 : 0);
             animateValue(el('scMaxDD'), mdd > 0 ? '-' + fmtK(mdd) : '--');
             el('scMaxDD').className = 'sc-value ' + (mdd > 0 ? 'negative' : 'neutral');
+            el('scMaxDD').style.color = scoreColor(100 - dd_pct * 10, 100);
 
             animateValue(el('scOpenCount'), String(s.open_positions));
             el('scOpenPnl').textContent = (s.open_pnl >= 0 ? '+' : '') + fmtK(s.open_pnl);
@@ -1732,7 +1819,7 @@
                             <div class="pos-tags" style="display:inline-flex;margin-left:8px">
                                 ${typeTag(p.type)}
                                 <span class="tag tag-strategy">${p.strategy}</span>
-                                ${p.score ? `<span class="tag tag-score">${p.score}</span>` : ''}
+                                ${p.score ? `<span class="tag ${scoreBg(p.score)}">${p.score}</span>` : ''}
                                 <span class="tag tag-market">${p.market.toUpperCase()}</span>
                             </div>
                         </div>
@@ -2003,6 +2090,7 @@
                     <div class="strat-mini-stats">
                         <span>${s.trades} trades</span>
                         <span class="${s.win_rate >= 50 ? 'positive' : 'negative'}">${s.win_rate}% WR</span>
+                        ${s.profit_factor != null ? `<span style="color:${scoreColor(s.profit_factor, 2.5)}">PF ${s.profit_factor >= 999 ? '&#8734;' : s.profit_factor.toFixed(2)}</span>` : ''}
                         <span>${s.open_positions} open</span>
                         ${s.today_pnl ? `<span class="${pnlClass(s.today_pnl)}">Today: ${s.today_pnl >= 0 ? '+' : ''}${fmtK(s.today_pnl)}</span>` : ''}
                     </div>
@@ -2053,6 +2141,7 @@
                     <td>${typeTag(s.type)}</td>
                     <td>${fmt(s.strike)}</td>
                     <td>${fmt(s.premium)}</td>
+                    <td>${s.score != null ? `<span class="tag ${scoreBg(s.score)}">${s.score}</span>` : '--'}</td>
                     <td><span class="tag tag-market">${s.market.toUpperCase()}</span></td>
                     <td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis">${s.reason || '--'}</td>
                 </tr>
@@ -2086,7 +2175,7 @@
                 const cardClass = isBlock ? 'blocked' : 'passed';
                 const iconClass = isBlock ? 'block-icon' : 'pass-icon';
                 const iconChar = isBlock ? '&#10005;' : '&#10003;';
-                const scoreClass = g.score < 0 ? 'negative' : 'positive';
+                const scoreClass = scoreBg(Math.max(0, g.score + 50), 100);
 
                 // Format time from timestamp
                 let timeStr = '--';
@@ -2120,7 +2209,7 @@
                                 <span class="tag tag-market" style="margin-left:4px;font-size:9px">${(g.market || '').toUpperCase()}</span>
                             </div>
                             <div style="display:flex;align-items:center;gap:8px">
-                                <span class="physics-score ${scoreClass}">${g.score >= 0 ? '+' : ''}${g.score}</span>
+                                <span class="physics-score tag ${scoreClass}">${g.score >= 0 ? '+' : ''}${g.score}</span>
                                 <span class="physics-time">${timeStr}</span>
                             </div>
                         </div>
