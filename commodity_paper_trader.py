@@ -2949,13 +2949,14 @@ class CommodityPaperTrader:
                                 sw_dte = dte
                                 T = max(sw_dte / 365.0, 1/365.0)
                                 sw_type = f"BUY_{sw['direction']}_SWEEP"
-                                sw_strike, sw_ltp, sw_iv = self._get_strike_from_chain(
-                                    commodity, sw_spot, sw['direction'], sw_dte)
-                                if sw_ltp <= 0:
+                                spec = COMMODITIES[commodity]
+                                _si = spec['strike_interval']
+                                _opt = self.select_strike_live(commodity, sw_spot, _si, T, RISK_FREE_RATE, 0.30, sw['direction'], MCX_MIN_PREMIUM_BUY)
+                                if not _opt or _opt.get('price', 0) <= 0:
                                     continue
-                                g = greeks_from_market_price(
-                                    sw_ltp, sw_spot, sw_strike, T, RISK_FREE_RATE,
-                                    sw['direction'])
+                                sw_strike = _opt['strike']
+                                sw_ltp = _opt['price']
+                                g = _opt.get('greeks', {}) or greeks_from_market_price(sw_ltp, sw_spot, sw_strike, T, RISK_FREE_RATE, sw['direction'])
                                 if sw_ltp > MIN_PREMIUM_BUY:
                                     sl_buffer = sw['spike_size'] * 0.3
                                     target_move = sw['spike_size'] * 0.8 * 0.5
