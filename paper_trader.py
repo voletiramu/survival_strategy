@@ -3659,13 +3659,15 @@ class PaperTrader:
                 ls_end = now.replace(hour=15, minute=15, second=0)
                 if ls_start <= now <= ls_end:
                     for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                        _bc = self.calculus.bar_count(symbol)
+                        if _bc > 0 and _bc % 20 == 1: logger.info(f"  SWEEP_BARS: {symbol} has {_bc} bars")
                         if self.calculus.bar_count(symbol) >= 25:
                             sweeps = self.calculus.detect_liquidity_sweep(symbol)
                             for sw in sweeps:
                                 if sw['quality'] < 45:
                                     continue
                                 # Get option chain for the sweep direction
-                                sw_spot = self.latest_spot.get(symbol, 0)
+                                sw_spot = self.get_index_spot(symbol) or 0
                                 if sw_spot <= 0:
                                     continue
                                 sw_dte = dte  # Use same DTE as other strategies

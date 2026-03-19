@@ -2943,7 +2943,7 @@ class CommodityPaperTrader:
                             for sw in sweeps:
                                 if sw['quality'] < 45:
                                     continue
-                                sw_spot = self.latest_spot.get(commodity, 0)
+                                sw_spot = self.get_spot(commodity) or 0
                                 if sw_spot <= 0:
                                     continue
                                 sw_dte = dte
