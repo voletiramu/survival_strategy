@@ -154,6 +154,10 @@ class MarketDataPipeline:
         # Fetch cycle count
         self._cycle_count = 0
 
+        # v10.5: Stock option chain cache (on-demand, 60s TTL)
+        self._stock_chains = {}        # {symbol: {chain_data}}
+        self._stock_chain_time = {}    # {symbol: datetime}
+
         # v10.2e: Live data logger (set externally)
         self.data_logger = None
 
@@ -452,6 +456,7 @@ class MarketDataPipeline:
                 'CE': ce_contracts,
                 'PE': pe_contracts,
                 'expiry': nearest_expiry,
+                '_fetch_time': now,  # v10.5: timestamp for staleness detection
             }
 
             self._last_fetch[f'NSE_{symbol}'] = now
@@ -467,9 +472,17 @@ class MarketDataPipeline:
     # ============================================================
 
     def _init_bse_session(self):
-        """Initialize BSE API session with required headers/cookies."""
+        """Initialize BSE API session with required headers/cookies.
+        v10.5: Auto-refresh session every 30 min to prevent stale cookies.
+        """
         if self._bse_session:
-            return True
+            # v10.5: Check if session is stale (> 30 min old)
+            bse_age = getattr(self, '_bse_session_time', None)
+            if bse_age and (datetime.now() - bse_age).total_seconds() > 1800:
+                logger.info("[Pipeline] BSE session expired (>30min), refreshing...")
+                self._bse_session = None
+            else:
+                return True
 
         try:
             self._bse_session = requests.Session()
@@ -485,6 +498,7 @@ class MarketDataPipeline:
             # Get session cookie from BSE homepage
             resp = self._bse_session.get('https://www.bseindia.com/', timeout=10)
             if resp.status_code == 200:
+                self._bse_session_time = datetime.now()  # v10.5: track session age
                 logger.info("[Pipeline] BSE session initialized")
                 return True
             else:
@@ -686,6 +700,7 @@ class MarketDataPipeline:
                 'CE': ce_contracts,
                 'PE': pe_contracts,
                 'expiry': expiry,
+                '_fetch_time': now,  # v10.5: timestamp for staleness detection
             }
 
             self._last_fetch[f'BSE_{symbol}'] = now
@@ -1067,6 +1082,106 @@ class MarketDataPipeline:
         """
         with self._lock:
             return self._spots.get(symbol)
+
+    def get_stock_option_chain(self, symbol):
+        """v10.5: Fetch stock option chain from NSE on-demand with 60s cache.
+
+        Uses the same NSE optionChain() API that works for both indices and stocks.
+
+        Args:
+            symbol: Stock symbol (e.g., 'RELIANCE', 'TCS', 'HDFCBANK')
+
+        Returns:
+            dict with 'CE', 'PE' lists and 'expiry', or None if unavailable.
+        """
+        # Check cache (60s TTL)
+        now = datetime.now()
+        cached_time = self._stock_chain_time.get(symbol)
+        if cached_time and (now - cached_time).total_seconds() < 60:
+            with self._lock:
+                cached = self._stock_chains.get(symbol)
+                if cached:
+                    return cached
+
+        # Fetch from NSE
+        if not self._init_nse():
+            return None
+
+        try:
+            data = self._nse.optionChain(symbol)
+            if not data:
+                logger.debug(f"[Pipeline] NSE stock chain {symbol}: empty response")
+                return None
+
+            records = data.get('records', data) if isinstance(data, dict) else data
+            if isinstance(records, dict):
+                chain_data = records.get('data', [])
+                expiry_dates = records.get('expiryDates', [])
+            else:
+                chain_data = records if isinstance(records, list) else []
+                expiry_dates = []
+
+            if not chain_data:
+                return None
+
+            nearest_expiry = expiry_dates[0] if expiry_dates else None
+
+            # Filter for nearest expiry
+            if nearest_expiry:
+                filtered = [r for r in chain_data
+                            if r.get('expiryDates') == nearest_expiry
+                            or r.get('CE', {}).get('expiryDate', '') == nearest_expiry
+                            or r.get('PE', {}).get('expiryDate', '') == nearest_expiry]
+                if not filtered:
+                    filtered = chain_data
+            else:
+                filtered = chain_data
+
+            ce_contracts = []
+            pe_contracts = []
+
+            for row in filtered:
+                strike = row.get('strikePrice', 0)
+
+                ce = row.get('CE', {})
+                if ce and ce.get('openInterest', 0) > 0:
+                    ce_contracts.append({
+                        'strike': strike,
+                        'ltp': ce.get('lastPrice', 0),
+                        'oi': ce.get('openInterest', 0),
+                        'oi_change': ce.get('changeinOpenInterest', 0),
+                        'volume': ce.get('totalTradedVolume', 0),
+                        'iv': ce.get('impliedVolatility', 0),
+                    })
+
+                pe = row.get('PE', {})
+                if pe and pe.get('openInterest', 0) > 0:
+                    pe_contracts.append({
+                        'strike': strike,
+                        'ltp': pe.get('lastPrice', 0),
+                        'oi': pe.get('openInterest', 0),
+                        'oi_change': pe.get('changeinOpenInterest', 0),
+                        'volume': pe.get('totalTradedVolume', 0),
+                        'iv': pe.get('impliedVolatility', 0),
+                    })
+
+            result = {
+                'CE': ce_contracts,
+                'PE': pe_contracts,
+                'expiry': nearest_expiry,
+                '_fetch_time': now,
+            }
+
+            with self._lock:
+                self._stock_chains[symbol] = result
+                self._stock_chain_time[symbol] = now
+
+            logger.info(f"[Pipeline] NSE stock {symbol}: {len(ce_contracts)} CE + {len(pe_contracts)} PE strikes")
+            return result
+
+        except Exception as e:
+            logger.debug(f"[Pipeline] NSE stock chain {symbol} failed: {e}")
+            return None
 
     def get_data_status(self):
         """Get pipeline health status for monitoring.

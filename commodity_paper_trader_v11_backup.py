@@ -162,24 +162,7 @@ TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 BREAKOUT_FAIL_CHECK_MINUTES = 5
 BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
 BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
-BREAKOUT_FAIL_REVERSE_ENABLED = False
-
-# v13.3: Volatility-adjusted SL — scale SL by inverse ATR ratio
-# BANKNIFTY 2.7x more volatile than NIFTY, needs tighter SL
-# Simulation: saves Rs +8,638/week across BANKNIFTY + SENSEX
-VOLATILITY_SL_ENABLED = True
-ATR_REFERENCE = {
-    'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
-    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409,
-}
-ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
-
-# v13.3: Momentum reversal exit
-# If spot moves 0.4% AGAINST trade direction after 20min, exit
-# Simulation: saves Rs +6,974, hurts ZERO winning trades
-MOMENTUM_EXIT_ENABLED = True
-MOMENTUM_EXIT_SPOT_PCT = 0.4
-MOMENTUM_EXIT_MIN_MINUTES = 20
+BREAKOUT_FAIL_REVERSE_ENABLED = True
 
 # v10.3: Import regime-aware parameter function
 from market_regime import get_regime_params  # noqa: E402
@@ -235,9 +218,9 @@ MCX_VIX_HIGH_MULTIPLIER = 0.8
 MCX_VIX_BLOCK_HIGH = 35
 MCX_VIX_BLOCK_LOW = 11
 # v10.6: Greeks Refresh + Theta Decay Exit
-MCX_GREEKS_REFRESH_INTERVAL_SECONDS = 10    # v15: was 300s — pure math, zero API cost
+MCX_GREEKS_REFRESH_INTERVAL_SECONDS = 300
 MCX_THETA_BURDEN_TIGHTEN_PCT = 5.0
-MCX_THETA_BURDEN_EXIT_PCT = 999.0  # v11.1: Disabled — BS theta kills winners near expiry
+MCX_THETA_BURDEN_EXIT_PCT = 10.0
 MCX_THETA_TIGHTEN_SL_FACTOR = 0.90
 
 # MCX Trading costs
@@ -636,7 +619,6 @@ def compute_direction_confidence(sig, spot, indicators, vix, greeks):
     return max(min(score, 100), 0)
 
 DCI_MIN_THRESHOLD = 40
-DCI_SELL_MIN_THRESHOLD = 25  # v13.2: Lower DCI for SELL/PE signals (bearish bias harder to confirm)
 IV_MIN_FOR_DTE1 = 0.20
 IV_MIN_FOR_DTE0 = 0.25
 
@@ -983,145 +965,18 @@ class CommodityStrategyEngine:
         self.angel = angel
         self.historical_data = {}
 
-    def select_strike_live(self, commodity, spot, strike_int, T, r, iv, opt_type, min_premium=5.0, target_strike=None):
+    def select_strike_live(self, commodity, spot, strike_int, T, r, iv, opt_type, min_premium=5.0):
         """v10.3d: Strike selection with live API greeks, Black-76 fallback.
 
         Tries Angel optionGreek API first for real delta/gamma/OI/volume.
         Falls back to Black-76 model if API returns no data.
         Includes inline OI liquidity check (MIN_ENTRY_OI=500).
-        v10.7: target_strike param — if set, fetch LTP for that specific strike (for SELL signals).
         """
         MIN_ENTRY_OI = 500
         atm = round(spot / strike_int) * strike_int
         candidates = set(atm + i * strike_int for i in range(-2, 3))
 
-        # v10.7: If target_strike specified, add it to candidates so it can be matched
-        if target_strike:
-            candidates.add(target_strike)
-
-        # --- Source 1: Zerodha Kite option chain (primary — solves MCX Access denied) ---
-        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
-            try:
-                zd_chain = self.zerodha.get_option_chain(commodity)
-                if zd_chain:
-                    contracts = zd_chain.get(opt_type, [])
-                    if target_strike:
-                        for c in contracts:
-                            if int(c['strike']) == int(target_strike) and c.get('ltp', 0) >= min_premium:
-                                result = {
-                                    'strike': int(c['strike']),
-                                    'greeks': {
-                                        'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0,
-                                        'iv': c.get('iv', 0), 'price': c['ltp'],
-                                    },
-                                }
-                                logger.info(f"  MCX_ZD_TARGET: {commodity} {int(target_strike)}{opt_type} "
-                                           f"LTP={c['ltp']:.2f} [Zerodha]")
-                                return result
-                    else:
-                        best_score = -1
-                        best = None
-                        for c in contracts:
-                            if c['strike'] not in candidates:
-                                continue
-                            ltp = c.get('ltp', 0)
-                            if ltp < min_premium:
-                                continue
-                            oi = c.get('oi', 0)
-                            volume = c.get('volume', 0)
-                            if oi < MIN_ENTRY_OI:
-                                continue
-                            moneyness = abs(c['strike'] - spot) / spot
-                            delta_proxy = max(0, 1 - moneyness * 20)
-                            if delta_proxy < 0.1:
-                                continue
-                            oi_norm = min(oi / 100000, 1.0)
-                            vol_norm = min(volume / 10000, 1.0)
-                            score = (delta_proxy * 50) + (oi_norm * 30) + (vol_norm * 20)
-                            if score > best_score and ltp > 0:
-                                best_score = score
-                                best = {
-                                    'strike': int(c['strike']),
-                                    'greeks': {
-                                        'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0,
-                                        'iv': c.get('iv', 0), 'price': ltp,
-                                    },
-                                }
-                        if best:
-                            logger.info(f"  MCX_ZD_STRIKE: {commodity} {opt_type} ATM={atm} "
-                                       f"Selected={best['strike']} LTP={best['greeks']['price']:.2f} [Zerodha]")
-                            return best
-            except Exception as e:
-                logger.debug(f"  MCX_ZD_CHAIN_ERR: {commodity} {opt_type} — {e}")
-
-        # --- Source 2: TrueData option chain (secondary) ---
-        if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
-            try:
-                td_chain = self.truedata.get_option_chain(commodity)
-                if td_chain:
-                    contracts = td_chain.get(opt_type, [])
-                    if target_strike:
-                        # v10.7: If target_strike specified, find that exact strike (SELL signals)
-                        for c in contracts:
-                            if int(c['strike']) == int(target_strike) and c.get('ltp', 0) >= min_premium:
-                                result = {
-                                    'strike': int(c['strike']),
-                                    'greeks': {
-                                        'delta': 0,
-                                        'gamma': 0,
-                                        'theta': 0,
-                                        'vega': 0,
-                                        'iv': c.get('iv', 0),
-                                        'price': c['ltp'],
-                                    },
-                                }
-                                logger.info(f"  MCX_TD_TARGET: {commodity} {int(target_strike)}{opt_type} "
-                                           f"LTP={c['ltp']:.2f} IV={c.get('iv', 0):.3f} [TrueData]")
-                                return result
-                    else:
-                        # Score candidates same way as Angel API
-                        best_score = -1
-                        best = None
-                        for c in contracts:
-                            if c['strike'] not in candidates:
-                                continue
-                            ltp = c.get('ltp', 0)
-                            if ltp < min_premium:
-                                continue
-                            oi = c.get('oi', 0)
-                            volume = c.get('volume', 0)
-                            if oi < MIN_ENTRY_OI:
-                                logger.debug(f"  MCX_TD_SKIP_LOW_OI: {commodity} {int(c['strike'])}{opt_type} OI={oi:.0f}")
-                                continue
-                            # Without delta from TrueData chain, use ATM proximity as proxy
-                            moneyness = abs(c['strike'] - spot) / spot
-                            delta_proxy = max(0, 1 - moneyness * 20)  # ~0.5 at ATM, 0 at 5% OTM
-                            if delta_proxy < 0.1:
-                                continue
-                            oi_norm = min(oi / 100000, 1.0)
-                            vol_norm = min(volume / 10000, 1.0)
-                            score = (delta_proxy * 50) + (oi_norm * 30) + (vol_norm * 20)
-                            if score > best_score and ltp > 0:
-                                best_score = score
-                                best = {
-                                    'strike': int(c['strike']),
-                                    'greeks': {
-                                        'delta': 0,
-                                        'gamma': 0,
-                                        'theta': 0,
-                                        'vega': 0,
-                                        'iv': c.get('iv', 0),
-                                        'price': ltp,
-                                    },
-                                }
-                        if best:
-                            logger.info(f"  MCX_TD_STRIKE: {commodity} {opt_type} ATM={atm} "
-                                       f"Selected={best['strike']} LTP={best['greeks']['price']:.2f} [TrueData]")
-                            return best
-            except Exception as e:
-                logger.debug(f"  MCX_TD_CHAIN_ERR: {commodity} {opt_type} — {e}")
-
-        # --- Source 2: Angel API greeks ---
+        # --- Try live API greeks first ---
         if self.angel and self.angel._connected:
             try:
                 # v10.3d-3: Get nearest MCX expiry for API call (was missing → "Invalid expiry date")
@@ -1152,39 +1007,6 @@ class CommodityStrategyEngine:
 
                 greeks_data = self.angel.get_option_greeks(commodity, expiry)
                 if greeks_data and len(greeks_data) > 0:
-                    # v10.7: If target_strike specified, find that exact strike (SELL signals)
-                    if target_strike:
-                        for item in greeks_data:
-                            try:
-                                item_strike = float(item.get('strikePrice', 0))
-                            except (ValueError, TypeError):
-                                continue
-                            if int(item_strike) != int(target_strike):
-                                continue
-                            item_type = item.get('optionType', '').upper()
-                            if item_type != opt_type:
-                                continue
-                            ltp = float(item.get('ltp', 0) or 0)
-                            if ltp > 0 and ltp >= min_premium:
-                                result = {
-                                    'strike': int(item_strike),
-                                    'greeks': {
-                                        'delta': float(item.get('delta', 0) or 0),
-                                        'gamma': float(item.get('gamma', 0) or 0),
-                                        'theta': float(item.get('theta', 0) or 0),
-                                        'vega': float(item.get('vega', 0) or 0),
-                                        'iv': float(item.get('impliedVolatility', 0) or 0) / 100,
-                                        'price': ltp,
-                                    },
-                                }
-                                logger.info(f"  MCX_LIVE_TARGET: {commodity} {int(target_strike)}{opt_type} "
-                                           f"LTP={ltp:.2f} Delta={result['greeks']['delta']:.3f} [API]")
-                                return result
-                        # target_strike not found in live data — fall through to skip
-                        logger.info(f"  MCX_SKIP_NO_LIVE: {commodity} {int(target_strike)}{opt_type} — "
-                                   f"target strike not found in live API data")
-                        return None
-
                     best_score = -1
                     best = None
                     for item in greeks_data:
@@ -1206,7 +1028,7 @@ class CommodityStrategyEngine:
                         volume = float(item.get('tradeVolume', 0) or 0)
 
                         # Skip flat/illiquid strikes
-                        if delta < 0.35 or delta > 0.65:
+                        if delta < 0.20 or delta > 0.70:
                             continue
                         if oi < MIN_ENTRY_OI:
                             logger.debug(f"  MCX_SKIP_LOW_OI: {commodity} {int(item_strike)}{opt_type} OI={oi:.0f}")
@@ -1452,16 +1274,12 @@ class CommodityStrategyEngine:
 
         prev_range = (prev['High'] - prev['Low']) / max(atr, 1)
 
-        # v13.0: Intraday VWAP (integral calculus) — replaces stale 5-day VWAP
-        vwap = None
-        if hasattr(self, 'calculus'):
-            vwap = self.calculus.get_intraday_vwap_for_indicators(commodity)
-        if vwap is None:
-            if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
-                tp = (df['High'] + df['Low'] + df['Close']) / 3
-                vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
-            else:
-                vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()
+        # VWAP calculation (for PCR+VWAP strategy)
+        if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
+            tp = (df['High'] + df['Low'] + df['Close']) / 3
+            vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
+        else:
+            vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()  # v10.2c: Fixed VWAP fallback formula
 
         # v10.1: EMA trend indicators for direction validation
         ema_9 = df['Close'].ewm(span=9).mean().iloc[-1] if len(df) >= 9 else df['Close'].iloc[-1]
@@ -1500,11 +1318,6 @@ class CommodityStrategyEngine:
         T = dte / 365
         cpr_w = ind['cpr_width']
 
-        # v11.1: Skip CPR signals on ultra-narrow CPR days
-        if cpr_w < 0.03:
-            logger.info(f"  CPR_NARROW_SKIP: {commodity} CPR width {cpr_w:.4f}% < 0.03% — signals unreliable")
-            return signals
-
         # v9.6: Multi-tier CPR targets (ported from equity)
         # Narrow (<0.3%): strong breakout → highest targets
         # Moderate (0.3-0.6%): directional trade → standard targets
@@ -1514,10 +1327,6 @@ class CommodityStrategyEngine:
             target_hit_mult = 1.5    # 50% gain (Camarilla confirmed)
             target_base_mult = 1.3   # 30% gain (no Camarilla confirmation)
             sl_mult = 0.5
-            # v13.3: Volatility-adjusted SL
-            if VOLATILITY_SL_ENABLED and commodity in ATR_REFERENCE:
-                vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(commodity, 313))
-                sl_mult = max(0.12, min(0.50, vol_sl_mult))  # Clamp 12%-50%
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
             target_hit_mult = 1.4    # 40% gain
@@ -1698,39 +1507,27 @@ class CommodityStrategyEngine:
 
         if ohlc['low'] <= ind['demand_zone'] * 1.01 and spot > ind['demand_zone'] and ind['demand_strength'] >= 2:
             ce_strike = round(spot / strike_int) * strike_int
-            # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
-            if opt:
-                g = opt['greeks']
-                ce_strike = opt['strike']
-                if g['price'] > MCX_MIN_PREMIUM_BUY:
-                    bounce = (spot - ohlc['low']) / max(atr, 1)
-                    signals.append({
-                        'type': 'BUY_CE_GTZ', 'strike': ce_strike,
-                        'premium': g['price'], 'greeks': g,
-                        'reason': f"Ghost Zone: Demand retest bounce={bounce:.2f}x [LIVE]",
-                        'target': g['price'] * 2.5 if bounce > 0.8 else g['price'] * 1.8,
-                        'sl': g['price'] * 0.4,
-                    })
-            else:
-                logger.info(f"  GTZ_SKIP_NO_LIVE: {commodity} CE at {ce_strike:.0f} — no live LTP available")
+            g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, iv, 'CE')
+            if g['price'] > MCX_MIN_PREMIUM_BUY:
+                bounce = (spot - ohlc['low']) / max(atr, 1)
+                signals.append({
+                    'type': 'BUY_CE_GTZ', 'strike': ce_strike,
+                    'premium': g['price'], 'greeks': g,
+                    'reason': f"Ghost Zone: Demand retest bounce={bounce:.2f}x",
+                    'target': g['price'] * 2.5 if bounce > 0.8 else g['price'] * 1.8,
+                    'sl': g['price'] * 0.4,
+                })
 
         elif ohlc['high'] >= ind['supply_zone'] * 0.99 and spot < ind['supply_zone'] and ind['supply_strength'] >= 2:
             pe_strike = round(spot / strike_int) * strike_int
-            # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
-            if opt:
-                g = opt['greeks']
-                pe_strike = opt['strike']
-                if g['price'] > MCX_MIN_PREMIUM_BUY:
-                    signals.append({
-                        'type': 'BUY_PE_GTZ', 'strike': pe_strike,
-                        'premium': g['price'], 'greeks': g,
-                        'reason': f"Ghost Zone: Supply retest [LIVE]",
-                        'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
-                    })
-            else:
-                logger.info(f"  GTZ_SKIP_NO_LIVE: {commodity} PE at {pe_strike:.0f} — no live LTP available")
+            g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, iv, 'PE')
+            if g['price'] > MCX_MIN_PREMIUM_BUY:
+                signals.append({
+                    'type': 'BUY_PE_GTZ', 'strike': pe_strike,
+                    'premium': g['price'], 'greeks': g,
+                    'reason': f"Ghost Zone: Supply retest",
+                    'target': g['price'] * 2.5, 'sl': g['price'] * 0.4,
+                })
         return signals
 
     def check_pcr_vwap_signals(self, commodity, spot, ohlc, indicators, dow, dte):
@@ -1754,43 +1551,33 @@ class CommodityStrategyEngine:
 
         # BUY CE: PCR > 1.05 (bullish momentum), near VWAP
         if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
-            # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_BUY)
-            if opt:
-                g = opt['greeks']
-                ce_strike = opt['strike']
-                if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
-                    signals.append({
-                        'type': 'BUY_CE_PCRVWAP',
-                        'strike': ce_strike,
-                        'premium': g['price'],
-                        'greeks': g,
-                        'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f} [LIVE]",
-                        'target': g['price'] * 2.5,
-                        'sl': g['price'] * 0.4,
-                    })
-            else:
-                logger.info(f"  PCRVWAP_SKIP_NO_LIVE: {commodity} CE — no live LTP available")
+            ce_strike = round(spot / strike_int) * strike_int
+            g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
+            if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
+                signals.append({
+                    'type': 'BUY_CE_PCRVWAP',
+                    'strike': ce_strike,
+                    'premium': g['price'],
+                    'greeks': g,
+                    'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
+                    'target': g['price'] * 2.5,
+                    'sl': g['price'] * 0.4,
+                })
 
         # BUY PE: PCR < 0.95 (bearish momentum), near VWAP
         elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
-            # v10.7: Live API greeks ONLY — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_BUY)
-            if opt:
-                g = opt['greeks']
-                pe_strike = opt['strike']
-                if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
-                    signals.append({
-                        'type': 'BUY_PE_PCRVWAP',
-                        'strike': pe_strike,
-                        'premium': g['price'],
-                        'greeks': g,
-                        'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f} [LIVE]",
-                        'target': g['price'] * 2.5,
-                        'sl': g['price'] * 0.4,
-                    })
-            else:
-                logger.info(f"  PCRVWAP_SKIP_NO_LIVE: {commodity} PE — no live LTP available")
+            pe_strike = round(spot / strike_int) * strike_int
+            g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
+            if g['price'] > MCX_MIN_PREMIUM_BUY and g['price'] < spot * 0.05:
+                signals.append({
+                    'type': 'BUY_PE_PCRVWAP',
+                    'strike': pe_strike,
+                    'premium': g['price'],
+                    'greeks': g,
+                    'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}",
+                    'target': g['price'] * 2.5,
+                    'sl': g['price'] * 0.4,
+                })
 
         return signals
 
@@ -1841,46 +1628,34 @@ class CommodityStrategyEngine:
         # PE SELLING — price breaks above resistance (bullish → sell OTM PEs)
         if ohlc['high'] > resistance + gap:
             pe_strike = round((spot - distance) / strike_int) * strike_int
-            # v10.7: Live LTP via select_strike_live with target_strike — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'PE', MCX_MIN_PREMIUM_SELL, target_strike=pe_strike)
-            if opt:
-                g = opt['greeks']
-                pe_strike = opt['strike']
-                if g['price'] > MCX_MIN_PREMIUM_SELL:
-                    signals.append({
-                        'type': 'SELL_PE_SURV',
-                        'strike': pe_strike,
-                        'premium': g['price'],
-                        'greeks': g,
-                        'reason': f"Survivor: PE sell at {pe_strike:.0f} dist={distance:.0f} "
-                                  f"gap={gap:.0f} res={resistance:.0f} [LIVE]",
-                        'target': g['price'] * 0.3,
-                        'sl': g['price'] * 0.8,
-                    })
-            else:
-                logger.info(f"  SURV_SKIP_NO_LIVE: {commodity} PE sell at {pe_strike:.0f} — no live LTP available")
+            g = black76_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
+            if g['price'] > MCX_MIN_PREMIUM_SELL:
+                signals.append({
+                    'type': 'SELL_PE_SURV',
+                    'strike': pe_strike,
+                    'premium': g['price'],
+                    'greeks': g,
+                    'reason': f"Survivor: PE sell at {pe_strike:.0f} dist={distance:.0f} "
+                              f"gap={gap:.0f} res={resistance:.0f}",
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
+                })
 
         # CE SELLING — price breaks below support (bearish → sell OTM CEs)
         if ohlc['low'] < support - gap:
             ce_strike = round((spot + distance) / strike_int) * strike_int
-            # v10.7: Live LTP via select_strike_live with target_strike — no BS fallback
-            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, ind['iv'], 'CE', MCX_MIN_PREMIUM_SELL, target_strike=ce_strike)
-            if opt:
-                g = opt['greeks']
-                ce_strike = opt['strike']
-                if g['price'] > MCX_MIN_PREMIUM_SELL:
-                    signals.append({
-                        'type': 'SELL_CE_SURV',
-                        'strike': ce_strike,
-                        'premium': g['price'],
-                        'greeks': g,
-                        'reason': f"Survivor: CE sell at {ce_strike:.0f} dist={distance:.0f} "
-                                  f"gap={gap:.0f} sup={support:.0f} [LIVE]",
-                        'target': g['price'] * 0.3,
-                        'sl': g['price'] * 0.8,
-                    })
-            else:
-                logger.info(f"  SURV_SKIP_NO_LIVE: {commodity} CE sell at {ce_strike:.0f} — no live LTP available")
+            g = black76_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
+            if g['price'] > MCX_MIN_PREMIUM_SELL:
+                signals.append({
+                    'type': 'SELL_CE_SURV',
+                    'strike': ce_strike,
+                    'premium': g['price'],
+                    'greeks': g,
+                    'reason': f"Survivor: CE sell at {ce_strike:.0f} dist={distance:.0f} "
+                              f"gap={gap:.0f} sup={support:.0f}",
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
+                })
 
         return signals
 
@@ -2172,27 +1947,15 @@ class AngelMCXConnection:
         """Get option greeks including IV from Angel API."""
         if not self._connected:
             return None
-        # v13.7: Cache greeks for 30s to avoid Angel rate limits (196 errors/day)
-        import time as _time
-        _cache_key = f"{commodity}_{expiry}"
-        if not hasattr(self, '_greeks_cache'):
-            self._greeks_cache = {}
-            self._greeks_cache_time = {}
-        if _cache_key in self._greeks_cache:
-            _age = _time.time() - self._greeks_cache_time.get(_cache_key, 0)
-            if _age < 30:
-                return self._greeks_cache[_cache_key]
         try:
             self._throttle()
             params = {"name": commodity, "expirydate": expiry} if expiry else {"name": commodity}
             data = self.obj.optionGreek(params)
             if data and data.get('data'):
-                self._greeks_cache[_cache_key] = data['data']
-                self._greeks_cache_time[_cache_key] = _time.time()
                 return data['data']
         except Exception as e:
             logger.error(f"MCX option greeks error: {e}")
-        return self._greeks_cache.get(_cache_key)
+        return None
 
 
 # ====================================================================
@@ -2206,43 +1969,6 @@ class CommodityPaperTrader:
         self.engine = CommodityStrategyEngine(self.portfolio, self.angel)
         self._running = False
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
-        # v12.0: Zerodha Kite Connect as Source 1 (primary — solves MCX "Access denied")
-        self.zerodha = None
-        try:
-            from zerodha_feed import ZerodhaFeed
-            self.zerodha = ZerodhaFeed()
-            if self.zerodha.connect():
-                self.engine.zerodha = self.zerodha
-                logger.info("[Zerodha] ✅ Initialized as Source 1 for MCX option chain + LTP")
-            else:
-                self.zerodha = None
-                logger.warning("[Zerodha] Connection failed — trying TrueData as Source 2")
-        except Exception as e:
-            logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
-
-        # v11.2: TrueData as Source 2 for MCX option chain + LTP
-        self.truedata = None
-        try:
-            from truedata_feed import TrueDataFeed
-            self.truedata = TrueDataFeed()
-            if self.truedata.connect():
-                src_num = "2" if self.zerodha else "1 (Zerodha unavailable)"
-                logger.info(f"[TrueData] Initialized as Source {src_num} for MCX option chain + LTP")
-                self.engine.truedata = self.truedata
-            else:
-                self.truedata = None
-                logger.warning("[TrueData] Connection failed — falling back to Angel API")
-        except Exception as e:
-            logger.warning(f"[TrueData] Not available: {e} — falling back to Angel API")
-        # v13.0: Calculus engine — intraday VWAP + momentum direction
-        from market_calculus import MarketCalculus
-        self.calculus = MarketCalculus()
-        self.engine.calculus = self.calculus
-
-        # v14.0: Trade Intelligence engine
-        from trade_intelligence import TradeIntelligence
-        self.trade_intel = TradeIntelligence()
-
         # Caches to reduce REST API calls
         self._option_ltp_cache = {}  # {cache_key: {'ltp': float, 'time': datetime}}
         self._ohlc_cache = {}  # v2.5.2: {commodity: {'data': ohlc_dict, 'time': datetime}}
@@ -2320,38 +2046,20 @@ class CommodityPaperTrader:
 
     def get_spot(self, commodity):
         """Get current spot price for commodity.
-        v12.0 Priority: Zerodha -> TrueData -> WebSocket cache -> REST API -> historical close.
+        Priority: WebSocket cache -> REST API -> historical close.
         """
-        # v12.0 Source 1: Zerodha spot (primary — solves MCX "Access denied")
-        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
-            try:
-                zd_spot = self.zerodha.get_spot(commodity)
-                if zd_spot and zd_spot > 0:
-                    return zd_spot
-            except Exception:
-                pass
-
-        # Source 2: TrueData spot
-        if self.truedata and self.truedata.is_connected:
-            try:
-                td_spot = self.truedata.get_spot(commodity)
-                if td_spot and td_spot > 0:
-                    return td_spot
-            except Exception:
-                pass
-
-        # Source 2: WebSocket cache (instant, no API call)
+        # 1. Try WebSocket cache (instant, no API call)
         if self.ws_feed and commodity in self.angel._futures_tokens:
             ws_ltp = self.ws_feed.get_ltp(self.angel._futures_tokens[commodity])
             if ws_ltp:
                 return ws_ltp
 
-        # Source 3: REST API
+        # 2. Fallback: REST API
         ltp = self.angel.get_ltp(commodity)
         if ltp:
             return ltp
 
-        # Source 4: historical close
+        # 3. Fallback: historical close
         df = self.engine.historical_data.get(commodity)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
@@ -2428,38 +2136,16 @@ class CommodityPaperTrader:
                     if self.ws_feed and option_token:
                         self.ws_feed.subscribe_mcx_options([option_token])
 
-        # v12.0 Source 1: Zerodha option LTP (primary — no MCX rate limits)
-        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
-            try:
-                commodity_name = pos['commodity']
-                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
-                zd_ltp = self.zerodha.get_option_ltp(commodity_name, pos['strike'], opt_type)
-                if zd_ltp and zd_ltp > 0:
-                    return zd_ltp
-            except Exception:
-                pass
-
-        # v11.2 Source 2: TrueData option LTP (secondary, no rate limit)
-        if self.truedata and self.truedata.is_connected:
-            try:
-                commodity_name = pos['commodity']
-                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
-                td_ltp = self.truedata.get_option_ltp(commodity_name, pos['strike'], opt_type)
-                if td_ltp and td_ltp > 0:
-                    return td_ltp
-            except Exception:
-                pass
-
         if not option_token:
             return None
 
-        # v10.5 Source 2: WebSocket real-time LTP (instant, no rate limit)
+        # v10.5 Source 1: WebSocket real-time LTP (instant, no rate limit)
         if self.ws_feed:
             ws_ltp = self.ws_feed.get_ltp(str(option_token))
             if ws_ltp and ws_ltp > 0:
                 return ws_ltp
 
-        # Source 3: REST API with 5s cache
+        # Source 2: REST API with 5s cache
         cache_key = f"MCX_{option_token}"
         cached = self._option_ltp_cache.get(cache_key)
         if cached and (datetime.now() - cached['time']).total_seconds() < 5:
@@ -2853,10 +2539,6 @@ class CommodityPaperTrader:
             if self.data_logger and spot:
                 self.data_logger.log_spot_tick(commodity, spot)
 
-            # v13.0: Feed spot tick to calculus engine
-            if hasattr(self, 'calculus'):
-                self.calculus.add_spot_tick(commodity, spot)
-
             # v10.3: Update regime detector with latest spot + VIX
             self.regime_detector.update(commodity, spot, self.current_vix)
             regime = self.regime_detector.get_regime(commodity)
@@ -2909,16 +2591,6 @@ class CommodityPaperTrader:
             # Monthly expiry - estimate DTE
             dte = max(5, 15 - (now.day % 28))
 
-            # v11.1: Choppy day detection — block late entries if morning efficiency < 15%
-            choppy_blocked = False
-            if now.time() >= dtime(11, 0):
-                day_range = ohlc['high'] - ohlc['low']
-                net_move = abs(spot - ohlc['open'])
-                day_eff = net_move / day_range * 100 if day_range > 0 else 100
-                if day_eff < 15:
-                    choppy_blocked = True
-                    logger.info(f"  CHOPPY_DAY_BLOCK: {commodity} eff={day_eff:.0f}% — blocking new entries")
-
             # v7.1: Only 3 commodity strategies — PCR+VWAP needs equity OI data,
             # Survivor halted (needs more capital)
             checks = [
@@ -2930,9 +2602,6 @@ class CommodityPaperTrader:
             ]
 
             for strat_name, check_fn in checks:
-                if choppy_blocked:
-                    logger.debug(f"  CHOPPY_SKIP: {strat_name} blocked on choppy day")
-                    continue
                 signals = check_fn(commodity, spot, ohlc, indicators, dow, dte)
                 for sig in signals:
                     sig['strategy'] = strat_name
@@ -2944,11 +2613,7 @@ class CommodityPaperTrader:
                                f"Strike={sig['strike']:,.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
 
-        
-                        # v13.7: LIQUIDITY SWEEP DISABLED for commodity (causes scan crashes)
-            # Will re-enable after Angel->Zerodha migration
-
-# v10: Write live scan data for dashboard
+        # v10: Write live scan data for dashboard
         self._write_live_scan_data(scan_data)
 
         return all_signals
@@ -3039,15 +2704,18 @@ class CommodityPaperTrader:
                 logger.info(f"  MCX_MAX_TRADES_REACHED: {self.daily_trade_count} trades today. Skipping remaining.")
                 break
 
-            # v7.7: Strategy-aware duplicate check (v13.2: strike-agnostic — any open position with same strategy+direction blocks)
+            # v7.7: Strategy-aware duplicate check
+            strike_tolerance = {'GOLDM': 200, 'SILVERM': 1000, 'CRUDEOILM': 100}
+            tol = strike_tolerance.get(sig['commodity'], 100)
             sig_opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
             same_strat_dup = [p for p in self.portfolio.positions
                               if p['commodity'] == sig['commodity']
+                              and abs(p['strike'] - sig['strike']) <= tol
                               and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
                               and p['strategy'] == sig['strategy']]
             if same_strat_dup:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['commodity']} "
-                           f"{sig['strike']}{sig_opt_type} — already held @ {same_strat_dup[0]['strike']} (strike-agnostic v13.2)")
+                           f"{sig['strike']}{sig_opt_type} — already held @ {same_strat_dup[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -3082,9 +2750,10 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
-            # v10.4: Cross-strategy dedup — BLOCK any same commodity+direction (v13.2: strike-agnostic)
+            # v10.4: Cross-strategy dedup — BLOCK instead of allowing duplicate positions
             diff_strat_same_dir = [p for p in self.portfolio.positions
                                    if p['commodity'] == sig['commodity']
+                                   and abs(p['strike'] - sig['strike']) <= tol
                                    and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
                                    and p['strategy'] != sig['strategy']]
             if diff_strat_same_dir:
@@ -3331,39 +3000,12 @@ class CommodityPaperTrader:
             sig_greeks = sig.get('greeks', {})
             dci = compute_direction_confidence(sig, sig['spot'], indicators, self.current_vix, sig_greeks)
             sig['_dci'] = dci
-            # v13.2: Use lower DCI threshold for PE/bearish signals
-            _dci_thresh = DCI_SELL_MIN_THRESHOLD if 'PE' in sig['type'] else DCI_MIN_THRESHOLD
-            if dci < _dci_thresh:
-                logger.info(f"  SKIP_DCI: {sig['commodity']} {sig['type']} DCI={dci} < {_dci_thresh}")
+            if dci < DCI_MIN_THRESHOLD:
+                logger.info(f"  SKIP_DCI: {sig['commodity']} {sig['type']} DCI={dci} < {DCI_MIN_THRESHOLD}")
                 skipped += 1
                 continue
             logger.info(f"  DCI_PASS: {sig['commodity']} {sig['type']} DCI={dci}/100")
 
-
-            # ---- v12.0: PHYSICS GATE — mathematical signal quality filter ----
-            # Blocks entries where: momentum dying, wave peak, VWAP stretched, RSI extreme
-            # Backtested: PF 2.65 -> 3.18, blocks wrong-direction entries mathematically
-            if hasattr(self, 'calculus') and self.calculus.bar_count(sig['commodity']) >= 6:
-                sig_dir = 'CE' if 'CE' in sig['type'] else 'PE'
-                phy_score, phy_diag = self.calculus.physics_gate(sig['commodity'], sig_dir, sig['spot'])
-                sig['_physics_score'] = phy_score
-                sig['_physics_diag'] = phy_diag
-                if phy_score < 0:
-                    warnings_list = []
-                    if phy_diag.get('mom_dying'): warnings_list.append('MOM_DYING')
-                    if phy_diag.get('wave_peak'): warnings_list.append('WAVE_PEAK')
-                    if phy_diag.get('stretched'): warnings_list.append('VWAP_STRETCHED')
-                    if phy_diag.get('rsi_extreme'): warnings_list.append('RSI_EXTREME')
-                    logger.info(f"  PHYSICS_BLOCK: {sig['commodity']} {sig['type']} "
-                               f"score={phy_score} [{','.join(warnings_list)}] "
-                               f"accel={phy_diag.get('accel','?')} wave={phy_diag.get('wave_risk','?')} "
-                               f"vwap={phy_diag.get('vwap_stretch','?')} rsi={phy_diag.get('rsi','?')}")
-                    skipped += 1
-                    continue
-                else:
-                    logger.info(f"  PHYSICS_PASS: {sig['commodity']} {sig['type']} "
-                               f"score={phy_score} accel={phy_diag.get('accel','?')} "
-                               f"wave={phy_diag.get('wave_risk','?')}")
             # ---- v10.4: IV + DTE hard gate ----
             entry_iv_val = sig_greeks.get('iv', 0)
             sig_dte = sig.get('dte', 5)
@@ -3479,17 +3121,6 @@ class CommodityPaperTrader:
                         continue
                     logger.info(f"  PREMIUM_GAP: {sig['commodity']} {sig['strike']}{opt_type} gap={premium_gap_pct:.1f}% (OK)")
 
-            # v14.0: Trade Intelligence entry filter
-            if hasattr(self, 'trade_intel'):
-                ti_allowed, ti_reason, ti_quality = self.trade_intel.should_enter(
-                    sig, existing_positions=self.portfolio.positions
-                )
-                if not ti_allowed:
-                    logger.info(f"  TI_BLOCK: {sig.get('commodity','')} {sig.get('type','')} \u2014 {ti_reason}")
-                    skipped += 1
-                    continue
-                logger.info(f"  TI_PASS: {sig.get('commodity','')} {sig.get('type','')} \u2014 {ti_reason}")
-
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
                 commodity=sig['commodity'],
@@ -3505,7 +3136,7 @@ class CommodityPaperTrader:
                          'expiry': expiry,  # v9.1: Store expiry for dashboard display
                          'dci': sig.get('_dci', 0),  # v10.4: Direction Confidence Index
                          'entry_iv': sig['greeks'].get('iv', 0),  # v10.4: Entry IV
-                         'entry_regime': self.regime_detector.get_regime(sig['commodity']).value if hasattr(self, 'regime_detector') else 'unknown',  # v10.4
+                         'entry_regime': regime.value if hasattr(regime, 'value') else str(regime),  # v10.4
                          },
                 oi=entry_oi,
                 iv=sig['greeks'].get('iv', 0),
@@ -3609,28 +3240,23 @@ class CommodityPaperTrader:
 
             spec = COMMODITIES[commodity]
 
-            # ---- v10.7: GREEKS REFRESH — Use greeks_from_market_price_b76 with current premium ----
+            # ---- v10.6: GREEKS REFRESH — Recalculate every 5 min during hold ----
             _last_refresh = pos.get('greeks_refreshed_at')
             _should_refresh = (_last_refresh is None or
                               (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= MCX_GREEKS_REFRESH_INTERVAL_SECONDS)
-            if _should_refresh and pos.get('strike'):
+            if _should_refresh and pos.get('strike') and pos.get('iv'):
                 try:
                     _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
                     _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
                     _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
-                    _current_premium = pos.get('current_premium', pos['entry_premium'])
-                    if _current_premium > 0:
-                        _g = greeks_from_market_price_b76(_current_premium, spot, pos['strike'], _T, RISK_FREE_RATE, _opt_type)
-                        if _g:
-                            pos['delta'] = round(_g['delta'], 4)
-                            pos['gamma'] = round(_g['gamma'], 6)
-                            pos['theta'] = round(_g['theta'], 4)
-                            pos['iv'] = round(_g['iv'] * 100, 1) if _g.get('iv') else pos.get('iv', 0)
-                            pos['greeks_refreshed_at'] = datetime.now().isoformat()
-                            logger.debug(f"  MCX_GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
-                                        f"Th={_g['theta']:.3f} IV={_g.get('iv', 0)*100:.1f}% (T={_T:.4f}yr) [LIVE]")
-                        else:
-                            logger.debug(f"  MCX_GREEKS_REFRESH: {pos['id']} IV solve failed for premium={_current_premium:.2f}")
+                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
+                    _g = black76_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                    pos['delta'] = round(_g['delta'], 4)
+                    pos['gamma'] = round(_g['gamma'], 6)
+                    pos['theta'] = round(_g['theta'], 4)
+                    pos['greeks_refreshed_at'] = datetime.now().isoformat()
+                    logger.debug(f"  MCX_GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
+                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr)")
                 except Exception as e:
                     logger.debug(f"  MCX_GREEKS_REFRESH_ERR: {pos.get('id', '?')} — {e}")
 
@@ -3741,7 +3367,7 @@ class CommodityPaperTrader:
                         logger.info(f"  BKOUT_FAIL_DCI_SKIP: {pos['id']} entry DCI={entry_dci} >= 70 — high confidence, skipping breakout fail check")
                     else:
                         # Rapid drop: exit + queue reverse
-                        if BREAKOUT_FAIL_REVERSE_ENABLED and drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
+                        if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
                             logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s (bf_timer={bf_check_secs}s)")
                             self.portfolio.close_position(pos['id'], current, 'BREAKOUT_FAIL_REVERSE')
                             self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
@@ -3984,27 +3610,6 @@ class CommodityPaperTrader:
 
             exit_reason = None
 
-            # ---- v13.8: MOMENTUM EXIT — spot reverses against direction ----
-            if MOMENTUM_EXIT_ENABLED and exit_reason is None:
-                _me_entry_spot = pos.get('details', {}).get('spot', 0) if isinstance(pos.get('details'), dict) else 0
-                _me_spot_now = spot  # Already computed above in exit loop
-                _me_entry_ts = pos.get('timestamp', '')
-                if _me_entry_spot > 0 and _me_spot_now > 0 and _me_entry_ts:
-                    try:
-                        _me_entry_dt = datetime.fromisoformat(_me_entry_ts)
-                        _me_hold_min = (datetime.now() - _me_entry_dt).total_seconds() / 60
-                        if _me_hold_min >= MOMENTUM_EXIT_MIN_MINUTES:
-                            _me_change = (_me_spot_now - _me_entry_spot) / _me_entry_spot * 100
-                            _me_is_ce = 'CE' in pos.get('signal_type', '')
-                            _me_against = (_me_is_ce and _me_change < -MOMENTUM_EXIT_SPOT_PCT) or                                           (not _me_is_ce and _me_change > MOMENTUM_EXIT_SPOT_PCT)
-                            if _me_against and pos.get('unrealized_pnl', 0) <= 0:
-                                exit_reason = 'MOMENTUM_EXIT'
-                                logger.info(f"  MOMENTUM_EXIT: {pos['id']} spot {_me_entry_spot:.0f}->{_me_spot_now:.0f} "
-                                           f"({_me_change:+.2f}%) after {_me_hold_min:.0f}min")
-                    except Exception:
-                        pass
-
-
             if not pos['is_sell']:
                 # BUY positions
                 if current <= sl:
@@ -4200,12 +3805,11 @@ class CommodityPaperTrader:
             df.to_csv(log_file, index=False)
             logger.info(f"  Signals logged ({len(rows)} rows): {log_file}")
 
-    def run_continuous(self, interval_seconds=1):
-        """v15: Tick-by-tick scanning (was 5 min intervals)."""
+    def run_continuous(self, interval=5):
         self._running = True
         logger.info(f"\n{'='*70}")
-        logger.info("COMMODITY PAPER TRADING STARTED (v15 — TICK-BY-TICK)")
-        logger.info(f"MCX Hours: 9:00 AM - 11:30 PM | Scan every {interval_seconds}s")
+        logger.info("COMMODITY PAPER TRADING STARTED")
+        logger.info(f"MCX Hours: 9:00 AM - 11:30 PM | Scan every {interval} min")
         logger.info(f"Commodities: {', '.join(PAPER_TRADE_COMMODITIES)}")
         logger.info(f"Capital: Rs {self.portfolio.capital:,.0f}")
         logger.info(f"{'='*70}\n")
@@ -4215,15 +3819,12 @@ class CommodityPaperTrader:
         while self._running:
             now = datetime.now().time()
             if MCX_OPEN <= now <= MCX_CLOSE:
-                try:
-                    self.run_once()
-                except Exception as e:
-                    logger.error(f"  SCAN_ERROR: {e}")
+                self.run_once()
             elif now > MCX_CLOSE:
                 logger.info("MCX closed. Final status:")
                 self.portfolio.print_status()
                 break
-            time.sleep(interval_seconds)
+            time.sleep(interval * 60)
 
 
 def main():
@@ -4237,7 +3838,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--status', action='store_true')
     parser.add_argument('--once', action='store_true')
-    parser.add_argument('--interval', type=int, default=1, help='Scan interval in seconds (v15)')
+    parser.add_argument('--interval', type=int, default=5)
     parser.add_argument('--offline', action='store_true')
     parser.add_argument('--reset', action='store_true')
     args = parser.parse_args()
@@ -4266,7 +3867,7 @@ def main():
         if args.once:
             trader.run_once()
         else:
-            trader.run_continuous(interval_seconds=args.interval)
+            trader.run_continuous(args.interval)
     else:
         logger.warning("API failed, running offline...")
         trader.run_once()

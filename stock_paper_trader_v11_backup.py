@@ -80,11 +80,11 @@ HOLD_SCORE_WEAK = 40
 HOLD_SCORE_MIN_HOLD_MINS = 30
 
 # Trailing Stop Loss config (same proven system as paper_trader.py)
-TSL_BREAKEVEN_GAIN_PCT = 10    # v13: Lock breakeven at +10% (was 15% — too late)
-TSL_TRAIL_GAIN_PCT = 20        # v13: Start trailing at +20% (was 25%)
-TSL_TRAIL_DISTANCE_PCT = 20    # v13: 20% below peak (was 30% — too loose)
-TSL_TIGHT_GAIN_PCT = 35        # v13: Tight trail at +35% (was 40%)
-TSL_TIGHT_DISTANCE_PCT = 12    # v13: 12% below peak (was 20%)
+TSL_BREAKEVEN_GAIN_PCT = 15    # Phase 1: Lock breakeven at +15%
+TSL_TRAIL_GAIN_PCT = 25        # Phase 2: Start trailing at +25%
+TSL_TRAIL_DISTANCE_PCT = 30    # Phase 2: 30% below peak profit
+TSL_TIGHT_GAIN_PCT = 40        # Phase 3: Tight trail at +40%
+TSL_TIGHT_DISTANCE_PCT = 20    # Phase 3: 20% below peak profit
 
 # v10.1: Trailing Target (replaces hard TARGET_HIT exit)
 TARGET_TRAIL_ENABLED = True
@@ -92,28 +92,11 @@ TARGET_TRAIL_EXTEND_PCT = 20          # Extend target by 20% of current premium 
 TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
 TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 
-# v13.0: Breakout Failure Detection — RELAXED (was causing premature exits)
-BREAKOUT_FAIL_CHECK_MINUTES = 20       # v13: Extended from 5 min — stocks need time to develop
-BREAKOUT_FAIL_MIN_GAIN_PCT = 1        # v13: Reduced from 2%
-BREAKOUT_FAIL_REVERSE_DROP_PCT = 25   # v13: Increased from 15% — only reverse on severe failures
-BREAKOUT_FAIL_REVERSE_ENABLED = False
-
-# v13.3: Volatility-adjusted SL — scale SL by inverse ATR ratio
-# BANKNIFTY 2.7x more volatile than NIFTY, needs tighter SL
-# Simulation: saves Rs +8,638/week across BANKNIFTY + SENSEX
-VOLATILITY_SL_ENABLED = True
-ATR_REFERENCE = {
-    'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
-    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409,
-}
-ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
-
-# v13.3: Momentum reversal exit
-# If spot moves 0.4% AGAINST trade direction after 20min, exit
-# Simulation: saves Rs +6,974, hurts ZERO winning trades
-MOMENTUM_EXIT_ENABLED = True
-MOMENTUM_EXIT_SPOT_PCT = 0.4
-MOMENTUM_EXIT_MIN_MINUTES = 20
+# v10.1: Breakout Failure Detection
+BREAKOUT_FAIL_CHECK_MINUTES = 5
+BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
+BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
+BREAKOUT_FAIL_REVERSE_ENABLED = True
 
 # OI/IV exit thresholds
 OI_SURGE_FIRST_HOUR_PCT = 50
@@ -133,7 +116,7 @@ VIX_BLOCK_LOW = 11
 # v10.6: Greeks Refresh + Theta Decay Exit
 GREEKS_REFRESH_INTERVAL_SECONDS = 300
 THETA_BURDEN_TIGHTEN_PCT = 5.0
-THETA_BURDEN_EXIT_PCT = 999.0  # v11.1: Disabled — BS theta kills winners near expiry (same fix as equity bot)
+THETA_BURDEN_EXIT_PCT = 10.0
 THETA_TIGHTEN_SL_FACTOR = 0.90
 
 # Cooldowns & Limits
@@ -546,16 +529,12 @@ class StockCPRScanner:
         pcr_proxy = 1 + (close_chg.tail(5).mean() * 10)
         pcr_proxy = max(0.5, min(2.0, pcr_proxy))
 
-        # v13.0: Intraday VWAP (integral calculus) — replaces stale 5-day VWAP
-        vwap = None
-        if hasattr(self, 'calculus'):
-            vwap = self.calculus.get_intraday_vwap_for_indicators(symbol)
-        if vwap is None:
-            if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
-                tp = (df['High'] + df['Low'] + df['Close']) / 3
-                vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
-            else:
-                vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()
+        # VWAP (rolling 5-day)
+        if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
+            tp = (df['High'] + df['Low'] + df['Close']) / 3
+            vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
+        else:
+            vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()  # v10.2c: Fixed VWAP fallback
 
         return {
             'pivot': pivot,
@@ -685,18 +664,6 @@ class StockCPRScanner:
 # ====================================================================
 # STOCK ANGEL CONNECTION
 # ====================================================================
-
-# v13.5: Angel API disabled
-class _NullAngel:
-    """Stub for disabled Angel API."""
-    _connected = False
-    instruments = None
-    obj = None
-    def __getattr__(self, name):
-        def null_method(*args, **kwargs):
-            return None
-        return null_method
-
 class StockAngelConnection:
     """Manages Angel One SmartAPI connection for stock options.
 
@@ -718,8 +685,6 @@ class StockAngelConnection:
         self._auth_time = 0           # v9.2: Track when we last authenticated
         self._app_type = 'Historical' # v9.2: Remember app type for reconnect
         self.market_pipeline = None   # v10.5: NSE pipeline for stock option chain fallback
-        self.zerodha = None           # v12.0: Zerodha Kite feed (set by StockPaperTrader)
-        self.truedata = None          # v11.2: TrueData feed (set by StockPaperTrader)
         self._reconnecting = False    # v9.2: Prevent recursive reconnect loops
 
     def load_credentials(self):
@@ -1219,124 +1184,11 @@ class StockAngelConnection:
         best = None
         best_score = -1
 
-        # v12.0: Data source priority: 1) Zerodha, 2) TrueData, 3) NSE/BSE pipeline, 4) Angel API
-
-        # Source 1: Zerodha Kite option chain (primary)
-        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
-            try:
-                zd_chain = self.zerodha.get_option_chain(name)
-                if zd_chain:
-                    contracts = zd_chain.get(opt_type, [])
-                    zd_best = None
-                    zd_best_oi = -1
-                    for c in contracts:
-                        c_strike = c.get('strike', 0)
-                        if c_strike not in candidates:
-                            continue
-                        c_ltp = c.get('ltp', 0)
-                        c_oi = c.get('oi', 0)
-                        if c_ltp <= 0:
-                            continue
-                        if c_oi > zd_best_oi:
-                            zd_best_oi = c_oi
-                            zd_best = {
-                                'strike': c_strike,
-                                'ltp': c_ltp,
-                                'oi': c_oi,
-                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
-                                'volume': c.get('volume', 0),
-                            }
-                    if zd_best:
-                        token_info = self.find_option_tokens(name, None, zd_best['strike'], opt_type)
-                        if token_info:
-                            zd_best['token'] = str(token_info.get('token', ''))
-                            zd_best['symbol'] = token_info.get('symbol', '')
-                        logger.info(f"  ZERODHA_STRIKE: {name} {opt_type} ATM={atm_strike} "
-                                    f"Selected={zd_best['strike']} OI={zd_best['oi']:,.0f} "
-                                    f"LTP={zd_best['ltp']:.2f} [Zerodha]")
-                        return zd_best
-            except Exception as e:
-                logger.debug(f"[Zerodha] Strike lookup failed for {name}: {e}")
-
-        # Source 2: TrueData option chain (secondary)
-        if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
-            try:
-                td_chain = self.truedata.get_option_chain(name)
-                if td_chain:
-                    contracts = td_chain.get(opt_type, [])
-                    td_best = None
-                    td_best_oi = -1
-                    for c in contracts:
-                        c_strike = c.get('strike', 0)
-                        if c_strike not in candidates:
-                            continue
-                        c_ltp = c.get('ltp', 0)
-                        c_oi = c.get('oi', 0)
-                        if c_ltp <= 0:
-                            continue
-                        if c_oi > td_best_oi:
-                            td_best_oi = c_oi
-                            td_best = {
-                                'strike': c_strike,
-                                'ltp': c_ltp,
-                                'oi': c_oi,
-                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
-                                'volume': c.get('volume', 0),
-                            }
-                    if td_best:
-                        token_info = self.find_option_tokens(name, None, td_best['strike'], opt_type)
-                        if token_info:
-                            td_best['token'] = str(token_info.get('token', ''))
-                            td_best['symbol'] = token_info.get('symbol', '')
-                        logger.info(f"  TRUEDATA_STRIKE: {name} {opt_type} ATM={atm_strike} "
-                                    f"Selected={td_best['strike']} OI={td_best['oi']:,.0f} "
-                                    f"LTP={td_best['ltp']:.2f} [TrueData]")
-                        return td_best
-            except Exception as e:
-                logger.debug(f"[TrueData] Strike lookup failed for {name}: {e}")
-
-        # Source 2: NSE/BSE pipeline (most reliable, no API auth needed)
-        if hasattr(self, 'market_pipeline') and self.market_pipeline:
-            try:
-                chain = self.market_pipeline.get_stock_option_chain(name)
-                if chain:
-                    contracts = chain.get(opt_type, [])
-                    nse_best = None
-                    nse_best_oi = -1
-                    for c in contracts:
-                        c_strike = c.get('strike', 0)
-                        if c_strike not in candidates:
-                            continue
-                        c_ltp = c.get('ltp', 0)
-                        c_oi = c.get('oi', 0)
-                        if c_ltp <= 0:
-                            continue
-                        if c_oi > nse_best_oi:
-                            nse_best_oi = c_oi
-                            nse_best = {
-                                'strike': c_strike,
-                                'ltp': c_ltp,
-                                'oi': c_oi,
-                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
-                                'volume': c.get('volume', 0),
-                            }
-                    if nse_best:
-                        # Find token for this strike
-                        token_info = self.find_option_tokens(name, None, nse_best['strike'], opt_type)
-                        if token_info:
-                            nse_best['token'] = str(token_info.get('token', ''))
-                            nse_best['symbol'] = token_info.get('symbol', '')
-                        logger.info(f"  NSE_STRIKE: {name} {opt_type} ATM={atm_strike} "
-                                    f"Selected={nse_best['strike']} OI={nse_best['oi']:,.0f} "
-                                    f"LTP={nse_best['ltp']:.2f} [NSE Pipeline]")
-                        return nse_best
-            except Exception as e:
-                logger.debug(f"  NSE_STRIKE_ERR: {name} {opt_type} — {e}")
-
-        # Source 3: Angel API option chain (fallback when TrueData + NSE/BSE pipeline unavailable)
         # v10.3: Try NFO first, then BFO if optionGreek returns empty
+        # Some stocks (SUNPHARMA, LAURUSLABS) return empty from NFO API
         exchanges_to_try = ['NFO']
         if not expiry_date:
+            # If no expiry provided, try to get one from NFO first, then BFO
             expiry_date = self._get_nearest_expiry(name, exchange='NFO')
             if not expiry_date:
                 expiry_date = self._get_nearest_expiry(name, exchange='BFO')
@@ -1390,15 +1242,15 @@ class StockAngelConnection:
                     gamma = float(strike_data.get('gamma', 0) or 0)
 
                     # v10.3d: Gamma-first scoring — highest gamma wins
-                    delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
+                    delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
                     gamma_score = gamma * 10000  # No cap — let highest gamma win
                     oi_norm = min(oi / 100000, 1.0)
                     vol_norm = min(volume / 10000, 1.0)
                     # Weighted: Gamma(40%) + Delta(30%) + OI(20%) + Volume(10%)
                     score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
-                    # v11.1: Tighter delta range 0.35-0.65 (was 0.20-0.70)
-                    if delta > 0 and (delta < 0.35 or delta > 0.65):
+                    # FILTER: Skip strikes outside delta range 0.20-0.70
+                    if delta > 0 and (delta < 0.20 or delta > 0.70):
                         continue
 
                     # v10.3d-4: Score by delta+gamma+volume (optionGreek API returns LTP=0, OI=0)
@@ -1441,6 +1293,44 @@ class StockAngelConnection:
 
         except Exception as e:
             logger.error(f"Option chain strike selection error for {name}: {e}")
+
+        # v10.5: NSE pipeline fallback — try NSE option chain when Angel fails
+        if hasattr(self, 'market_pipeline') and self.market_pipeline:
+            try:
+                chain = self.market_pipeline.get_stock_option_chain(name)
+                if chain:
+                    contracts = chain.get(opt_type, [])
+                    nse_best = None
+                    nse_best_oi = -1
+                    for c in contracts:
+                        c_strike = c.get('strike', 0)
+                        if c_strike not in candidates:
+                            continue
+                        c_ltp = c.get('ltp', 0)
+                        c_oi = c.get('oi', 0)
+                        if c_ltp <= 0:
+                            continue
+                        if c_oi > nse_best_oi:
+                            nse_best_oi = c_oi
+                            nse_best = {
+                                'strike': c_strike,
+                                'ltp': c_ltp,
+                                'oi': c_oi,
+                                'iv': c.get('iv', 0) / 100 if c.get('iv', 0) > 1 else c.get('iv', 0),
+                                'volume': c.get('volume', 0),
+                            }
+                    if nse_best:
+                        # Find token for this strike
+                        token_info = self.find_option_tokens(name, None, nse_best['strike'], opt_type)
+                        if token_info:
+                            nse_best['token'] = str(token_info.get('token', ''))
+                            nse_best['symbol'] = token_info.get('symbol', '')
+                        logger.info(f"  NSE_FALLBACK: {name} {opt_type} ATM={atm_strike} "
+                                    f"Selected={nse_best['strike']} OI={nse_best['oi']:,.0f} "
+                                    f"LTP={nse_best['ltp']:.2f} [NSE Pipeline]")
+                        return nse_best
+            except Exception as e:
+                logger.debug(f"  NSE_FALLBACK_ERR: {name} {opt_type} — {e}")
 
         # No live data available — SKIP this stock (NO Black-Scholes fallback)
         logger.warning(f"  SKIP_NO_LIVE_DATA: {name} {opt_type} ATM={atm_strike} — "
@@ -1902,12 +1792,6 @@ class StockStrategyEngine:
             list of signal dicts.
         """
         try:
-            # v13.0: Lower CPR narrow threshold for stocks (was 0.03%, same as indices — too aggressive)
-            # Stocks naturally have much narrower CPR (CIPLA=0.023%, ADANIGREEN=0.002%)
-            cpr_w = indicators.get('cpr_width', 1.0)
-            if cpr_w < 0.005:
-                logger.info(f"  CPR_NARROW_SKIP: {symbol} CPR width {cpr_w:.4f}% < 0.005% — signals unreliable")
-                return []
             signals = check_cpr_breakout(spot, ohlc, indicators, config)
             # v10.1: VWAP direction filtering for CPR signals
             vwap = indicators.get('vwap', 0)
@@ -2097,7 +1981,7 @@ class StockPaperTrader:
     def __init__(self):
         """Initialize the stock paper trader with all subsystems."""
         self.fno_config = StockFnOConfig()
-        self.angel = _NullAngel()  # v13.5: Angel DISABLED
+        self.angel = StockAngelConnection()
         self.angel.fno_config_ref = self.fno_config  # Back-reference for strike selection
         self.portfolio = StockPortfolio()
         self.scanner = StockCPRScanner(self.fno_config, self.angel)
@@ -2124,46 +2008,6 @@ class StockPaperTrader:
         self.data_logger = None  # v10.2e: Live data logger for backtesting
         self.market_pipeline = None  # v10.5: NSE pipeline for stock option chain fallback
 
-        # v12.0: Zerodha Kite Connect as Source 1 (primary)
-        self.zerodha = None
-        try:
-            from zerodha_feed import ZerodhaFeed
-            self.zerodha = ZerodhaFeed()
-            if self.zerodha.connect():
-                logger.info("[Zerodha] ✅ Initialized as Source 1 for stock option chain + LTP")
-            else:
-                self.zerodha = None
-                logger.warning("[Zerodha] Connection failed — trying TrueData as Source 2")
-        except Exception as e:
-            logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
-
-        # v11.2: TrueData as Source 2 for option chain + LTP
-        self.truedata = None
-        try:
-            from truedata_feed import TrueDataFeed
-            self.truedata = TrueDataFeed()
-            if self.truedata.connect():
-                src_num = "2" if self.zerodha else "1 (Zerodha unavailable)"
-                logger.info(f"[TrueData] Initialized as Source {src_num} for stock option chain + LTP")
-            else:
-                self.truedata = None
-                logger.warning("[TrueData] Connection failed — falling back to NSE/BSE + Angel")
-        except Exception as e:
-            logger.warning(f"[TrueData] Not available: {e} — falling back to NSE/BSE + Angel")
-
-        # Wire data sources into StockAngelConnection for select_optimal_strike
-        self.angel.zerodha = self.zerodha
-        self.angel.truedata = self.truedata
-
-        # v13.0: Calculus engine — intraday VWAP + momentum direction
-        from market_calculus import MarketCalculus
-        self.calculus = MarketCalculus()
-        self.engine.calculus = self.calculus
-
-        # v14.0: Trade Intelligence engine
-        from trade_intelligence import TradeIntelligence
-        self.trade_intel = TradeIntelligence()
-
         # v10.5b: Regime detector (same as equity/commodity)
         self.regime_detector = RegimeDetector()
         self._last_logged_regime = {}
@@ -2187,18 +2031,19 @@ class StockPaperTrader:
         logger.info("STOCK OPTIONS PAPER TRADER v1.0 — Initializing")
         logger.info("=" * 70)
 
-        # v13.5: Angel disabled - try connecting (will fail gracefully with _NullAngel)
-        angel_ok = self.angel.connect('Historical')
-        if angel_ok:
-            self.angel.load_instruments()
-        else:
-            logger.warning("Angel API disabled/unavailable - using Zerodha as primary")
+        # Connect to Angel One
+        if not self.angel.connect('Historical'):
+            logger.error("Failed to connect to Angel One API")
+            return False
 
-        # v13.5: Zerodha is primary data source - Angel instruments optional
-        if self.angel.instruments is not None:
-            self.fno_config.refresh_from_instruments(self.angel)
-        else:
-            logger.info("Using cached F&O config (Angel instruments not available)")
+        # Load instruments master
+        self.angel.load_instruments()
+        if self.angel.instruments is None:
+            logger.error("Failed to load instruments master")
+            return False
+
+        # Refresh F&O config from instruments
+        self.fno_config.refresh_from_instruments(self.angel)
 
         self._initialized = True
         logger.info(f"Initialization complete. Capital: Rs {self.portfolio.capital:,.0f}")
@@ -2388,31 +2233,6 @@ class StockPaperTrader:
         if cached and (datetime.now() - cached['time']).total_seconds() < 15:
             return cached['ltp']
 
-        # v12.0: Source 1 — Zerodha Kite option LTP (primary)
-        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
-            try:
-                symbol = pos.get('stock_symbol', pos.get('symbol', ''))
-                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
-                zd_ltp = self.zerodha.get_option_ltp(symbol, pos['strike'], opt_type)
-                if zd_ltp and zd_ltp > 0:
-                    self._option_ltp_cache[cache_key] = {'ltp': zd_ltp, 'time': datetime.now()}
-                    return zd_ltp
-            except Exception as e:
-                logger.debug(f"  [Zerodha] Option LTP failed: {e}")
-
-        # Source 2: TrueData option LTP (secondary)
-        if hasattr(self, 'truedata') and self.truedata and self.truedata.is_connected:
-            try:
-                symbol = pos.get('stock_symbol', pos.get('symbol', ''))
-                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
-                td_ltp = self.truedata.get_option_ltp(symbol, pos['strike'], opt_type)
-                if td_ltp and td_ltp > 0:
-                    self._option_ltp_cache[cache_key] = {'ltp': td_ltp, 'time': datetime.now()}
-                    return td_ltp
-            except Exception as e:
-                logger.debug(f"  [TrueData] Option LTP failed: {e}")
-
-        # Source 3: Angel API LTP
         try:
             ltp = self.angel.get_ltp(exchange, option_token)
             if ltp and ltp > 0:
@@ -2421,7 +2241,7 @@ class StockPaperTrader:
         except Exception as e:
             logger.debug(f"  Option LTP fetch failed for {cache_key}: {e}")
 
-        # v10.5: Source 3 — NSE pipeline fallback for exit LTP
+        # v10.5: NSE pipeline fallback for exit LTP
         if hasattr(self, 'market_pipeline') and self.market_pipeline:
             try:
                 symbol = pos.get('stock_symbol', pos.get('symbol', ''))
@@ -2766,29 +2586,19 @@ class StockPaperTrader:
             _last_refresh = pos.get('greeks_refreshed_at')
             _should_refresh = (_last_refresh is None or
                               (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= GREEKS_REFRESH_INTERVAL_SECONDS)
-            if _should_refresh and pos.get('strike'):
+            if _should_refresh and pos.get('strike') and pos.get('iv'):
                 try:
                     _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
                     _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
                     _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
-                    # v11.3: Use greeks_from_market_price with current_premium instead of
-                    # bs_greeks with stale entry IV — gives accurate real-time greeks
-                    _curr_prem = pos.get('current_premium', pos['entry_premium'])
-                    _g = greeks_from_market_price(_curr_prem, spot, pos['strike'], _T, RISK_FREE_RATE, _opt_type)
-                    if _g is None:
-                        # IV solve failed — fallback to bs_greeks with stored IV
-                        _iv = pos['iv'] / 100 if pos.get('iv', 0) > 1 else pos.get('iv', 0.25)
-                        _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
-                        logger.debug(f"  GREEKS_REFRESH_IVFAIL: {pos['id']} — IV solve failed, using stored IV={_iv:.3f}")
-                    else:
-                        # Update stored IV with freshly solved value
-                        pos['iv'] = round(_g.get('iv', pos.get('iv', 0.25)), 6)
+                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
+                    _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
                     pos['delta'] = round(_g['delta'], 4)
                     pos['gamma'] = round(_g['gamma'], 6)
                     pos['theta'] = round(_g['theta'], 4)
                     pos['greeks_refreshed_at'] = datetime.now().isoformat()
-                    logger.debug(f"  GREEKS_REFRESH: {pos['id']} [LIVE] D={_g['delta']:.3f} G={_g['gamma']:.5f} "
-                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr, prem={_curr_prem:.2f})")
+                    logger.debug(f"  GREEKS_REFRESH: {pos['id']} D={_g['delta']:.3f} G={_g['gamma']:.5f} "
+                                f"Th={_g['theta']:.3f} (T={_T:.4f}yr)")
                 except Exception as e:
                     logger.debug(f"  GREEKS_REFRESH_ERR: {pos.get('id', '?')} — {e}")
 
@@ -2952,7 +2762,7 @@ class StockPaperTrader:
                         drop_bf = (current_premium - entry_prem_bf) / entry_prem_bf * 100
 
                     # Rapid drop: exit + queue reverse
-                    if BREAKOUT_FAIL_REVERSE_ENABLED and drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
+                    if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
                         logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s")
                         self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL_REVERSE')
                         self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
@@ -3230,27 +3040,6 @@ class StockPaperTrader:
 
             exit_reason = None
 
-            # ---- v13.8: MOMENTUM EXIT — spot reverses against direction ----
-            if MOMENTUM_EXIT_ENABLED and exit_reason is None:
-                _me_entry_spot = pos.get('details', {}).get('spot', 0) if isinstance(pos.get('details'), dict) else 0
-                _me_spot_now = self.get_stock_spot(pos.get('symbol', pos.get('stock_symbol', ''))) or 0
-                _me_entry_ts = pos.get('timestamp', '')
-                if _me_entry_spot > 0 and _me_spot_now > 0 and _me_entry_ts:
-                    try:
-                        _me_entry_dt = datetime.fromisoformat(_me_entry_ts)
-                        _me_hold_min = (datetime.now() - _me_entry_dt).total_seconds() / 60
-                        if _me_hold_min >= MOMENTUM_EXIT_MIN_MINUTES:
-                            _me_change = (_me_spot_now - _me_entry_spot) / _me_entry_spot * 100
-                            _me_is_ce = 'CE' in pos.get('signal_type', '')
-                            _me_against = (_me_is_ce and _me_change < -MOMENTUM_EXIT_SPOT_PCT) or                                           (not _me_is_ce and _me_change > MOMENTUM_EXIT_SPOT_PCT)
-                            if _me_against and pos.get('unrealized_pnl', 0) <= 0:
-                                exit_reason = 'MOMENTUM_EXIT'
-                                logger.info(f"  MOMENTUM_EXIT: {pos['id']} spot {_me_entry_spot:.0f}->{_me_spot_now:.0f} "
-                                           f"({_me_change:+.2f}%) after {_me_hold_min:.0f}min")
-                    except Exception:
-                        pass
-
-
             if not pos['is_sell']:
                 # BUY positions
                 if current_premium <= sl:
@@ -3363,10 +3152,6 @@ class StockPaperTrader:
             if self.data_logger and spot:
                 self.data_logger.log_spot_tick(symbol, spot)
 
-            # v13.0: Feed spot tick to calculus engine
-            if hasattr(self, 'calculus'):
-                self.calculus.add_spot_tick(symbol, spot)
-
             # Compute indicators
             indicators = stock_info.get('indicators')
             if not indicators:
@@ -3453,54 +3238,6 @@ class StockPaperTrader:
             logger.info(f"  [SPOT] OK={spots_ok} FAIL={spots_fail} Raw_signals={len(all_signals)}")
         elif datetime.now().minute % 5 == 0:
             logger.info(f"  [SPOT] OK={spots_ok} Raw_signals={len(all_signals)}")
-
-        
-        # ---- v13.1: LIQUIDITY SWEEP for stocks ----
-        try:
-            if hasattr(self, 'calculus'):
-                _ls_now = datetime.now()
-                _ls_s = _ls_now.replace(hour=9, minute=16, second=0)
-                _ls_e = _ls_now.replace(hour=15, minute=15, second=0)
-                if _ls_s <= _ls_now <= _ls_e:
-                    for _si in watchlist:
-                        _sym = _si.get('symbol', '')
-                        if self.calculus.bar_count(_sym) >= 25:
-                            _sweeps = self.calculus.detect_liquidity_sweep(_sym)
-                            for _sw in _sweeps:
-                                if _sw['quality'] < 45:
-                                    continue
-                                _sw_spot = self.get_stock_spot(_sym) or 0
-                                if _sw_spot <= 0:
-                                    continue
-                                _sw_dir = _sw['direction']
-                                _sw_type = 'BUY_' + _sw_dir + '_SWEEP'
-                                _opt = self.engine.select_optimal_strike(_sym, _sw_spot, _sw_dir)
-                                if not _opt:
-                                    continue
-                                _sw_strike = _opt.get('strike', 0)
-                                _sw_ltp = _opt.get('ltp', 0)
-                                _sw_iv = _opt.get('iv', 0)
-                                if _sw_ltp > 5:
-                                    _T = max(dte, 1) / 365.0
-                                    _g = greeks_from_market_price(_sw_ltp, _sw_spot, _sw_strike, _T, RISK_FREE_RATE, _sw_dir)
-                                    _q = _sw['quality']
-                                    all_signals.append({
-                                        'type': _sw_type,
-                                        'strike': _sw_strike,
-                                        'premium': _sw_ltp,
-                                        'greeks': _g,
-                                        'symbol': _sym,
-                                        'spot': _sw_spot,
-                                        'strategy': 'Liquidity Sweep',
-                                        'reason': 'Liquidity Sweep: ' + _sw['spike_dir'] + ' spike Q=' + str(_q) + ' [LIVE]',
-                                        'target': _sw_ltp * 1.5,
-                                        'sl': _sw_ltp * 0.5,
-                                        'quality_score': _q,
-                                    })
-                                    logger.info('  SIGNAL [Liquidity Sweep]: ' + _sym + ' ' + _sw_type + ' Q=' + str(_q))
-
-        except Exception as _sweep_err:
-            logger.debug(f"  SWEEP_SKIP: {_sweep_err}")
 
         # v9.6: Build indicators lookup from watchlist (signals don't carry indicators)
         ind_lookup = {si['symbol']: si.get('indicators', {}) for si in watchlist}
@@ -3672,9 +3409,8 @@ class StockPaperTrader:
                 skipped += 1
                 continue
 
-            # ---- v13.0: CALCULUS-BASED DIRECTION VALIDATION (replaces v10.1 static checks) ----
+            # ---- v10.1: DIRECTION VALIDATION — the primary filter ----
             dir_spot = self.get_stock_spot(symbol) or sig.get('spot', 0)
-            dir_adj = 0
             if dir_spot:
                 intra = self.engine.intraday_data.get(symbol)
                 if intra is not None and len(intra) > 0:
@@ -3688,48 +3424,21 @@ class StockPaperTrader:
                     dir_ohlc = {'open': dir_spot, 'high': dir_spot, 'low': dir_spot,
                                 'close': dir_spot, 'volume': 0}
                 dir_indicators = self.engine.compute_indicators(symbol, dir_ohlc)
-
-                # v13.0: Use calculus engine as PRIMARY direction gate
-                if hasattr(self, 'calculus') and self.calculus.bar_count(symbol) >= 15:
-                    calc_allowed, calc_reason, calc_data = self.calculus.should_allow_direction(
-                        symbol, signal_type, dir_spot)
-                    logger.info(f"  CALC_DIR: {symbol} {signal_type} — {calc_reason}")
-
-                    if not calc_allowed:
-                        orig_type = signal_type
-                        flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
-                        calc_dir = calc_data.get('direction')
-                        flipped_opt = 'CE' if 'CE' in flipped_type else 'PE'
-
-                        if calc_dir and flipped_opt == calc_dir:
-                            existing_flipped = [p for p in self.portfolio.positions
-                                if p['symbol'] == symbol
-                                and ('CE' if 'CE' in p.get('signal_type', '') else 'PE') == flipped_opt]
-                            if existing_flipped:
-                                logger.info(f"  DIR_REJECT: {symbol} {orig_type} — calculus says {calc_dir} "
-                                           f"but already holding {flipped_opt}")
-                                skipped += 1; continue
-                            logger.info(f"  CALC_DIR_FLIP: {symbol} {orig_type} -> {flipped_type} "
-                                       f"(score={calc_data['score']:+.0f}, mom={calc_data['momentum']:+.2f})")
-                            signal_type = flipped_type
-                            sig['type'] = flipped_type
-                            dir_adj = 5
-                        else:
-                            logger.info(f"  DIR_REJECT: {symbol} {orig_type} — calculus blocks "
-                                       f"(score={calc_data['score']:+.0f})")
-                            skipped += 1; continue
-                    else:
-                        dir_adj = min(calc_data.get('confidence', 0) // 10, 10)
-                elif dir_indicators:
-                    # Fallback: old multi-factor validation
+                if dir_indicators:
                     dir_valid, dir_reason, dir_adj = validate_signal_direction(
                         signal_type, dir_spot, dir_ohlc, dir_indicators)
                     if not dir_valid:
+                        # v10.2b: Direction Flip — trade correct direction instead of just blocking
+                        # Guard: Don't flip AGAINST the daily EMA trend
+                        # If EMA bullish (9>20), only flip to CE, never to PE
+                        # If EMA bearish (9<20), only flip to PE, never to CE
                         orig_type = signal_type
                         ema_9 = dir_indicators.get('ema_9', 0)
                         ema_20 = dir_indicators.get('ema_20', 0)
+
                         flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
                         flip_to_pe = 'PE' in flipped_type
+
                         if ema_9 > 0 and ema_20 > 0:
                             daily_bullish = ema_9 > ema_20
                             if (daily_bullish and flip_to_pe) or (not daily_bullish and not flip_to_pe):
@@ -3784,25 +3493,6 @@ class StockPaperTrader:
                 sig['_lot_tier'] = 'BASE'
             logger.info(f"  DCI: {symbol} {signal_type} DCI={dci:.0f}/100 tier={sig['_lot_tier']}")
 
-
-            # ---- v12.0: PHYSICS GATE — mathematical signal quality filter ----
-            if hasattr(self, 'calculus') and self.calculus.bar_count(symbol) >= 6:
-                sig_dir = 'CE' if 'CE' in signal_type else 'PE'
-                phy_score, phy_diag = self.calculus.physics_gate(symbol, sig_dir)
-                sig['_physics_score'] = phy_score
-                if phy_score < 0:
-                    warnings_list = []
-                    if phy_diag.get('mom_dying'): warnings_list.append('MOM_DYING')
-                    if phy_diag.get('wave_peak'): warnings_list.append('WAVE_PEAK')
-                    if phy_diag.get('stretched'): warnings_list.append('VWAP_STRETCHED')
-                    if phy_diag.get('rsi_extreme'): warnings_list.append('RSI_EXTREME')
-                    logger.info(f"  PHYSICS_BLOCK: {symbol} {signal_type} "
-                               f"score={phy_score} [{','.join(warnings_list)}] "
-                               f"accel={phy_diag.get('accel','?')} wave={phy_diag.get('wave_risk','?')}")
-                    skipped += 1
-                    continue
-                else:
-                    logger.info(f"  PHYSICS_PASS: {symbol} {signal_type} score={phy_score}")
             # Get spot and determine strike
             spot = self.get_stock_spot(symbol)
             if not spot:
@@ -3876,26 +3566,19 @@ class StockPaperTrader:
                 skipped += 1
                 continue
 
-            # Compute Greeks for the selected strike — v11.3: use greeks_from_market_price
-            # with live entry_premium instead of bs_greeks with stale IV
+            # Compute Greeks for the selected strike
             dte = get_dte_monthly()
             T = max(dte, 1) / 365
+            iv_for_greeks = entry_iv if entry_iv > 0 else 0.25
+            if iv_for_greeks < 1:
+                pass  # already in decimal
+            else:
+                iv_for_greeks = iv_for_greeks / 100  # convert from pct
 
             try:
-                g = greeks_from_market_price(entry_premium, spot, strike, T, RISK_FREE_RATE, opt_type)
-                if g is None:
-                    # IV solve failed — use entry_iv as fallback for greeks only
-                    iv_for_greeks = entry_iv if entry_iv > 0 else 0.25
-                    if iv_for_greeks >= 1:
-                        iv_for_greeks = iv_for_greeks / 100
-                    g = bs_greeks(spot, strike, T, RISK_FREE_RATE, iv_for_greeks, opt_type)
-                    logger.debug(f"  GREEKS_IV_SOLVE_FAIL: {symbol} {strike}{opt_type} — "
-                                f"using bs_greeks with entry_iv={iv_for_greeks:.3f}")
+                g = bs_greeks(spot, strike, T, RISK_FREE_RATE, iv_for_greeks, opt_type)
             except Exception:
                 g = {'delta': 0.5, 'gamma': 0, 'theta': 0, 'price': entry_premium}
-            iv_for_greeks = g.get('iv', entry_iv if entry_iv > 0 else 0.25)
-            if iv_for_greeks >= 1:
-                iv_for_greeks = iv_for_greeks / 100
 
             # Set target and SL from signal
             target_mult = sig.get('target_mult', 1.5)
@@ -3907,17 +3590,6 @@ class StockPaperTrader:
             else:
                 target = round(entry_premium * target_mult, 2)
                 sl_price = round(entry_premium * sl_mult, 2)
-
-            # v14.0: Trade Intelligence entry filter
-            if hasattr(self, 'trade_intel'):
-                ti_allowed, ti_reason, ti_quality = self.trade_intel.should_enter(
-                    sig, existing_positions=self.portfolio.positions
-                )
-                if not ti_allowed:
-                    logger.info(f"  TI_BLOCK: {sig.get('symbol','')} {sig.get('type','')} \u2014 {ti_reason}")
-                    skipped += 1
-                    continue
-                logger.info(f"  TI_PASS: {sig.get('symbol','')} {sig.get('type','')} \u2014 {ti_reason}")
 
             # Open position
             position = self.portfolio.add_signal(
@@ -4132,9 +3804,9 @@ class StockPaperTrader:
                 symbol = sig.get('symbol', '')
                 sig_key = f"{sig.get('strategy', '')}_{symbol}_{sig.get('strike', 0)}"
 
-                # Determine data source (real chain vs no-data)
+                # Determine data source (real chain vs Black-Scholes)
                 oi_val = sig.get('oi', 0)
-                data_source = 'LIVE' if oi_val and oi_val > 0 else 'NO_OI_DATA'
+                data_source = 'REAL_CHAIN' if oi_val and oi_val > 0 else 'BLACK_SCHOLES'
 
                 rows.append({
                     'timestamp': datetime.now().isoformat(),

@@ -60,8 +60,8 @@ from market_holidays import is_nse_holiday, is_mcx_holiday
 
 # Default scan intervals (seconds)
 # With WebSocket real-time LTP, we can scan faster (no REST API call for spot prices)
-DEFAULT_EQUITY_INTERVAL = 15    # 15 seconds — was 45s before WebSocket
-DEFAULT_COMMODITY_INTERVAL = 10  # 10 seconds — was 30s before WebSocket
+DEFAULT_EQUITY_INTERVAL = 1    # v15: 1 second tick-by-tick (was 15s)    # 15 seconds — was 45s before WebSocket
+DEFAULT_COMMODITY_INTERVAL = 1   # v15: 1 second tick-by-tick (was 10s)  # 10 seconds — was 30s before WebSocket
 DEFAULT_CRYPTO_INTERVAL = 300    # 5 minutes for BTC, ETH, SOL (Binance, not Angel)
 
 # Instance identification & PID lock
@@ -332,6 +332,8 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
                 break
             elif not is_weekday:
                 logger.info("[EquityThread] Weekend - equity market closed. Waiting...")
+                stop_event.wait(300)  # v15: sleep 5 min on weekends, not 1s
+                continue
 
             stop_event.wait(interval_sec)
 
@@ -437,6 +439,8 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                 break
             elif not is_weekday:
                 logger.info("[CommodityThread] Weekend - MCX closed. Waiting...")
+                stop_event.wait(300)  # v15: sleep 5 min on weekends, not 1s
+                continue
 
             stop_event.wait(interval_sec)
 
@@ -800,9 +804,9 @@ def main():
     parser.add_argument('--once', action='store_true', help='Single scan both markets')
     parser.add_argument('--interval', type=float, default=None,
                         help='Legacy: set ALL intervals (minutes). Overridden by per-market args.')
-    parser.add_argument('--equity-interval', type=float, default=0.25,
+    parser.add_argument('--equity-interval', type=float, default=0.0167,
                         help='Equity scan interval in minutes (default: 0.25 = 15s with WebSocket)')
-    parser.add_argument('--commodity-interval', type=float, default=0.167,
+    parser.add_argument('--commodity-interval', type=float, default=0.0167,
                         help='Commodity scan interval in minutes (default: 0.167 = 10s with WebSocket)')
     parser.add_argument('--crypto-interval', type=float, default=5,
                         help='Crypto scan interval in minutes (default: 5)')

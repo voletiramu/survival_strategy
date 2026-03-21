@@ -75,13 +75,11 @@ MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 m
 # Strategies compete for the same capital — no per-strategy hard limits.
 # Allocation percentages are for MONITORING/LOGGING only.
 STRATEGY_ALLOCATION = {
-    'CPR':          0.25,    # 25% target — solid 65% WR, consistent
-    'Gamma Blast':  0.30,    # 30% target — best risk-adjusted (Sharpe 4.42)
-    'Ghost Zone':   0.15,    # 15% target — v7 institutional methodology
-    'PCR+VWAP':     0.10,    # 10% target — needs live OI data to prove
-    'Trend Rider':  0.20,    # 20% target
-    'Liquidity Sweep': 0.15,  # 15% target — SL hunt reversal (PF 2.95, WR 78%) — NEW: trend day riding (PF 5.56 in backtest)
-    # 'Survivor':   0.00,    # HALTED — needs Rs 1L+ per symbol
+    'Gamma Blast': 0.40,    # 40% target — best risk-adjusted (Sharpe 4.42)
+    'CPR':         0.30,    # 30% target — solid 70% WR, consistent
+    'Ghost Zone':  0.20,    # 20% target — v7 institutional methodology
+    'PCR+VWAP':    0.10,    # 10% target — needs live OI data to prove
+    # 'Survivor':  0.00,    # HALTED — needs Rs 1L+ per symbol
 }
 
 def get_strategy_used_capital(positions, strategy_name):
@@ -122,21 +120,13 @@ STRATEGY_EXIT_MULT = {
     'Gamma Blast':  {'oi': 1.0, 'iv': 1.0},
     'Ghost Zone':   {'oi': 0.7, 'iv': 0.8},    # 30% LOWER threshold → exits faster
     'PCR+VWAP':     {'oi': 1.0, 'iv': 1.0},
-    'Trend Rider':  {'oi': 2.0, 'iv': 2.0},
-    'Liquidity Sweep': {'oi': 1.5, 'iv': 1.5},  # Medium tolerance — fast trades    # 2x HIGHER threshold — let trends run
     'Survivor':     {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold → tolerates swings
 }
 
 # Trade Quality Filters (eliminate brokerage-losing weak trades)
 MIN_PREMIUM_BUY = 15             # Min Rs 15 premium for BUY trades (was Rs 3)
-MIN_PREMIUM_BUY_BN = 40          # v11.1: BANKNIFTY min premium Rs 40 (premiums 3-5x NIFTY)
 MIN_PREMIUM_SELL = 20            # Min Rs 20 premium for SELL trades (was Rs 5)
 MIN_SIGNAL_SCORE = 50            # v2.5: Quality score 0-100, reject below 50 (was 40)
-
-# v11.1: Drawdown-reduction filters (backtest-validated: +Rs 10,671 PnL, -52% BANKNIFTY DD)
-CPR_MIN_WIDTH_PCT = 0.03         # Skip CPR signals when TC-BC width < 0.03% of pivot
-CHOPPY_DAY_EFF_THRESHOLD = 15    # Block late entries if 11:00 efficiency < 15%
-CHOPPY_DAY_BLOCK_AFTER = dtime(11, 0)  # Block new entries after 11:00 on choppy days
 DIRECTION_FLIP_MIN_SCORE = 70    # v7.6.2: Higher bar for DIRECTION_FLIP (closing existing to flip)
 
 # v7.7: Signal-Based Hold Score — controls exits
@@ -154,9 +144,9 @@ VIX_HIGH_MULTIPLIER = 0.8        # Multiply thresholds by 0.8 in high VIX
 VIX_BLOCK_HIGH = 35              # VIX > 35: too volatile, block entries
 VIX_BLOCK_LOW = 11               # VIX < 11: no movement expected, block entries
 # v10.6: Greeks Refresh + Theta Decay Exit
-GREEKS_REFRESH_INTERVAL_SECONDS = 10    # v15: Refresh Greeks every 10s (was 300s — pure BS math, zero API cost)
+GREEKS_REFRESH_INTERVAL_SECONDS = 300   # Refresh Greeks every 5 min during hold
 THETA_BURDEN_TIGHTEN_PCT = 5.0   # >5%/day theta burden → tighten SL to 90%
-THETA_BURDEN_EXIT_PCT = 999.0    # DISABLED (was 10%) — backtest proved it kills winning trades in 3 min
+THETA_BURDEN_EXIT_PCT = 10.0     # >10%/day + losing → force exit
 THETA_TIGHTEN_SL_FACTOR = 0.90   # SL set to 90% of current premium
 # v10.6: PCR Shift Monitor (equity only)
 PCR_SHIFT_MIN_HOLD_MINUTES = 15
@@ -176,18 +166,16 @@ MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x 
 # Old system: TSL thresholds tied to target distance. With 2.5x targets,
 # needed 45% premium gain just to lock breakeven → never triggered.
 # New system: TSL triggers on actual premium gain from entry.
-# v13.0: TSL phases — TIGHTENED to capture more peak profit
-# Data shows avg peak capture was only 11% — trades that peaked at +21% exited at +1.5%
-# Problem: trail distances too wide, breakeven lock too late
+# v10.4: Phase 0 — micro-gains protection (captures 5%+ peaks that never reach Phase 1)
 TSL_MICRO_GAIN_PCT = 5               # Activate at 5% peak gain
-TSL_MICRO_TRAIL_DISTANCE_PCT = 45    # v13: Keep 55% of peak gain (was 40% — too loose)
-TSL_MICRO_MIN_HOLD_SECONDS = 180     # v13: 3 min hold (was 5 min — missed fast peaks)
+TSL_MICRO_TRAIL_DISTANCE_PCT = 60    # Keep 40% of peak gain from entry (trail 60%)
+TSL_MICRO_MIN_HOLD_SECONDS = 300     # Only after 5 min hold (avoid noise exits)
 
-TSL_BREAKEVEN_GAIN_PCT = 10      # v13: Lock breakeven at 10% gain (was 15% — too late)
-TSL_TRAIL_GAIN_PCT = 20          # v13: Start trailing at 20% gain (was 25%)
-TSL_TRAIL_DISTANCE_PCT = 20      # v13: Trail 20% below peak (was 30% — too loose)
-TSL_TIGHT_GAIN_PCT = 35          # v13: Tight trail at 35% gain (was 40%)
-TSL_TIGHT_DISTANCE_PCT = 12      # v13: Trail 12% below peak (was 20% — captures more)
+TSL_BREAKEVEN_GAIN_PCT = 15      # Phase 1: Lock breakeven when premium gains 15%
+TSL_TRAIL_GAIN_PCT = 25          # Phase 2: Start trailing when premium gains 25%
+TSL_TRAIL_DISTANCE_PCT = 30      # Phase 2 trail: 30% below peak profit
+TSL_TIGHT_GAIN_PCT = 40          # Phase 3: Tight trail when premium gains 40%+
+TSL_TIGHT_DISTANCE_PCT = 20      # Phase 3 trail: 20% below peak profit
 
 # v10.1: Trailing Target (replaces hard TARGET_HIT exit)
 TARGET_TRAIL_ENABLED = True
@@ -195,40 +183,11 @@ TARGET_TRAIL_EXTEND_PCT = 20          # Extend target by 20% of current premium 
 TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
 TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 
-# v13.0: Breakout Failure Detection — RELAXED to prevent premature exits
-# Data shows BREAKOUT_FAIL_REVERSE lost Rs -8,632 across 8 trades (0% WR on reverses)
-# Problem: 3-5 min exits + wrong-direction reversals destroy PnL
-BREAKOUT_FAIL_CHECK_MINUTES = 20       # v13: Extended from 15 min — give trades time to develop
-BREAKOUT_FAIL_MIN_GAIN_PCT = 1        # v13: Reduced from 2% — don't exit nearly-flat positions
-BREAKOUT_FAIL_REVERSE_DROP_PCT = 25   # v13: Increased from 15% — only reverse on severe failures
-BREAKOUT_FAIL_REVERSE_ENABLED = False
-
-# v13.3: Volatility-adjusted SL — scale SL by inverse ATR ratio
-# BANKNIFTY 2.7x more volatile than NIFTY, needs tighter SL
-# Simulation: saves Rs +8,638/week across BANKNIFTY + SENSEX
-VOLATILITY_SL_ENABLED = True
-ATR_REFERENCE = {
-    'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
-    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409,
-}
-ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
-
-# v13.3: Momentum reversal exit
-# If spot moves 0.4% AGAINST trade direction after 20min, exit
-# Simulation: saves Rs +6,974, hurts ZERO winning trades
-MOMENTUM_EXIT_ENABLED = True
-MOMENTUM_EXIT_SPOT_PCT = 0.4
-MOMENTUM_EXIT_MIN_MINUTES = 20
-
-# v11: TREND RIDER — 5th strategy for riding big trend days
-TR_ENTRY_TIME = dtime(10, 15)          # Enter after 1-hour confirmation
-TR_LAST_ENTRY_TIME = dtime(10, 30)     # Must enter by 10:30
-TR_MAX_GAP_PCT = 1.5                   # Skip gaps > 1.5% (reversal risk)
-TR_MIN_SCORE = 5                       # Need 5/10+ signal score
-TR_WIDE_TSL_TRIGGER_PCT = 35           # Start trailing after 35% gain
-TR_WIDE_TSL_DISTANCE_PCT = 28          # Trail 28% from peak (wide)
-TR_TARGET_MULT = 1.5                   # Target = 1.5x premium
-TR_SL_MULT = 0.65                      # SL at 65% of entry (35% loss allowed)
+# v10.1: Breakout Failure Detection
+BREAKOUT_FAIL_CHECK_MINUTES = 5
+BREAKOUT_FAIL_MIN_GAIN_PCT = 2        # Must gain 2% from entry in 5 min
+BREAKOUT_FAIL_REVERSE_DROP_PCT = 15   # Exit + reverse if drops >15% in 5 min
+BREAKOUT_FAIL_REVERSE_ENABLED = True
 
 # v10.3: Import regime-aware parameter function
 from market_regime import get_regime_params  # noqa: E402
@@ -1175,14 +1134,14 @@ class AngelConnection:
                         gamma = float(strike_data.get('gamma', 0) or 0)
 
                         # v10.3d: Gamma-first scoring — highest gamma wins
-                        delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
+                        delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
                         gamma_score = gamma * 10000
                         oi_norm = min(oi / 100000, 1.0)
                         vol_norm = min(volume / 10000, 1.0)
                         score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
 
                         # FILTER: Skip strikes outside delta range 0.20-0.70
-                        if delta > 0 and (delta < 0.35 or delta > 0.65):
+                        if delta > 0 and (delta < 0.20 or delta > 0.70):
                             continue
 
                         # v10.3d-4: Score by delta+gamma+volume (optionGreek API returns LTP=0, OI=0)
@@ -1256,9 +1215,9 @@ class AngelConnection:
                             volume = float(strike_data.get('tradeVolume', 0) or 0)
                             delta = abs(float(strike_data.get('delta', 0) or 0))
                             gamma = float(strike_data.get('gamma', 0) or 0)
-                            if delta > 0 and (delta < 0.35 or delta > 0.65):
+                            if delta > 0 and (delta < 0.20 or delta > 0.70):
                                 continue
-                            delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
+                            delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
                             gamma_score = gamma * 10000
                             vol_norm = min(volume / 10000, 1.0)
                             score = (delta_score * 30) + (gamma_score * 40) + (vol_norm * 10)
@@ -1326,11 +1285,11 @@ class AngelConnection:
                                     g = bs_greeks(spot, cand_strike, T_fallback, RISK_FREE_RATE, iv_estimate, opt_type)
                                     delta = abs(g['delta'])
                                     gamma = g['gamma']
-                                    delta_score = max(0, 1 - abs(delta - 0.50) * 6.67)
+                                    delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
                                     gamma_score = gamma * 10000
                                     oi_norm = min(oi / 100000, 1.0)
                                     score = (delta_score * 30) + (gamma_score * 40) + (oi_norm * 20) + (0.5 * 10)
-                                    if delta < 0.35 or delta > 0.65:
+                                    if delta < 0.20 or delta > 0.70:
                                         continue
                                     if score > best_fallback_score:
                                         best_fallback_score = score
@@ -1706,8 +1665,6 @@ class StrategyEngine:
         self.portfolio = portfolio
         self.historical_data = {}  # symbol -> DataFrame
         self.market_pipeline = None  # v9.6d: Set by PaperTrader if available
-        self.zerodha = None   # v12.0: Set by PaperTrader if available
-        self.truedata = None  # v11.2: Set by PaperTrader if available
 
     def load_historical(self, symbol):
         """Load historical data for indicators. Auto-download if missing/stale."""
@@ -2009,17 +1966,12 @@ class StrategyEngine:
         hv = log_ret.tail(20).std() * np.sqrt(252)
         iv = max(min(hv * 1.15, 0.60), 0.08)
 
-        # v13.0: Intraday VWAP (integral calculus) — replaces stale 5-day VWAP
-        vwap = None
-        if hasattr(self, 'calculus'):
-            vwap = self.calculus.get_intraday_vwap_for_indicators(symbol)
-        if vwap is None:
-            # Fallback: 5-day VWAP only if calculus engine has no data yet
-            if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
-                tp = (df['High'] + df['Low'] + df['Close']) / 3
-                vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
-            else:
-                vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()
+        # VWAP (rolling 5-day)
+        if 'Volume' in df.columns and df['Volume'].tail(5).sum() > 0:
+            tp = (df['High'] + df['Low'] + df['Close']) / 3
+            vwap = (tp * df['Volume']).tail(5).sum() / df['Volume'].tail(5).sum()
+        else:
+            vwap = ((df['High'] + df['Low'] + df['Close']) / 3).tail(5).mean()  # v10.2c: Fixed VWAP fallback formula
 
         # PCR proxy
         close_chg = df['Close'].pct_change()
@@ -2194,17 +2146,16 @@ class StrategyEngine:
         except Exception:
             return None
 
-    def _get_strike_from_chain(self, symbol, spot, opt_type, dte, target_strike=None):
+    def _get_strike_from_chain(self, symbol, spot, opt_type, dte):
         """v5: Get optimal strike from live option chain with caching.
 
         Uses Angel option chain API to select strike with best OI/liquidity.
         Falls back to mathematical derivation if API unavailable.
         Caches results for 5 minutes to avoid excessive API calls.
-        v11.2: target_strike param — if set, fetch LTP for that specific strike (for SELL signals).
 
         Returns: (strike, real_ltp, real_iv) tuple
         """
-        cache_key = f"{symbol}_{opt_type}" + (f"_{target_strike}" if target_strike else "")
+        cache_key = f"{symbol}_{opt_type}"
         now = time.time()
 
         # Check cache (5 min TTL for chain hits, 30s for fallbacks — v9.3)
@@ -2219,98 +2170,45 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 50)
         fallback_strike = round(spot / strike_interval) * strike_interval
 
-        # v12.0: Data source priority: 1) Zerodha, 2) TrueData, 3) NSE/BSE pipeline, 4) Angel API
-
-        # Source 1: Zerodha Kite Connect option chain (primary)
-        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
+        # Source 1: Angel API option chain (best for strike selection with OI/liquidity)
+        if self.angel and self.angel._connected:
             try:
-                zd_chain = self.zerodha.get_option_chain(symbol)
-                if zd_chain:
-                    contracts = zd_chain.get(opt_type, [])
-                    zd_best = None
-                    zd_best_dist = float('inf')
-                    if target_strike:
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0 and c['strike'] == target_strike:
-                                zd_best = c
-                                break
-                    else:
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0:
-                                dist = abs(c['strike'] - spot)
-                                if dist < zd_best_dist:
-                                    zd_best_dist = dist
-                                    zd_best = c
-                    if zd_best:
+                expiry = self._get_nearest_expiry(symbol)
+                if expiry:
+                    result = self.angel.select_optimal_strike(
+                        symbol, spot, opt_type, expiry_date=expiry
+                    )
+                    if result and result.get('strike', 0) > 0:
                         self._strike_cache[cache_key] = {
-                            'strike': zd_best['strike'],
-                            'ltp': zd_best['ltp'],
-                            'iv': zd_best.get('iv', 0),
+                            'strike': result['strike'],
+                            'ltp': result.get('ltp', 0),
+                            'iv': result.get('iv', 0),
                             'time': now,
                         }
-                        logger.info(f"  ZERODHA_STRIKE: {symbol} {opt_type} "
-                                   f"strike={zd_best['strike']} LTP={zd_best['ltp']:.2f} "
-                                   f"IV={zd_best.get('iv', 0)*100:.1f}% [Zerodha]")
-                        return zd_best['strike'], zd_best['ltp'], zd_best.get('iv', 0)
-            except Exception as e:
-                logger.debug(f"[Zerodha] Strike lookup failed for {symbol}: {e}")
-
-        # Source 2: TrueData option chain (secondary — real-time WebSocket data)
-        if self.truedata and self.truedata.is_connected:
-            try:
-                td_chain = self.truedata.get_option_chain(symbol)
-                if td_chain:
-                    contracts = td_chain.get(opt_type, [])
-                    td_best = None
-                    td_best_dist = float('inf')
-                    if target_strike:
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0 and c['strike'] == target_strike:
-                                td_best = c
-                                break
+                        return result['strike'], result.get('ltp', 0), result.get('iv', 0)
                     else:
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0:
-                                dist = abs(c['strike'] - spot)
-                                if dist < td_best_dist:
-                                    td_best_dist = dist
-                                    td_best = c
-                    if td_best:
-                        self._strike_cache[cache_key] = {
-                            'strike': td_best['strike'],
-                            'ltp': td_best['ltp'],
-                            'iv': td_best.get('iv', 0),
-                            'time': now,
-                        }
-                        logger.info(f"  TRUEDATA_STRIKE: {symbol} {opt_type} "
-                                   f"strike={td_best['strike']} LTP={td_best['ltp']:.2f} "
-                                   f"IV={td_best.get('iv', 0)*100:.1f}% [TrueData]")
-                        return td_best['strike'], td_best['ltp'], td_best.get('iv', 0)
+                        logger.info(f"  ANGEL_STRIKE_EMPTY: {symbol} {opt_type} expiry={expiry} — "
+                                   f"no valid strike from optionGreek API")
+                else:
+                    logger.info(f"  ANGEL_STRIKE_NO_EXPIRY: {symbol} — no future expiry found")
             except Exception as e:
-                logger.debug(f"[TrueData] Strike lookup failed for {symbol}: {e}")
+                logger.info(f"  ANGEL_STRIKE_ERR: {symbol} {opt_type} — {e}")
 
-        # Source 2: Pipeline chain from NSE/BSE (fallback when TrueData unavailable)
+        # Source 2: v9.4 — Pipeline chain from NSE/BSE (get real LTP for ATM strike)
         if self.market_pipeline:
             try:
                 chain = self.market_pipeline.get_option_chain(symbol)
                 if chain:
                     contracts = chain.get(opt_type, [])
-                    # v11.2: If target_strike specified, find that exact strike
+                    # Find ATM contract closest to spot with real LTP
                     best = None
                     best_dist = float('inf')
-                    if target_strike:
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0 and c['strike'] == target_strike:
+                    for c in contracts:
+                        if c.get('ltp', 0) > 0:
+                            dist = abs(c['strike'] - spot)
+                            if dist < best_dist:
+                                best_dist = dist
                                 best = c
-                                break
-                    else:
-                        # Find ATM contract closest to spot with real LTP
-                        for c in contracts:
-                            if c.get('ltp', 0) > 0:
-                                dist = abs(c['strike'] - spot)
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    best = c
                     if best:
                         self._strike_cache[cache_key] = {
                             'strike': best['strike'],
@@ -2323,45 +2221,6 @@ class StrategyEngine:
                         return best['strike'], best['ltp'], best.get('iv', 0)
             except Exception as e:
                 logger.debug(f"Pipeline strike lookup failed for {symbol}: {e}")
-
-        # Source 3: Angel API option chain (last resort)
-        if self.angel and self.angel._connected:
-            try:
-                expiry = self._get_nearest_expiry(symbol)
-                if expiry:
-                    if target_strike:
-                        # v11.2: Fetch LTP for specific strike (SELL signals)
-                        token_info = self.angel.find_option_tokens(symbol, None, target_strike, opt_type)
-                        if token_info:
-                            exchange = 'BFO' if symbol == 'SENSEX' else 'NFO'
-                            self.angel._throttle()
-                            mkt = self.angel.get_market_data(exchange, str(token_info.get('token', '')))
-                            if mkt:
-                                ltp = float(mkt.get('ltp', 0) or 0)
-                                if ltp > 0:
-                                    self._strike_cache[cache_key] = {
-                                        'strike': target_strike, 'ltp': ltp, 'iv': 0, 'time': now,
-                                    }
-                                    return target_strike, ltp, 0
-                    else:
-                        result = self.angel.select_optimal_strike(
-                            symbol, spot, opt_type, expiry_date=expiry
-                        )
-                        if result and result.get('strike', 0) > 0:
-                            self._strike_cache[cache_key] = {
-                                'strike': result['strike'],
-                                'ltp': result.get('ltp', 0),
-                                'iv': result.get('iv', 0),
-                                'time': now,
-                            }
-                            return result['strike'], result.get('ltp', 0), result.get('iv', 0)
-                        else:
-                            logger.info(f"  ANGEL_STRIKE_EMPTY: {symbol} {opt_type} expiry={expiry} — "
-                                       f"no valid strike from optionGreek API")
-                else:
-                    logger.info(f"  ANGEL_STRIKE_NO_EXPIRY: {symbol} — no future expiry found")
-            except Exception as e:
-                logger.info(f"  ANGEL_STRIKE_ERR: {symbol} {opt_type} — {e}")
 
         # Fallback — v9.3: Short cache (30s) for ltp=0 so we retry quickly at market open
         self._strike_cache[cache_key] = {
@@ -2382,12 +2241,6 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         cpr_w = ind['cpr_width']
 
-        # v11.1: Skip CPR signals on ultra-narrow CPR days (causes signal flipping)
-        if cpr_w < CPR_MIN_WIDTH_PCT:
-            logger.info(f"  CPR_NARROW_SKIP: {symbol} CPR width {cpr_w:.4f}% < {CPR_MIN_WIDTH_PCT}% "
-                       f"— TC≈BC≈Pivot, signals unreliable")
-            return signals
-
         # ---- v7.5: Realistic intraday option targets ----
         # Old targets (2.5x) required 150% option gain — almost never hit intraday.
         # New targets based on realistic option delta/gamma math:
@@ -2400,11 +2253,7 @@ class StrategyEngine:
             cpr_label = "Narrow"
             target_hit_mult = 1.5   # Target = 1.5x premium (50% gain)
             target_base_mult = 1.3  # Fallback target = 1.3x (30% gain)
-            sl_mult = 0.5
-            # v13.3: Volatility-adjusted SL
-            if VOLATILITY_SL_ENABLED and symbol in ATR_REFERENCE:
-                vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(symbol, 313))
-                sl_mult = max(0.12, min(0.50, vol_sl_mult))  # Clamp 12%-50%
+            sl_mult = 0.5           # SL = 50% of premium
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
             target_hit_mult = 1.4   # 40% gain
@@ -2427,19 +2276,17 @@ class StrategyEngine:
                            f"(body={intraday_body:.0f}, spot={spot:.0f}<VWAP={vwap:.0f})")
             else:
                 ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                if chain_ltp <= 0:
-                    logger.info(f"  CPR_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
-                else:
-                    use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                    g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                    premium = chain_ltp
-                    if premium > MIN_PREMIUM_BUY:
-                        signals.append({
-                            'type': 'BUY_CE_CPR',
-                            'strike': ce_strike,
-                            'premium': premium,
-                            'greeks': g,
-                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f} [LIVE]",
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
+                    signals.append({
+                        'type': 'BUY_CE_CPR',
+                        'strike': ce_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bullish breakout above TC={ind['tc']:.0f}"
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * target_hit_mult if ohlc['high'] > ind['cam_r3'] else premium * target_base_mult,
                         'sl': premium * sl_mult,
                     })
@@ -2454,19 +2301,17 @@ class StrategyEngine:
                            f"(body={intraday_body:+.0f}, spot={spot:.0f}>VWAP={vwap:.0f})")
             else:
                 pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                if chain_ltp <= 0:
-                    logger.info(f"  CPR_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
-                else:
-                    use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                    g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                    premium = chain_ltp
-                    if premium > MIN_PREMIUM_BUY:
-                        signals.append({
-                            'type': 'BUY_PE_CPR',
-                            'strike': pe_strike,
-                            'premium': premium,
-                            'greeks': g,
-                            'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f} [LIVE]",
+                use_iv = chain_iv if chain_iv > 0 else ind['iv']
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
+                if premium > MIN_PREMIUM_BUY:
+                    signals.append({
+                        'type': 'BUY_PE_CPR',
+                        'strike': pe_strike,
+                        'premium': premium,
+                        'greeks': g,
+                        'reason': f"{cpr_label} CPR ({cpr_w:.3f}%) bearish breakout below BC={ind['bc']:.0f}"
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * target_hit_mult if ohlc['low'] < ind['cam_s3'] else premium * target_base_mult,
                         'sl': premium * sl_mult,
                     })
@@ -2476,35 +2321,31 @@ class StrategyEngine:
             margin_ok = self.portfolio.capital >= MARGIN_PER_LOT.get(symbol, 120000)
             if ohlc['high'] >= ind['cam_r3'] * 0.998 and spot < ind['cam_r4'] and margin_ok:
                 ce_strike = round(ind['cam_r4'] / strike_interval) * strike_interval
-                _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte, target_strike=ce_strike)
-                if sell_ltp > 0:
-                    g = greeks_from_market_price(sell_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE')
-                    if sell_ltp > MIN_PREMIUM_SELL:
-                        signals.append({
-                            'type': 'SELL_CE_CPR',
-                            'strike': ce_strike,
-                            'premium': sell_ltp,
-                            'greeks': g,
-                            'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at R3={ind['cam_r3']:.0f} [LIVE]",
-                            'target': sell_ltp * 0.3,
-                            'sl': sell_ltp * 1.2,
-                        })
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
+                if g['price'] > MIN_PREMIUM_SELL:
+                    signals.append({
+                        'type': 'SELL_CE_CPR',
+                        'strike': ce_strike,
+                        'premium': g['price'],
+                        'greeks': g,
+                        'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at R3={ind['cam_r3']:.0f}",
+                        'target': g['price'] * 0.3,
+                        'sl': g['price'] * 1.2,
+                    })
 
             if ohlc['low'] <= ind['cam_s3'] * 1.002 and spot > ind['cam_s4'] and margin_ok:
                 pe_strike = round(ind['cam_s4'] / strike_interval) * strike_interval
-                _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte, target_strike=pe_strike)
-                if sell_ltp > 0:
-                    g = greeks_from_market_price(sell_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE')
-                    if sell_ltp > MIN_PREMIUM_SELL:
-                        signals.append({
-                            'type': 'SELL_PE_CPR',
-                            'strike': pe_strike,
-                            'premium': sell_ltp,
-                            'greeks': g,
-                            'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at S3={ind['cam_s3']:.0f} [LIVE]",
-                            'target': sell_ltp * 0.3,
-                            'sl': sell_ltp * 1.2,
-                        })
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
+                if g['price'] > MIN_PREMIUM_SELL:
+                    signals.append({
+                        'type': 'SELL_PE_CPR',
+                        'strike': pe_strike,
+                        'premium': g['price'],
+                        'greeks': g,
+                        'reason': f"Wide CPR ({cpr_w:.3f}%) mean reversion at S3={ind['cam_s3']:.0f}",
+                        'target': g['price'] * 0.3,
+                        'sl': g['price'] * 1.2,
+                    })
 
         return signals
 
@@ -2565,20 +2406,18 @@ class StrategyEngine:
                     logger.info(f"  GAMMA_DIR_SKIP: {symbol} CE up body={body:.0f} but spot={spot:.0f}<VWAP={vwap:.0f}")
                 else:
                     ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                    if chain_ltp <= 0:
-                        logger.info(f"  GAMMA_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
-                    else:
-                        use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                        g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                        premium = chain_ltp
-                        if premium > MIN_PREMIUM_BUY:
-                            signals.append({
-                                'type': 'BUY_CE_GAMMA',
-                                'strike': ce_strike,
-                                'premium': premium,
-                                'greeks': g,
-                                'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
-                                          f"ATR={atr:.0f} range={day_range:.2f}x [LIVE]",
+                    use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                    g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                    premium = chain_ltp if chain_ltp > 0 else g['price']
+                    if premium > MIN_PREMIUM_BUY:
+                        signals.append({
+                            'type': 'BUY_CE_GAMMA',
+                            'strike': ce_strike,
+                            'premium': premium,
+                            'greeks': g,
+                            'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
+                                      f"ATR={atr:.0f} range={day_range:.2f}x"
+                                      f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                             'target': premium * target_mult,
                             'sl': premium * sl_mult,
                         })
@@ -2588,20 +2427,18 @@ class StrategyEngine:
                     logger.info(f"  GAMMA_DIR_SKIP: {symbol} PE down body={body:.0f} but spot={spot:.0f}>VWAP={vwap:.0f}")
                 else:
                     pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                    if chain_ltp <= 0:
-                        logger.info(f"  GAMMA_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
-                    else:
-                        use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                        g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                        premium = chain_ltp
-                        if premium > MIN_PREMIUM_BUY:
-                            signals.append({
-                                'type': 'BUY_PE_GAMMA',
-                                'strike': pe_strike,
-                                'premium': premium,
-                                'greeks': g,
-                                'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
-                                          f"ATR={atr:.0f} range={day_range:.2f}x [LIVE]",
+                    use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
+                    g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                    premium = chain_ltp if chain_ltp > 0 else g['price']
+                    if premium > MIN_PREMIUM_BUY:
+                        signals.append({
+                            'type': 'BUY_PE_GAMMA',
+                            'strike': pe_strike,
+                            'premium': premium,
+                            'greeks': g,
+                            'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
+                                      f"ATR={atr:.0f} range={day_range:.2f}x"
+                                      f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                             'target': premium * target_mult,
                             'sl': premium * sl_mult,
                         })
@@ -2716,12 +2553,9 @@ class StrategyEngine:
                 # Entry at 50% of zone (institutional limit order level)
                 entry_at_mid = zone_mid
                 ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                if chain_ltp <= 0:
-                    logger.info(f"  GTZ_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
-                    continue
                 use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                premium = chain_ltp
+                g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
 
                 if premium > MIN_PREMIUM_BUY:
                     signals.append({
@@ -2731,7 +2565,8 @@ class StrategyEngine:
                         'greeks': g,
                         'reason': f"GTZ v7 Demand: zone={zone_low:.0f}-{zone_high:.0f} "
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
-                                  f"{oi_label}{exhaustion_label} [LIVE]",
+                                  f"{oi_label}{exhaustion_label}"
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * 1.5,  # v7.5: realistic intraday target (was 2.5x)
                         'sl': premium * 0.35,      # SL below zone
                     })
@@ -2759,12 +2594,9 @@ class StrategyEngine:
                     continue  # No OI data AND no price-action strength — skip
 
                 pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                if chain_ltp <= 0:
-                    logger.info(f"  GTZ_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
-                    continue
                 use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                premium = chain_ltp
+                g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                premium = chain_ltp if chain_ltp > 0 else g['price']
 
                 if premium > MIN_PREMIUM_BUY:
                     signals.append({
@@ -2774,7 +2606,8 @@ class StrategyEngine:
                         'greeks': g,
                         'reason': f"GTZ v7 Supply: zone={zone_low:.0f}-{zone_high:.0f} "
                                   f"entry@50%={zone_mid:.0f} spot={spot:.0f}"
-                                  f"{oi_label} [LIVE]",
+                                  f"{oi_label}"
+                                  f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
                         'target': premium * 1.5,  # v7.5: realistic intraday target
                         'sl': premium * 0.35,
                     })
@@ -2783,228 +2616,62 @@ class StrategyEngine:
         return signals
 
     def check_pcr_vwap_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """PCR+VWAP v2: Institutional Flow Strategy.
-
-        Redesigned from live PCR data analysis (6 days):
-        - PCR SHIFT (not absolute level) is the real signal
-        - Bullish PCR shift +0.03 predicts UP with 76% accuracy (NIFTY)
-        - Bearish PCR shift is UNRELIABLE (32%) so PE entries disabled
-        - VWAP used as trend filter, not proximity check
-        - SENSEX needs higher threshold (+0.05) due to noise
+        """PCR+VWAP Strategy - CA Nitin Muraka.
+        v2.5.2: RE-ENABLED — now using real option chain PCR from OI data.
+        Previously disabled because proxy PCR (from price changes) never exceeded 1.05/0.95.
+        v7.4: Relaxed IV cap from 40% to 50%. Added logging for filter rejections.
         """
         signals = []
         ind = indicators
         T = dte / 365
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
 
-        # IV cap
+        # v7.4: Relaxed IV cap — high IV days often have strong directional PCR signals
         if ind['iv'] > 0.50:
-            logger.info(f"  PCR_SKIP: {symbol} IV={ind['iv']*100:.1f}%% > 50%% cap")
+            logger.info(f"  PCR_SKIP: {symbol} IV={ind['iv']*100:.1f}% > 50% cap")
             return signals
 
+        tolerance = max(ind['atr'] * 0.1, spot * 0.003)
         vwap = ind['vwap']
         pcr = ind['pcr']
 
-        # v2 CORE: Use PCR SHIFT from pipeline
-        pcr_shift = 0
-        if hasattr(self, 'market_pipeline') and self.market_pipeline:
-            pcr_shift_data = self.market_pipeline.get_pcr_shift(symbol, window_minutes=15)
-            if pcr_shift_data:
-                pcr_shift = pcr_shift_data.get('shift', 0)
-
-        # CONDITION 1: PCR shift threshold (symbol-specific)
-        pcr_threshold = 0.05 if symbol == 'SENSEX' else 0.03
-        if pcr_shift <= pcr_threshold:
-            return signals
-
-        # CONDITION 2: Spot above VWAP (trend confirmation)
-        if spot < vwap:
-            logger.info(f"  PCR_V2_SKIP: {symbol} spot={spot:.0f} < VWAP={vwap:.0f}")
-            return signals
-
-        # CONDITION 3: PCR not extreme (>1.5 means potential reversal)
-        if pcr > 1.5:
-            logger.info(f"  PCR_V2_EXTREME: {symbol} PCR={pcr:.2f} > 1.5")
-            return signals
-
-        # CONDITION 4: Intraday body positive (spot > open)
-        if spot < ohlc['open']:
-            return signals
-
-        # ALL CONDITIONS MET: Generate BUY CE
-        ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-        if chain_ltp <= 0:
-            logger.info(f"  PCR_V2_NO_LTP: {symbol} CE strike={ce_strike}")
-            return signals
-
-        use_iv = chain_iv if chain_iv > 0 else ind['iv']
-        g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-        premium = chain_ltp
-
-        if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
-            # Quality score from shift strength (0.03=15, 0.10=50, 0.20=100)
-            shift_quality = min(100, int(pcr_shift * 500))
-
-            signals.append({
-                'type': 'BUY_CE',
-                'strike': ce_strike,
-                'premium': premium,
-                'greeks': g,
-                'reason': (f"PCR+VWAP v2: Bullish shift={pcr_shift:+.3f} "
-                          f"PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f} [LIVE]"),
-                'target': premium * 1.5,
-                'sl': premium * 0.5,
-                'quality_score': shift_quality,
-            })
-
-            logger.info(f"  PCR_V2_SIGNAL: {symbol} BUY_CE shift={pcr_shift:+.3f} "
-                       f"PCR={pcr:.2f} spot>{vwap:.0f}(VWAP) Q={shift_quality}")
-
-        # PE entries DISABLED: bearish PCR shift has only 28-32% accuracy
-        # Spot moves UP even when PCR drops (institutional put buying is protective)
-
-        return signals
-
-
-    def check_trend_rider_signal(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Trend Rider v3 — ride big trend days with wide trailing stops.
-        v11: NEW strategy. Evaluates once per day at 10:15 using multi-signal confirmation.
-        Backtest: PF 5.56, 66.7% WR across NIFTY/BANKNIFTY/SENSEX.
-
-        Returns list with 0 or 1 signal (max 1 trade per day per symbol).
-        """
-        signals = []
-        ind = indicators
-        T = dte / 365
-        strike_interval = STRIKE_INTERVALS.get(symbol, 100)
-
-        now = datetime.now()
-        if now.time() < TR_ENTRY_TIME or now.time() > TR_LAST_ENTRY_TIME:
-            return signals
-
-        # Need previous day data for gap, prev trend
-        df = self.historical_data.get(symbol)
-        if df is None or len(df) < 3:
-            return signals
-
-        prev1 = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
-        prev2 = df.iloc[-3] if len(df) >= 3 else prev1
-        prev_close = prev1['Close']
-
-        # Gap check
-        day_open = ohlc['open']
-        gap_pct = (day_open - prev_close) / prev_close * 100
-        if abs(gap_pct) > TR_MAX_GAP_PCT:
-            logger.info(f"  TR_SKIP: {symbol} gap={gap_pct:+.2f}% > {TR_MAX_GAP_PCT}% (reversal risk)")
-            return signals
-
-        # 1-hour move
-        atr = ind['atr']
-        if atr <= 0:
-            return signals
-        move_1h = (spot - day_open) / atr
-
-        # VWAP
-        vwap = ind.get('vwap', spot)
-
-        # Check sustained direction (not spike-and-reverse)
-        # Use intraday body as proxy for 9:45 direction
-        intraday_body = spot - day_open
-        early_body = ohlc.get('close', spot) - day_open  # Current body direction
-
-        # Scoring
-        bear_score = 0; bull_score = 0
-        bear_r = []; bull_r = []
-
-        # 1. Gap (2 pts)
-        if gap_pct < -0.3:
-            bear_score += 2; bear_r.append(f'gap{gap_pct:.1f}%')
-        elif gap_pct > 0.3:
-            bull_score += 2; bull_r.append(f'gap+{gap_pct:.1f}%')
-
-        # 2. 1-hour momentum (3 pts — strongest signal)
-        if move_1h < -0.20:
-            bear_score += 3; bear_r.append(f'1h{move_1h:.2f}')
-        elif move_1h > 0.20:
-            bull_score += 3; bull_r.append(f'1h+{move_1h:.2f}')
-
-        # 3. VWAP position (1 pt)
-        if vwap > 0 and spot < vwap:
-            bear_score += 1; bear_r.append('<VW')
-        elif vwap > 0 and spot > vwap:
-            bull_score += 1; bull_r.append('>VW')
-
-        # 4. PCR (2 pts) — only with real PCR data
-        pcr = ind.get('pcr', 1.0)
-        pcr_source = ind.get('pcr_source', 'PROXY')
-        if pcr_source in ('PIPELINE', 'ANGEL_OI', 'REAL'):
-            if pcr < 0.85:
-                bear_score += 2; bear_r.append(f'PCR{pcr:.2f}')
-            elif pcr > 1.10:
-                bull_score += 2; bull_r.append(f'PCR{pcr:.2f}')
-
-        # 5. Previous day trend (1-2 pts)
-        prev1_red = prev1['Close'] < prev1['Open']
-        prev2_red = prev2['Close'] < prev2['Open']
-        prev1_grn = prev1['Close'] > prev1['Open']
-        prev2_grn = prev2['Close'] > prev2['Open']
-        if prev1_red and prev2_red:
-            bear_score += 2; bear_r.append('2xRed')
-        elif prev1_red:
-            bear_score += 1; bear_r.append('pRed')
-        if prev1_grn and prev2_grn:
-            bull_score += 2; bull_r.append('2xGrn')
-        elif prev1_grn:
-            bull_score += 1; bull_r.append('pGrn')
-
-        # 6. Making new low/high in first hour (1 pt)
-        if spot < day_open and spot <= ohlc['low'] * 1.001:
-            bear_score += 1; bear_r.append('newLo')
-        elif spot > day_open and spot >= ohlc['high'] * 0.999:
-            bull_score += 1; bull_r.append('newHi')
-
-        # Generate signal
-        if bear_score >= TR_MIN_SCORE:
-            pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-            if chain_ltp <= 0:
-                logger.info(f"  TR_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
-            else:
-                use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                premium = chain_ltp
-                if premium > MIN_PREMIUM_BUY:
-                    reason_str = '+'.join(bear_r)
-                    signals.append({
-                        'type': 'BUY_PE',
-                        'strike': pe_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"TrendRider DN {reason_str} sc={bear_score} [LIVE]",
-                        'target': premium * TR_TARGET_MULT,
-                        'sl': premium * TR_SL_MULT,
-                        'trend_rider_score': bear_score,
-                    })
-
-        elif bull_score >= TR_MIN_SCORE:
+        # BUY CE: PCR > 1.05 (bullish), near VWAP
+        # v10.1: Fixed direction bug — CE requires spot > VWAP (was 0.995x allowing below)
+        if pcr > 1.05 and abs(spot - vwap) < tolerance * 2 and spot > vwap:
             ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-            if chain_ltp <= 0:
-                logger.info(f"  TR_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
-            else:
-                use_iv = chain_iv if chain_iv > 0 else ind['iv']
-                g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                premium = chain_ltp
-                if premium > MIN_PREMIUM_BUY:
-                    reason_str = '+'.join(bull_r)
-                    signals.append({
-                        'type': 'BUY_CE',
-                        'strike': ce_strike,
-                        'premium': premium,
-                        'greeks': g,
-                        'reason': f"TrendRider UP {reason_str} sc={bull_score} [LIVE]",
-                        'target': premium * TR_TARGET_MULT,
-                        'sl': premium * TR_SL_MULT,
-                        'trend_rider_score': bull_score,
-                    })
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
+                signals.append({
+                    'type': 'BUY_CE',
+                    'strike': ce_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': f"PCR+VWAP: Bullish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
+                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                    'target': premium * 1.5,  # v7.5: realistic intraday target
+                    'sl': premium * 0.4,
+                })
+
+        # BUY PE: PCR < 0.95 (bearish), near VWAP
+        # v10.1: Fixed direction bug — PE requires spot < VWAP (was 1.005x allowing above)
+        elif pcr < 0.95 and abs(spot - vwap) < tolerance * 2 and spot < vwap:
+            pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+            use_iv = chain_iv if chain_iv > 0 else ind['iv']
+            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
+            premium = chain_ltp if chain_ltp > 0 else g['price']
+            if premium > MIN_PREMIUM_BUY and premium < spot * 0.05:
+                signals.append({
+                    'type': 'BUY_PE',
+                    'strike': pe_strike,
+                    'premium': premium,
+                    'greeks': g,
+                    'reason': f"PCR+VWAP: Bearish PCR={pcr:.2f} VWAP={vwap:.0f} spot={spot:.0f}"
+                              f"{' [LIVE]' if chain_ltp > 0 else ' [BS-PENDING]'}",
+                    'target': premium * 1.5,  # v7.5: realistic intraday target
+                    'sl': premium * 0.4,
+                })
 
         return signals
 
@@ -3044,35 +2711,33 @@ class StrategyEngine:
         strike_interval = STRIKE_INTERVALS.get(symbol, 100)
         if ohlc['high'] > ind['resistance'] + gap:
             pe_strike = round((spot - distance) / strike_interval) * strike_interval
-            _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte, target_strike=pe_strike)
-            if sell_ltp > 0 and sell_ltp > MIN_PREMIUM_SELL:
-                g = greeks_from_market_price(sell_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE')
+            g = bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, ind['iv'], 'PE')
+            if g['price'] > MIN_PREMIUM_SELL:
                 signals.append({
                     'type': 'SELL_PE',
                     'strike': pe_strike,
-                    'premium': sell_ltp,
+                    'premium': g['price'],
                     'greeks': g,
                     'reason': f"Survivor: PE sell at {pe_strike:.0f} "
-                              f"dist={distance:.0f} gap={gap:.0f} res={ind['resistance']:.0f} [LIVE]",
-                    'target': sell_ltp * 0.3,
-                    'sl': sell_ltp * 0.8,
+                              f"dist={distance:.0f} gap={gap:.0f} res={ind['resistance']:.0f}",
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
                 })
 
         # CE SELLING - price breaks below support
         if ohlc['low'] < ind['support'] - gap:
             ce_strike = round((spot + distance) / strike_interval) * strike_interval
-            _, sell_ltp, sell_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte, target_strike=ce_strike)
-            if sell_ltp > 0 and sell_ltp > MIN_PREMIUM_SELL:
-                g = greeks_from_market_price(sell_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE')
+            g = bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, ind['iv'], 'CE')
+            if g['price'] > MIN_PREMIUM_SELL:
                 signals.append({
                     'type': 'SELL_CE',
                     'strike': ce_strike,
-                    'premium': sell_ltp,
+                    'premium': g['price'],
                     'greeks': g,
                     'reason': f"Survivor: CE sell at {ce_strike:.0f} "
-                              f"dist={distance:.0f} gap={gap:.0f} sup={ind['support']:.0f} [LIVE]",
-                    'target': sell_ltp * 0.3,
-                    'sl': sell_ltp * 0.8,
+                              f"dist={distance:.0f} gap={gap:.0f} sup={ind['support']:.0f}",
+                    'target': g['price'] * 0.3,
+                    'sl': g['price'] * 0.8,
                 })
 
         return signals
@@ -3092,48 +2757,11 @@ class PaperTrader:
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         self.market_pipeline = market_pipeline  # v9: Real-time NSE/BSE option chain pipeline
         self.engine.market_pipeline = market_pipeline  # v9.6d: Share pipeline with engine
-        # v12.0: Zerodha Kite Connect as Source 1 (primary)
-        self.zerodha = None
-        try:
-            from zerodha_feed import ZerodhaFeed
-            self.zerodha = ZerodhaFeed()
-            if self.zerodha.connect():
-                self.engine.zerodha = self.zerodha
-                logger.info("[Zerodha] ✅ Initialized as Source 1 for option chain + LTP")
-            else:
-                self.zerodha = None
-                logger.warning("[Zerodha] Connection failed — trying TrueData as Source 2")
-        except Exception as e:
-            logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
-
-        # v11.2: TrueData as Source 2 (fallback when Zerodha unavailable)
-        self.truedata = None
-        try:
-            from truedata_feed import TrueDataFeed
-            self.truedata = TrueDataFeed()
-            if self.truedata.connect():
-                self.engine.truedata = self.truedata
-                src_num = "2" if self.zerodha else "1 (Zerodha unavailable)"
-                logger.info(f"[TrueData] Initialized as Source {src_num} for option chain + LTP")
-            else:
-                self.truedata = None
-                logger.warning("[TrueData] Connection failed — falling back to NSE/BSE + Angel")
-        except Exception as e:
-            logger.warning(f"[TrueData] Not available: {e} — falling back to NSE/BSE + Angel")
         self._index_tokens = {
             'NIFTY': {'exchange': 'NSE', 'token': '99926000'},
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
             'SENSEX': {'exchange': 'BSE', 'token': '99919000'},
         }
-        # v13.0: Calculus engine — intraday VWAP + momentum direction
-        from market_calculus import MarketCalculus
-        self.calculus = MarketCalculus()
-        self.engine.calculus = self.calculus  # Share with StrategyEngine
-
-        # v14.0: Trade Intelligence engine
-        from trade_intelligence import TradeIntelligence
-        self.trade_intel = TradeIntelligence()
-
         # Caches to reduce REST API calls (prevents rate limiting AB1004)
         self._ohlc_cache = {}      # {symbol: {'data': ohlc_dict, 'time': datetime}}
         self._greeks_cache = {}    # {cache_key: {'data': greeks, 'time': datetime}}
@@ -3156,16 +2784,11 @@ class PaperTrader:
         self.pending_reverses = {}      # v10.1: {symbol: {opt_type, spot, ...}} for breakout failure reversal
         self._vix_cache = {'value': None, 'time': None}
         self.current_vix = None
-        # v15: Two-tier logging for 1-second scan loop
-        self._last_full_log_time = 0       # epoch timestamp
-        self._full_log_interval = 60       # full indicator dump every 60 seconds
         self.data_logger = None  # v10.2e: Live data logger for backtesting
         # v10.3: Market regime detection
         from market_regime import RegimeDetector
         self.regime_detector = RegimeDetector()
         self._last_logged_regime = {}
-        # v11: Trend Rider — track daily entries (max 1 per symbol per day)
-        self._trend_rider_today = {}  # {symbol: date_str} — tracks if TR entered today
 
     def connect(self):
         """Connect to Angel API."""
@@ -3265,33 +2888,15 @@ class PaperTrader:
         return 1.0
 
     def _get_option_ltp(self, pos):
-        """Get real-time option LTP for a position. 4-source fallback.
+        """Get real-time option LTP for a position. 3-source fallback.
 
-        v12.0: Zerodha (1st) > TrueData (2nd) > NSE/BSE pipeline (3rd) > Angel API (4th).
-        Returns None if all unavailable.
+        v9.4: Pipeline chain LTP is primary source (NSE/BSE website data).
+        Angel API is secondary. Returns None if both unavailable.
         """
         symbol = pos['symbol']
         opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
 
-        # Source 1: Zerodha Kite Connect (primary — REST API)
-        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
-            try:
-                zd_ltp = self.zerodha.get_option_ltp(symbol, pos['strike'], opt_type)
-                if zd_ltp and zd_ltp > 0:
-                    return zd_ltp
-            except Exception as e:
-                logger.debug(f"[Zerodha] Option LTP failed for {symbol} {pos['strike']}{opt_type}: {e}")
-
-        # Source 2: TrueData option LTP (secondary — real-time WebSocket)
-        if self.truedata and self.truedata.is_connected:
-            try:
-                td_ltp = self.truedata.get_option_ltp(symbol, pos['strike'], opt_type)
-                if td_ltp and td_ltp > 0:
-                    return td_ltp
-            except Exception as e:
-                logger.debug(f"[TrueData] Option LTP failed for {symbol} {pos['strike']}{opt_type}: {e}")
-
-        # Source 2: Pipeline chain LTP from NSE/BSE (fallback when TrueData unavailable)
+        # Source 1: Pipeline chain LTP from NSE/BSE (most reliable, no API auth needed)
         # v10.5: Skip stale BSE data for SENSEX (> 5 min old → fall through to Angel BFO)
         try:
             if self.market_pipeline:
@@ -3316,7 +2921,7 @@ class PaperTrader:
         except Exception as e:
             logger.debug(f"  Pipeline exit LTP failed for {symbol} {pos['strike']}{opt_type}: {e}")
 
-        # Source 3: Angel API with 15s cache (last resort)
+        # Source 2: Angel API with 15s cache
         details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
         option_token = details.get('option_token')
         exchange = details.get('option_exchange')
@@ -3342,7 +2947,7 @@ class PaperTrader:
         # Check cache (15-second TTL)
         cache_key = f"{exchange}_{option_token}"
         cached = self._option_ltp_cache.get(cache_key)
-        if cached and (datetime.now() - cached['time']).total_seconds() < 5:  # v15: 5s (was 15s)
+        if cached and (datetime.now() - cached['time']).total_seconds() < 15:
             return cached['ltp']
 
         try:
@@ -3388,9 +2993,6 @@ class PaperTrader:
                     'close': closes[-1],
                     'volume': sum(volumes),
                 }
-                # v13.0: Feed candle data to calculus engine
-                if hasattr(self, 'calculus') and self.calculus.bar_count(symbol) < len(data):
-                    self.calculus.load_intraday_candles(symbol, data)
                 self._ohlc_cache[symbol] = {'data': ohlc, 'time': datetime.now()}
                 return ohlc
         except Exception as e:
@@ -3405,9 +3007,9 @@ class PaperTrader:
         return None
 
     def get_real_pcr_cached(self, symbol):
-        """v2.5.2: Get real PCR from option chain OI, cached for 60 seconds (was 300s)."""
+        """v2.5.2: Get real PCR from option chain OI, cached for 5 minutes."""
         cached = self._pcr_cache.get(symbol)
-        if cached and (datetime.now() - cached['time']).total_seconds() < 60:
+        if cached and (datetime.now() - cached['time']).total_seconds() < 300:
             return cached['pcr']
         expiry = self._get_nearest_expiry(symbol)
         if expiry:
@@ -3436,14 +3038,10 @@ class PaperTrader:
         return MARKET_OPEN <= current_time <= MARKET_CLOSE
 
     def scan_all_strategies(self):
-        """Scan all strategies across all 3 indices. Runs every 1 second (v15)."""
-        # v15: Two-tier logging — full dump every 60s, compact tick line otherwise
-        do_full_log = (time.time() - self._last_full_log_time) >= self._full_log_interval
-        if do_full_log:
-            logger.info("\n" + "=" * 70)
-            logger.info("SCANNING ALL STRATEGIES...")
-            logger.info("=" * 70)
-            self._last_full_log_time = time.time()
+        """Scan all 5 strategies across all 3 indices."""
+        logger.info("\n" + "=" * 70)
+        logger.info("SCANNING ALL STRATEGIES...")
+        logger.info("=" * 70)
 
         now = datetime.now()
         dow = now.weekday()
@@ -3456,12 +3054,11 @@ class PaperTrader:
             self.daily_trade_count = 0
             self.exit_history = []
             self.ghost_zone_losses = {}
-            self._trend_rider_today = {}  # v11: Reset TR daily entries
 
         # Fetch India VIX for adaptive filtering
         vix = self.get_india_vix()
         vix_mult = self.get_vix_multiplier()
-        if vix and do_full_log:
+        if vix:
             regime = "LOW" if vix < VIX_LOW_THRESHOLD else ("HIGH" if vix > VIX_HIGH_THRESHOLD else "NORMAL")
             logger.info(f"  INDIA VIX: {vix:.2f} | Regime: {regime} | Filter multiplier: {vix_mult}x")
 
@@ -3472,28 +3069,17 @@ class PaperTrader:
             logger.warning(f"  Signals will be logged but NOT executed.")
             return all_signals  # Return empty - no trades outside hours
 
-        # v15: Collect spots for compact tick line
-        _tick_spots = {}
         for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
-            if do_full_log:
-                logger.info(f"\n--- {symbol} ---")
+            logger.info(f"\n--- {symbol} ---")
 
             spot = self.get_index_spot(symbol)
             if not spot:
-                if do_full_log:
-                    logger.warning(f"  No spot data for {symbol}")
+                logger.warning(f"  No spot data for {symbol}")
                 continue
-            _tick_spots[symbol] = spot
 
             # v10.2e: Log spot tick for backtesting
             if self.data_logger and spot:
                 self.data_logger.log_spot_tick(symbol, spot)
-
-            # v13.0: Feed spot tick to calculus engine
-            if hasattr(self, 'calculus'):
-                ohlc_for_calc = self.get_intraday_ohlc(symbol)
-                vol = ohlc_for_calc.get('volume', 0) if ohlc_for_calc else 0
-                self.calculus.add_spot_tick(symbol, spot, vol)
 
             # v10.3: Update regime detector with latest spot + VIX
             self.regime_detector.update(symbol, spot, vix)
@@ -3509,9 +3095,8 @@ class PaperTrader:
             if not ohlc:
                 ohlc = {'open': spot, 'high': spot, 'low': spot, 'close': spot, 'volume': 0}
 
-            if do_full_log:
-                logger.info(f"  Spot: {spot:.2f} | O: {ohlc['open']:.2f} H: {ohlc['high']:.2f} "
-                           f"L: {ohlc['low']:.2f} C: {ohlc['close']:.2f}")
+            logger.info(f"  Spot: {spot:.2f} | O: {ohlc['open']:.2f} H: {ohlc['high']:.2f} "
+                       f"L: {ohlc['low']:.2f} C: {ohlc['close']:.2f}")
 
             indicators = self.engine.compute_indicators(symbol, ohlc)
             if not indicators:
@@ -3570,17 +3155,16 @@ class PaperTrader:
                            'has_pipeline': pcr_source == 'PIPELINE'}
             indicators['_data_quality'] = data_quality
 
-            if do_full_log:
-                logger.info(f"  ATR: {indicators['atr']:.2f} | IV: {indicators['iv']*100:.1f}% | "
-                           f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f} ({pcr_source})")
-                if indicators.get('pcr_shift') is not None:
-                    logger.info(f"  PCR Shift: {indicators['pcr_shift']:+.3f} ({indicators.get('pcr_direction', 'N/A')}) | "
-                               f"OI: {indicators.get('oi_sentiment', 'N/A')} | "
-                               f"Premium: {indicators.get('premium_signal', 'N/A')}")
-                logger.info(f"  Pivot: {indicators['pivot']:.0f} | TC: {indicators['tc']:.0f} | "
-                           f"BC: {indicators['bc']:.0f}")
-                logger.info(f"  Cam R3: {indicators['cam_r3']:.0f} R4: {indicators['cam_r4']:.0f} | "
-                           f"S3: {indicators['cam_s3']:.0f} S4: {indicators['cam_s4']:.0f}")
+            logger.info(f"  ATR: {indicators['atr']:.2f} | IV: {indicators['iv']*100:.1f}% | "
+                       f"CPR: {indicators['cpr_width']:.3f}% | PCR: {indicators['pcr']:.2f} ({pcr_source})")
+            if indicators.get('pcr_shift') is not None:
+                logger.info(f"  PCR Shift: {indicators['pcr_shift']:+.3f} ({indicators.get('pcr_direction', 'N/A')}) | "
+                           f"OI: {indicators.get('oi_sentiment', 'N/A')} | "
+                           f"Premium: {indicators.get('premium_signal', 'N/A')}")
+            logger.info(f"  Pivot: {indicators['pivot']:.0f} | TC: {indicators['tc']:.0f} | "
+                       f"BC: {indicators['bc']:.0f}")
+            logger.info(f"  Cam R3: {indicators['cam_r3']:.0f} R4: {indicators['cam_r4']:.0f} | "
+                       f"S3: {indicators['cam_s3']:.0f} S4: {indicators['cam_s4']:.0f}")
 
             # v10: Collect live scan data for dashboard
             scan_data[symbol] = {
@@ -3610,17 +3194,6 @@ class PaperTrader:
 
             dte = max(1, (3 - dow) + 1) if dow <= 3 else 1
 
-            # v11.1: Choppy day detection — block late entries if morning efficiency < 15%
-            choppy_blocked = False
-            if now.time() >= CHOPPY_DAY_BLOCK_AFTER:
-                day_range = ohlc['high'] - ohlc['low']
-                net_move = abs(spot - ohlc['open'])
-                day_eff = net_move / day_range * 100 if day_range > 0 else 100
-                if day_eff < CHOPPY_DAY_EFF_THRESHOLD:
-                    choppy_blocked = True
-                    logger.info(f"  CHOPPY_DAY_BLOCK: {symbol} efficiency={day_eff:.0f}% "
-                               f"(range={day_range:.0f}, net={net_move:.0f}) — blocking new entries")
-
             # Run active strategies (Survivor HALTED — needs Rs 1L+ capital per symbol)
             strategy_checks = [
                 ('CPR', self.engine.check_cpr_signals),
@@ -3631,9 +3204,6 @@ class PaperTrader:
             ]
 
             for strat_name, check_fn in strategy_checks:
-                if choppy_blocked:
-                    logger.debug(f"  CHOPPY_SKIP: {strat_name} blocked on choppy day")
-                    continue
                 signals = check_fn(symbol, spot, ohlc, indicators, dow, dte)
                 for sig in signals:
                     sig['strategy'] = strat_name
@@ -3646,97 +3216,8 @@ class PaperTrader:
                                f"Strike={sig['strike']:.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
 
-            # v11: TREND RIDER — independent scan at 10:15-10:30 (max 1 per symbol per day)
-            today_str = now.strftime('%Y-%m-%d')
-            tr_entered_today = self._trend_rider_today.get(symbol) == today_str
-            if not tr_entered_today and TR_ENTRY_TIME <= now.time() <= TR_LAST_ENTRY_TIME:
-                tr_signals = self.engine.check_trend_rider_signal(symbol, spot, ohlc, indicators, dow, dte)
-                for sig in tr_signals:
-                    sig['strategy'] = 'Trend Rider'
-                    sig['symbol'] = symbol
-                    sig['spot'] = spot
-                    sig['dte'] = dte
-                    sig['is_trend_rider'] = True  # Flag for special handling in execute
-                    all_signals.append(sig)
-                    logger.info(f"  SIGNAL [Trend Rider]: {sig['type']} "
-                               f"Strike={sig['strike']:.0f} Premium=Rs {sig['premium']:.2f} "
-                               f"| {sig['reason']}")
-
-        
-            # ---- v13.1: LIQUIDITY SWEEP (SL Hunt Reversal) ----
-            # Detects institutional stop-loss hunts and trades the reversal
-            # Hybrid sizing: Q>=45 half-lot, Q>=60 full-lot
-            # Backtested 6 days: PF=1.98-2.95, WR=70-78%, DD<1%
-            # Timing: 09:20 to 15:15 (needs 5+ bars of data)
-            if hasattr(self, 'calculus') and not choppy_blocked:
-                ls_start = now.replace(hour=9, minute=16, second=0)
-                ls_end = now.replace(hour=15, minute=15, second=0)
-                if ls_start <= now <= ls_end:
-                    for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
-                        _bc = self.calculus.bar_count(symbol)
-                        if _bc > 0 and _bc % 20 == 1: logger.info(f"  SWEEP_BARS: {symbol} has {_bc} bars")
-                        if self.calculus.bar_count(symbol) >= 25:
-                            sweeps = self.calculus.detect_liquidity_sweep(symbol)
-                            if not sweeps: continue
-                            for sw in sweeps:
-                                if sw['quality'] < 45:
-                                    continue
-                                # Get option chain for the sweep direction
-                                sw_spot = self.get_index_spot(symbol) or 0
-                                if sw_spot <= 0:
-                                    continue
-                                sw_dte = dte  # Use same DTE as other strategies
-                                T = max(sw_dte / 365.0, 1/365.0)
-                                sw_type = f"BUY_{sw['direction']}_SWEEP"
-                                sw_strike, sw_ltp, sw_iv = self.engine._get_strike_from_chain(
-                                    symbol, sw_spot, sw['direction'], sw_dte)
-                                if sw_ltp <= 0:
-                                    continue
-                                g = greeks_from_market_price(
-                                    sw_ltp, sw_spot, sw_strike, T, RISK_FREE_RATE,
-                                    sw['direction'])
-                                if sw_ltp > MIN_PREMIUM_BUY:
-                                    # SL at spike peak + 30%
-                                    sl_buffer = sw['spike_size'] * 0.3
-                                    # Target: 80% of spike retrace
-                                    target_move = sw['spike_size'] * 0.8 * 0.5  # delta-adjusted
-                                    sig = {
-                                        'type': sw_type,
-                                        'strike': sw_strike,
-                                        'premium': sw_ltp,
-                                        'greeks': g,
-                                        'reason': (f"Liquidity Sweep: {sw['spike_dir']} spike "
-                                                  f"{sw['spike_pct']:.3f}% Z={sw['z_score']:.1f} "
-                                                  f"rev={sw['reversal_ratio']:.0%} "
-                                                  f"{'AccFlip ' if sw['accel_flip'] else ''}"
-                                                  f"Q={sw['quality']} [LIVE]"),
-                                        'target': sw_ltp + target_move,
-                                        'sl': max(sw_ltp * 0.5, sw_ltp - sl_buffer * 0.5),
-                                        'strategy': 'Liquidity Sweep',
-                                        'symbol': symbol,
-                                        'spot': sw_spot,
-                                        'dte': sw_dte,
-                                        'quality_score': sw['quality'],
-                                        '_sweep_quality': sw['quality'],
-                                        '_sweep_half_lot': sw['quality'] < 60,
-                                    }
-                                    all_signals.append(sig)
-                                    logger.info(f"  SIGNAL [Liquidity Sweep]: {sw_type} "
-                                              f"Strike={sw_strike:.0f} Premium=Rs {sw_ltp:.2f} "
-                                              f"| {sig['reason']}")
-
-
-        # v10: Write live scan data for dashboard (only on full log cycles to reduce I/O)
-        if do_full_log:
-            self._write_live_scan_data(scan_data, vix)
-
-        # v15: Compact tick line on non-full-log cycles
-        if not do_full_log:
-            unrealized = sum(p.get('unrealized_pnl', 0) for p in self.portfolio.positions)
-            spots_str = ' '.join(f"{s[:3]}={_tick_spots.get(s, 0):.0f}" for s in ['NIFTY', 'BANKNIFTY', 'SENSEX'])
-            logger.info(f"  TICK {datetime.now().strftime('%H:%M:%S')} | {spots_str} | "
-                       f"Pos:{len(self.portfolio.positions)} UnrlPnL:{unrealized:+,.0f} | "
-                       f"Signals:{len(all_signals)}")
+        # v10: Write live scan data for dashboard
+        self._write_live_scan_data(scan_data, vix)
 
         return all_signals
 
@@ -3833,15 +3314,20 @@ class PaperTrader:
                 logger.info(f"  MAX_TRADES_REACHED: {self.daily_trade_count} trades today. Skipping remaining signals.")
                 break
 
-            # v7.7: Strategy-aware duplicate check (v13.2: strike-agnostic — prevents duplicate positions)
+            # v7.7: Strategy-aware duplicate check
+            # Same strategy + same symbol + nearby strike = duplicate (block)
+            # Different strategy + same symbol + same direction = confirmation (allow)
+            strike_tolerance = {'NIFTY': 100, 'BANKNIFTY': 200, 'SENSEX': 200}
+            tol = strike_tolerance.get(sig['symbol'], 100)
             sig_opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
             same_strat_dup = [p for p in self.portfolio.positions
                               if p['symbol'] == sig['symbol']
+                              and abs(p['strike'] - sig['strike']) <= tol
                               and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
                               and p['strategy'] == sig['strategy']]
             if same_strat_dup:
                 logger.info(f"  SKIP (duplicate): {sig['strategy']} {sig['symbol']} "
-                           f"{sig['strike']}{sig_opt_type} — already held @ {same_strat_dup[0]['strike']} (strike-agnostic v13.2)")
+                           f"{sig['strike']}{sig_opt_type} — already held @ {same_strat_dup[0]['strike']}")
                 skipped += 1
                 continue
 
@@ -3881,6 +3367,7 @@ class PaperTrader:
             # (e.g., Silver 280000 CE at 13:30 executed by both CPR and Gamma Blast = same position twice)
             cross_strat_dup = [p for p in self.portfolio.positions
                                if p['symbol'] == sig['symbol']
+                               and abs(p['strike'] - sig['strike']) <= tol
                                and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
                                and p['strategy'] != sig['strategy']]
             if cross_strat_dup:
@@ -3935,27 +3422,15 @@ class PaperTrader:
                     opp_pnl = opp.get('unrealized_pnl', 0)
                     opp_current = opp.get('current_premium', opp['entry_premium'])
 
-                    # v13.0: Calculus-based flip protection — replaces static DCI
-                    # Use live momentum/VWAP instead of frozen entry-time DCI
-                    if hasattr(self, 'calculus') and self.calculus.bar_count(sig['symbol']) >= 15:
-                        calc_allowed, calc_reason, calc_data = self.calculus.should_allow_direction(
-                            sig['symbol'], sig['type'], sig['spot'])
-                        if not calc_allowed:
-                            logger.info(f"  SKIP_FLIP_CALCULUS: {sig['symbol']} {sig['type']} — {calc_reason}")
-                            flip_blocked = True
-                            break
-                        else:
-                            logger.info(f"  CALC_FLIP_OK: {sig['symbol']} {sig['type']} — {calc_reason}")
-                    else:
-                        # Fallback: use original DCI if calculus has no data yet
-                        opp_details = opp.get('details', {}) if isinstance(opp.get('details'), dict) else {}
-                        existing_dci = opp_details.get('dci', 0)
-                        if existing_dci > 60:
-                            logger.info(f"  SKIP_FLIP_DCI: Existing {opp['id']} ({opp['strategy']} "
-                                       f"{opp['signal_type']}) DCI={existing_dci:.0f} > 60 — direction strong, "
-                                       f"blocking flip to {sig['type']}")
-                            flip_blocked = True
-                            break
+                    # v10.4: DCI-based flip protection — don't flip strong-direction positions
+                    opp_details = opp.get('details', {}) if isinstance(opp.get('details'), dict) else {}
+                    existing_dci = opp_details.get('dci', 0)
+                    if existing_dci > 60:
+                        logger.info(f"  SKIP_FLIP_DCI: Existing {opp['id']} ({opp['strategy']} "
+                                   f"{opp['signal_type']}) DCI={existing_dci:.0f} > 60 — direction strong, "
+                                   f"blocking flip to {sig['type']}")
+                        flip_blocked = True
+                        break
 
                     # v7.7: Only flip LOSING positions. Profitable ones run regardless of breakeven_locked.
                     if opp_pnl <= 0:
@@ -4066,14 +3541,8 @@ class PaperTrader:
                         continue
 
             # ---- v2.3: VIX-adjusted minimum premium check ----
-            # v11.1: BANKNIFTY higher min premium (premiums 3-5x NIFTY, each SL costs more)
             is_sell = 'SELL' in sig['type']
-            if is_sell:
-                min_prem = MIN_PREMIUM_SELL * vix_mult
-            elif sig.get('symbol') == 'BANKNIFTY':
-                min_prem = MIN_PREMIUM_BUY_BN * vix_mult
-            else:
-                min_prem = MIN_PREMIUM_BUY * vix_mult
+            min_prem = (MIN_PREMIUM_SELL if is_sell else MIN_PREMIUM_BUY) * vix_mult
             if sig['premium'] < min_prem:
                 logger.info(f"  SKIP_PREMIUM: {sig['symbol']} {sig['type']} Rs {sig['premium']:.2f} "
                            f"< VIX-adjusted min Rs {min_prem:.2f} (VIX mult={vix_mult}x)")
@@ -4097,56 +3566,25 @@ class PaperTrader:
                             skipped += 1
                             continue
 
-            # ---- v13.0: CALCULUS-BASED DIRECTION VALIDATION (replaces v10.1 static VWAP checks) ----
+            # ---- v10.1: DIRECTION VALIDATION — the primary filter ----
             dir_ohlc = self.get_intraday_ohlc(sig['symbol']) or {
                 'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0}
             dir_indicators = self.engine.compute_indicators(sig['symbol'], dir_ohlc)
-
-            # v13.0: Use calculus engine as PRIMARY direction gate
-            calc_dir_valid = True
-            dir_adj = 0
-            if hasattr(self, 'calculus') and self.calculus.bar_count(sig['symbol']) >= 15:
-                calc_allowed, calc_reason, calc_data = self.calculus.should_allow_direction(
-                    sig['symbol'], sig['type'], sig['spot'])
-                logger.info(f"  CALC_DIR: {sig['symbol']} {sig['type']} — {calc_reason}")
-
-                if not calc_allowed:
-                    # Calculus says wrong direction — try flipping
-                    orig_type = sig['type']
-                    flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
-                    calc_dir = calc_data.get('direction')
-                    flipped_opt = 'CE' if 'CE' in flipped_type else 'PE'
-
-                    if calc_dir and flipped_opt == calc_dir:
-                        # Calculus direction matches flipped direction — flip signal
-                        existing_flipped = [p for p in self.portfolio.positions
-                            if p['symbol'] == sig['symbol']
-                            and ('CE' if 'CE' in p['signal_type'] else 'PE') == flipped_opt]
-                        if existing_flipped:
-                            logger.info(f"  DIR_REJECT: {sig['symbol']} {orig_type} — calculus says {calc_dir} "
-                                       f"but already holding {flipped_opt}")
-                            skipped += 1; continue
-                        logger.info(f"  CALC_DIR_FLIP: {sig['symbol']} {orig_type} -> {flipped_type} "
-                                   f"(calculus score={calc_data['score']:+.0f}, mom={calc_data['momentum']:+.2f})")
-                        sig['type'] = flipped_type
-                        dir_adj = 5  # Small boost for calculus-aligned flip
-                    else:
-                        logger.info(f"  DIR_REJECT: {sig['symbol']} {orig_type} — calculus blocks "
-                                   f"(score={calc_data['score']:+.0f})")
-                        skipped += 1; continue
-                else:
-                    # Calculus agrees — give score boost based on confidence
-                    dir_adj = min(calc_data.get('confidence', 0) // 10, 10)
-            elif dir_indicators:
-                # Fallback: old multi-factor validation if calculus has insufficient data
+            if dir_indicators:
                 dir_valid, dir_reason, dir_adj = validate_signal_direction(
                     sig['type'], sig['spot'], dir_ohlc, dir_indicators)
                 if not dir_valid:
+                    # v10.2b: Direction Flip — trade correct direction instead of just blocking
+                    # Guard: Don't flip AGAINST the daily EMA trend
+                    # If EMA bullish (9>20), only flip to CE, never to PE
+                    # If EMA bearish (9<20), only flip to PE, never to CE
                     orig_type = sig['type']
                     ema_9 = dir_indicators.get('ema_9', 0)
                     ema_20 = dir_indicators.get('ema_20', 0)
+
                     flipped_type = orig_type.replace('CE', 'PE') if 'CE' in orig_type else orig_type.replace('PE', 'CE')
                     flip_to_pe = 'PE' in flipped_type
+
                     if ema_9 > 0 and ema_20 > 0:
                         daily_bullish = ema_9 > ema_20
                         if (daily_bullish and flip_to_pe) or (not daily_bullish and not flip_to_pe):
@@ -4157,6 +3595,7 @@ class PaperTrader:
                     flip_valid, flip_reason, flip_adj = validate_signal_direction(
                         flipped_type, sig['spot'], dir_ohlc, dir_indicators)
                     if flip_valid:
+                        # Safety: check no existing position in flipped direction
                         flipped_opt = 'CE' if 'CE' in flipped_type else 'PE'
                         existing_flipped = [p for p in self.portfolio.positions
                             if p['symbol'] == sig['symbol']
@@ -4203,18 +3642,9 @@ class PaperTrader:
                 skipped += 1
                 continue
 
-            # ---- v13.0: Direction Confidence Index — enhanced with calculus momentum ----
+            # ---- v10.4: Direction Confidence Index — math-based entry filter ----
             g = sig['greeks']
             dci = compute_direction_confidence(sig, sig['spot'], indicators, self.current_vix, g)
-            # v13.0: Boost/penalize DCI based on calculus momentum alignment
-            if hasattr(self, 'calculus') and self.calculus.bar_count(sig['symbol']) >= 15:
-                calc_sig = self.calculus.direction_signal(sig['symbol'], sig['spot'])
-                sig_dir = 'CE' if 'CE' in sig['type'] else 'PE'
-                if calc_sig['direction'] == sig_dir:
-                    dci = min(100, dci + 10)  # Calculus agrees — boost
-                elif calc_sig['direction'] and calc_sig['confidence'] > 30:
-                    dci = max(0, dci - 10)    # Calculus opposes — penalize
-                sig['_calculus'] = calc_sig  # Store for logging
             if dci < DCI_MIN_THRESHOLD:
                 logger.info(f"  SKIP_DCI: {sig['symbol']} {sig['type']} DCI={dci:.0f} < {DCI_MIN_THRESHOLD} — weak direction")
                 skipped += 1
@@ -4227,33 +3657,7 @@ class PaperTrader:
             else:
                 sig['_lot_tier'] = 'BASE'       # 10% capital allocation (minimum)
             logger.info(f"  DCI: {sig['symbol']} {sig['type']} DCI={dci:.0f}/100 tier={sig['_lot_tier']}")
-            sig["_dci"] = dci  # Store DCI for trade_intelligence gate
 
-
-            # ---- v12.0: PHYSICS GATE — mathematical signal quality filter ----
-            # Blocks entries where: momentum dying, wave peak, VWAP stretched, RSI extreme
-            # Backtested: PF 2.65 -> 3.18, blocks wrong-direction entries mathematically
-            if hasattr(self, 'calculus') and self.calculus.bar_count(sig['symbol']) >= 6:
-                sig_dir = 'CE' if 'CE' in sig['type'] else 'PE'
-                phy_score, phy_diag = self.calculus.physics_gate(sig['symbol'], sig_dir, sig['spot'])
-                sig['_physics_score'] = phy_score
-                sig['_physics_diag'] = phy_diag
-                if phy_score < 0:
-                    warnings_list = []
-                    if phy_diag.get('mom_dying'): warnings_list.append('MOM_DYING')
-                    if phy_diag.get('wave_peak'): warnings_list.append('WAVE_PEAK')
-                    if phy_diag.get('stretched'): warnings_list.append('VWAP_STRETCHED')
-                    if phy_diag.get('rsi_extreme'): warnings_list.append('RSI_EXTREME')
-                    logger.info(f"  PHYSICS_BLOCK: {sig['symbol']} {sig['type']} "
-                               f"score={phy_score} [{','.join(warnings_list)}] "
-                               f"accel={phy_diag.get('accel','?')} wave={phy_diag.get('wave_risk','?')} "
-                               f"vwap={phy_diag.get('vwap_stretch','?')} rsi={phy_diag.get('rsi','?')}")
-                    skipped += 1
-                    continue
-                else:
-                    logger.info(f"  PHYSICS_PASS: {sig['symbol']} {sig['type']} "
-                               f"score={phy_score} accel={phy_diag.get('accel','?')} "
-                               f"wave={phy_diag.get('wave_risk','?')}")
             # ---- v10.4: IV + DTE hard gate (0% WR when IV crushed near expiry) ----
             if sig.get('dte', 5) <= 1 and g and g.get('iv', 0) > 0:
                 if g['iv'] < IV_MIN_FOR_DTE0 and sig.get('dte', 5) == 0:
@@ -4287,46 +3691,23 @@ class PaperTrader:
             real_ltp = None
             opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
 
-            # Source 1: Zerodha Kite LTP (primary)
-            if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
-                try:
-                    zd_ltp = self.zerodha.get_option_ltp(sig['symbol'], sig['strike'], opt_type)
-                    if zd_ltp and zd_ltp > 0:
-                        real_ltp = zd_ltp
-                        logger.info(f"  ZERODHA_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
-                                   f"LTP={real_ltp:.2f} [Zerodha]")
-                except Exception as e:
-                    logger.debug(f"[Zerodha] Entry LTP failed for {sig['symbol']}: {e}")
+            # Source 1: Pipeline chain LTP from NSE/BSE website (most reliable)
+            try:
+                if self.market_pipeline:
+                    chain = self.market_pipeline.get_option_chain(sig['symbol'])
+                    if chain:
+                        contracts = chain.get(opt_type, [])
+                        for c in contracts:
+                            if c.get('strike') == sig['strike'] and c.get('ltp', 0) > 0:
+                                real_ltp = c['ltp']
+                                entry_oi = float(c.get('oi', 0) or 0)
+                                logger.info(f"  PIPELINE_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
+                                           f"LTP={real_ltp:.2f} OI={entry_oi} (from NSE/BSE chain)")
+                                break
+            except Exception as e:
+                logger.debug(f"  Pipeline chain lookup failed for {sig['symbol']}: {e}")
 
-            # Source 2: TrueData LTP (secondary)
-            if not real_ltp and self.truedata and self.truedata.is_connected:
-                try:
-                    td_ltp = self.truedata.get_option_ltp(sig['symbol'], sig['strike'], opt_type)
-                    if td_ltp and td_ltp > 0:
-                        real_ltp = td_ltp
-                        logger.info(f"  TRUEDATA_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
-                                   f"LTP={real_ltp:.2f} [TrueData]")
-                except Exception as e:
-                    logger.debug(f"[TrueData] Entry LTP failed for {sig['symbol']}: {e}")
-
-            # Source 3: Pipeline chain LTP from NSE/BSE website
-            if not real_ltp:
-                try:
-                    if self.market_pipeline:
-                        chain = self.market_pipeline.get_option_chain(sig['symbol'])
-                        if chain:
-                            contracts = chain.get(opt_type, [])
-                            for c in contracts:
-                                if c.get('strike') == sig['strike'] and c.get('ltp', 0) > 0:
-                                    real_ltp = c['ltp']
-                                    entry_oi = float(c.get('oi', 0) or 0)
-                                    logger.info(f"  PIPELINE_LTP: {sig['symbol']} {sig['strike']}{opt_type} "
-                                               f"LTP={real_ltp:.2f} OI={entry_oi} (from NSE/BSE chain)")
-                                    break
-                except Exception as e:
-                    logger.debug(f"  Pipeline chain lookup failed for {sig['symbol']}: {e}")
-
-            # Source 3: Angel API (fallback if TrueData + pipeline didn't have LTP)
+            # Source 2: Angel API (fallback if pipeline didn't have LTP)
             try:
                 expiry = self._get_nearest_expiry(sig['symbol'])
                 if expiry:
@@ -4404,22 +3785,6 @@ class PaperTrader:
                            f"BS={bs_premium:.2f} → Market={real_ltp:.2f} "
                            f"Target={sig['target']:.2f} SL={sig['sl']:.2f}")
 
-            # v14.0: Trade Intelligence entry filter
-            if hasattr(self, 'trade_intel'):
-                ti_allowed, ti_reason, ti_quality = self.trade_intel.should_enter(
-                    sig, existing_positions=self.portfolio.positions
-                )
-                if not ti_allowed:
-                    logger.info(f"  TI_BLOCK: {sig.get('symbol','')} {sig.get('type','')} \u2014 {ti_reason}")
-                    skipped += 1
-                    continue
-                logger.info(f"  TI_PASS: {sig.get('symbol','')} {sig.get('type','')} \u2014 {ti_reason}")
-
-# v13.1: Liquidity Sweep sizing — Q<60: 1 lot (min), Q>=60: full tier
-            if sig.get('_sweep_half_lot'):
-                sig['_lot_tier'] = 'BASE'  # 1 lot only for lower quality sweeps
-                logger.info(f"  SWEEP_MIN_LOT: {sig.get('symbol','')} Q={sig.get('_sweep_quality',0)} < 60 -- 1 lot")
-
             result = self.portfolio.add_signal(
                 strategy=sig['strategy'],
                 symbol=sig['symbol'],
@@ -4441,7 +3806,6 @@ class PaperTrader:
                     'quality_score': sig.get('quality_score', 0),  # v2.5: FIX — was missing! Enables dynamic lots
                     'expiry': expiry,  # v9.1: Store expiry for dashboard display
                     'dci': dci,  # v10.4: Direction Confidence Index at entry
-                    'calculus': sig.get('_calculus', {}),  # v13.0: Calculus momentum/VWAP at entry
                     'entry_iv': g.get('iv', 0),  # v10.4: IV at entry for BREAKOUT_FAIL scaling
                     'entry_regime': self.regime_detector.get_regime(sig['symbol']) if hasattr(self, 'regime_detector') else 'UNKNOWN',  # v10.4
                     'lot_tier': sig.get('_lot_tier', 'BASE'),  # v10.4: DCI-based lot tier
@@ -4454,28 +3818,6 @@ class PaperTrader:
                 continue
             executed += 1
             self.daily_trade_count += 1
-
-            # v14.0: Register position with Trade Intelligence
-            if hasattr(self, 'trade_intel'):
-                try:
-                    self.trade_intel.register_position(
-                        pos_id=result['id'] if isinstance(result, dict) else str(result),
-                        entry_premium=sig['premium'],
-                        target=sig.get('target', sig['premium'] * 1.5),
-                        sl=sig.get('sl', sig['premium'] * 0.5),
-                        lot_size=sig.get('lot_size', 65),
-                        num_lots=sig.get('num_lots', 1),
-                        is_buy='BUY' in sig.get('type', sig.get('signal_type', 'BUY')),
-                        symbol=sig.get('symbol', ''),
-                        strategy=sig.get('strategy', ''),
-                    )
-                except Exception as e:
-                    logger.debug(f"  TI register failed: {e}")
-
-            # v11: Track Trend Rider entry (max 1 per symbol per day)
-            if sig.get('is_trend_rider') or sig.get('strategy') == 'Trend Rider':
-                self._trend_rider_today[sig['symbol']] = datetime.now().strftime('%Y-%m-%d')
-                logger.info(f"  TREND_RIDER_ENTERED: {sig['symbol']} marked for today — no more TR entries")
 
             # Send Telegram notification
             try:
@@ -4966,7 +4308,6 @@ class PaperTrader:
                 continue
 
             symbol = pos['symbol']
-            details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
             spot = self.get_index_spot(symbol)
             if not spot:
                 continue
@@ -4975,19 +4316,13 @@ class PaperTrader:
             _last_refresh = pos.get('greeks_refreshed_at')
             _should_refresh = (_last_refresh is None or
                               (datetime.now() - datetime.fromisoformat(_last_refresh)).total_seconds() >= GREEKS_REFRESH_INTERVAL_SECONDS)
-            if _should_refresh and pos.get('strike'):
+            if _should_refresh and pos.get('strike') and pos.get('iv'):
                 try:
                     _opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
                     _elapsed_days = (datetime.now() - entry_time).total_seconds() / 86400
                     _T = max((pos.get('dte', 1) - _elapsed_days) / 365, 1e-6)
-                    # v11.2: Use live LTP for greeks instead of stale BS model
-                    _curr_prem_for_greeks = pos.get('current_premium', pos['entry_premium'])
-                    if _curr_prem_for_greeks > 0:
-                        _g = greeks_from_market_price(_curr_prem_for_greeks, spot, pos['strike'], _T, RISK_FREE_RATE, _opt_type)
-                    else:
-                        _iv = pos.get('iv', 0.15)
-                        _iv = _iv / 100 if _iv > 1 else _iv
-                        _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
+                    _iv = pos['iv'] / 100 if pos['iv'] > 1 else pos['iv']
+                    _g = bs_greeks(spot, pos['strike'], _T, RISK_FREE_RATE, _iv, _opt_type)
                     pos['delta'] = round(_g['delta'], 4)
                     pos['gamma'] = round(_g['gamma'], 6)
                     pos['theta'] = round(_g['theta'], 4)
@@ -5047,40 +4382,14 @@ class PaperTrader:
                 current_premium = real_option_ltp
                 premium_source = 'MARKET'
             else:
-                # v11.2: Fallback approximation — only for premium tracking, NOT for entry/exit decisions
+                # Fallback: delta+gamma+theta approximation
                 premium_delta = delta_val * spot_change + 0.5 * gamma_val * (spot_change ** 2)
                 theta_val = pos.get('theta', 0)
                 time_decay = theta_val * (hours_held / 24)
                 current_premium = max(pos['entry_premium'] + premium_delta + time_decay, 0.05)
                 premium_source = 'APPROX'
-                if hours_held > 0.5:  # Only warn after 30 min without live data
-                    logger.warning(f"  NO_LIVE_LTP: {pos['id']} using approx premium Rs {current_premium:.2f} "
-                                  f"(no market data for {hours_held:.1f}h)")
 
             self.portfolio.update_position(pos['id'], current_premium)
-
-            # v14.0: Trade Intelligence monitoring
-            if hasattr(self, 'trade_intel'):
-                try:
-                    ti_signal = self.trade_intel.update(pos['id'], current_premium)
-                    if ti_signal.action == 'EXIT':
-                        logger.info(f"  TI_EXIT: {pos['symbol']} {pos['id']} \u2014 {ti_signal.reason} "
-                                    f"P(win)={ti_signal.p_win:.0%} EV={ti_signal.ev:+.1%}")
-                        self._track_exit(pos, current_premium, f'TI_{ti_signal.reason}')
-                        continue
-                    elif ti_signal.action == 'TIGHTEN_SL' and ti_signal.new_sl:
-                        if ti_signal.new_sl > pos.get('trailing_sl', 0):
-                            old_tsl = pos.get('trailing_sl', 0)
-                            pos['trailing_sl'] = ti_signal.new_sl
-                            logger.info(f"  TI_TIGHTEN: {pos['symbol']} TSL {old_tsl:.1f} \u2192 {ti_signal.new_sl:.1f} "
-                                        f"({ti_signal.reason})")
-                    # Log status periodically (every ~30 readings = 5 min)
-                    elif hasattr(self.trade_intel, '_trackers') and pos['id'] in self.trade_intel._trackers:
-                        tracker = self.trade_intel._trackers[pos['id']]
-                        if hasattr(tracker, 'readings') and len(tracker.readings) % 30 == 0:
-                            logger.info(f"  TI_STATUS: {pos['symbol']} {ti_signal.reason}")
-                except Exception as e:
-                    logger.debug(f"  TI update error: {e}")
 
             # ---- v7.7: COMPUTE HOLD SCORE for signal-based exit decisions ----
             hold_score = 50  # Default moderate
@@ -5173,23 +4482,20 @@ class PaperTrader:
                         continue
 
             # ---- v10.1: BREAKOUT FAILURE DETECTION ----
-            # v11: Skip for Trend Rider — it has wide SL, no breakout check needed
             # v10.3: Regime-aware — disabled on TRENDING days to let winners run
             # v10.4: Regime-aware timer + IV extension + confidence gate
-            _skip_breakout_fail = (pos.get('strategy') == 'Trend Rider')
-            if not _skip_breakout_fail:
-                regime = self.regime_detector.get_regime(symbol)
-                regime_params = get_regime_params(regime)
-                # v10.4: Dynamic timer from regime params (was hardcoded 5 min)
-                bf_check_minutes = regime_params.get('breakout_fail_check_minutes', BREAKOUT_FAIL_CHECK_MINUTES)
-                bf_timer_secs = bf_check_minutes * 60
-                # v10.4: If entry IV > 40% (high vol), extend timer 50% — big moves take longer
-                entry_iv = details.get('entry_iv', 0) if isinstance(pos.get('details'), dict) else 0
-                if entry_iv > 0.40:
-                    bf_timer_secs = int(bf_timer_secs * 1.5)
-                # v10.4: Confidence gate — skip BREAKOUT_FAIL if regime not confident (< 60 data points)
-                regime_confident = self.regime_detector.is_regime_confident(symbol) if hasattr(self.regime_detector, 'is_regime_confident') else True
-            if not _skip_breakout_fail and regime_params['breakout_fail_enabled'] and regime_confident and GRACE_PERIOD_SECONDS < elapsed_secs <= bf_timer_secs:
+            regime = self.regime_detector.get_regime(symbol)
+            regime_params = get_regime_params(regime)
+            # v10.4: Dynamic timer from regime params (was hardcoded 5 min)
+            bf_check_minutes = regime_params.get('breakout_fail_check_minutes', BREAKOUT_FAIL_CHECK_MINUTES)
+            bf_timer_secs = bf_check_minutes * 60
+            # v10.4: If entry IV > 40% (high vol), extend timer 50% — big moves take longer
+            entry_iv = details.get('entry_iv', 0) if isinstance(pos.get('details'), dict) else 0
+            if entry_iv > 0.40:
+                bf_timer_secs = int(bf_timer_secs * 1.5)
+            # v10.4: Confidence gate — skip BREAKOUT_FAIL if regime not confident (< 60 data points)
+            regime_confident = self.regime_detector.is_regime_confident(symbol) if hasattr(self.regime_detector, 'is_regime_confident') else True
+            if regime_params['breakout_fail_enabled'] and regime_confident and GRACE_PERIOD_SECONDS < elapsed_secs <= bf_timer_secs:
                 entry_prem_bf = pos['entry_premium']
                 if entry_prem_bf > 0:
                     if not pos['is_sell']:
@@ -5202,7 +4508,7 @@ class PaperTrader:
                         drop_bf = (current_premium - entry_prem_bf) / entry_prem_bf * 100
 
                     # Rapid drop: exit + queue reverse
-                    if BREAKOUT_FAIL_REVERSE_ENABLED and drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
+                    if drop_bf > BREAKOUT_FAIL_REVERSE_DROP_PCT:
                         logger.info(f"  BREAKOUT_FAIL_REVERSE: {pos['id']} dropped {drop_bf:.1f}% in {int(elapsed_secs)}s")
                         self.portfolio.close_position(pos['id'], current_premium, 'BREAKOUT_FAIL_REVERSE')
                         self._track_exit(pos, 'BREAKOUT_FAIL_REVERSE')
@@ -5270,99 +4576,59 @@ class PaperTrader:
                                  if entry_prem > 0 else 0)
                 profit_from_entry = peak - entry_prem
 
-                # v11: TREND RIDER — Wide TSL (separate from standard phases)
-                is_trend_rider = pos.get('strategy') == 'Trend Rider'
-                if is_trend_rider:
-                    # Only start trailing after 35% gain, trail 28% from peak
-                    if peak_gain_pct >= TR_WIDE_TSL_TRIGGER_PCT:
-                        wide_tsl = round(peak * (1 - TR_WIDE_TSL_DISTANCE_PCT / 100), 2)
-                        if wide_tsl > (pos.get('trailing_sl') or 0):
-                            pos['trailing_sl'] = wide_tsl
-                            logger.info(f"  TSL_WIDE_TR: {pos['id']} peak={peak_gain_pct:.0f}% → "
-                                       f"SL Rs {wide_tsl:.2f} (28% from peak Rs {peak:.2f})")
-
-                    # Check trailing SL hit
-                    if pos.get('trailing_sl') and current_premium <= pos['trailing_sl']:
-                        logger.info(f"  WIDE_TSL_HIT: {pos['id']} premium {current_premium:.2f} <= "
-                                   f"TSL {pos['trailing_sl']:.2f} (Trend Rider)")
-                        self.portfolio.close_position(pos['id'], current_premium, 'WIDE_TSL_HIT')
-                        self._track_exit(pos, 'WIDE_TSL_HIT')
-                        try:
-                            from trade_notifier import notify_trade_exit
-                            lot_size = LOT_SIZES.get(symbol, 50)
-                            cap = entry_prem * lot_size
-                            notify_trade_exit(
-                                market="EQUITY", strategy=pos['strategy'],
-                                symbol=symbol, signal_type=pos['signal_type'],
-                                strike=pos['strike'], entry_price=entry_prem,
-                                exit_price=current_premium, entry_time=pos['timestamp'],
-                                pnl=pos.get('unrealized_pnl', 0), capital_used=cap,
-                                exit_reason='WIDE_TSL_HIT',
-                            )
-                        except Exception:
-                            pass
-                        continue
-
-                    # Trend Rider: skip standard TSL phases, go directly to target/SL/EOD checks
-                    # (handled by static target & SL below)
-
-                else:
-                    # ---- Standard strategies: TSL phases ----
-
-                    # v10.4: Phase 0 — Micro-gains protection (5%+ peaks that never reach Phase 1)
-                    if (peak_gain_pct >= TSL_MICRO_GAIN_PCT
-                            and elapsed_secs >= TSL_MICRO_MIN_HOLD_SECONDS
-                            and not pos.get('breakeven_locked')):
-                        # Set trailing SL = entry + 40% of peak gain (floor at entry - 2%)
-                        micro_sl = round(entry_prem + (profit_from_entry * (1 - TSL_MICRO_TRAIL_DISTANCE_PCT / 100)), 2)
-                        micro_sl = max(micro_sl, round(entry_prem * 0.98, 2))  # Floor: entry - 2%
-                        if micro_sl > (pos.get('trailing_sl') or 0):
-                            pos['trailing_sl'] = micro_sl
-                            logger.info(f"  TSL_MICRO: {pos['id']} peak={peak_gain_pct:.1f}% → SL Rs {micro_sl:.2f} "
-                                       f"(keeping {100-TSL_MICRO_TRAIL_DISTANCE_PCT}% of peak gain)")
+                # v10.4: Phase 0 — Micro-gains protection (5%+ peaks that never reach Phase 1)
+                if (peak_gain_pct >= TSL_MICRO_GAIN_PCT
+                        and elapsed_secs >= TSL_MICRO_MIN_HOLD_SECONDS
+                        and not pos.get('breakeven_locked')):
+                    # Set trailing SL = entry + 40% of peak gain (floor at entry - 2%)
+                    micro_sl = round(entry_prem + (profit_from_entry * (1 - TSL_MICRO_TRAIL_DISTANCE_PCT / 100)), 2)
+                    micro_sl = max(micro_sl, round(entry_prem * 0.98, 2))  # Floor: entry - 2%
+                    if micro_sl > (pos.get('trailing_sl') or 0):
+                        pos['trailing_sl'] = micro_sl
+                        logger.info(f"  TSL_MICRO: {pos['id']} peak={peak_gain_pct:.1f}% → SL Rs {micro_sl:.2f} "
+                                   f"(keeping {100-TSL_MICRO_TRAIL_DISTANCE_PCT}% of peak gain)")
 
                 # Phase 1: Lock breakeven when premium gains 15%+
-                if not is_trend_rider and peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
+                if peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT and not pos.get('breakeven_locked'):
                     pos['breakeven_locked'] = True
                     pos['trailing_sl'] = round(entry_prem * 1.03, 2)  # entry + 3% buffer
                     logger.info(f"  TSL_BREAKEVEN: {pos['id']} gained {peak_gain_pct:.0f}% → locked SL at Rs {pos['trailing_sl']:.2f}")
 
-                # v10.3: Regime-aware TSL distances (skip for Trend Rider — uses wide TSL above)
-                if not is_trend_rider:
-                    regime = self.regime_detector.get_regime(symbol)
-                    regime_params = get_regime_params(regime)
-                    r_trail_dist = regime_params['tsl_trail_distance_pct']
-                    r_tight_dist = regime_params['tsl_tight_distance_pct']
+                # v10.3: Regime-aware TSL distances
+                regime = self.regime_detector.get_regime(symbol)
+                regime_params = get_regime_params(regime)
+                r_trail_dist = regime_params['tsl_trail_distance_pct']
+                r_tight_dist = regime_params['tsl_tight_distance_pct']
 
-                    # Phase 3: Tight trail when premium gained 40%+ (regime-aware distance)
-                    if peak_gain_pct >= TSL_TIGHT_GAIN_PCT:
-                        new_trailing_sl = round(peak - (profit_from_entry * r_tight_dist / 100), 2)
-                        new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
-                        if new_trailing_sl > (pos.get('trailing_sl') or 0):
-                            pos['trailing_sl'] = new_trailing_sl
-                            logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
-                                       f"(peak={peak:.2f} +{peak_gain_pct:.0f}%, phase3, trail={r_tight_dist}%)")
+                # Phase 3: Tight trail when premium gained 40%+ (regime-aware distance)
+                if peak_gain_pct >= TSL_TIGHT_GAIN_PCT:
+                    new_trailing_sl = round(peak - (profit_from_entry * r_tight_dist / 100), 2)
+                    new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
+                    if new_trailing_sl > (pos.get('trailing_sl') or 0):
+                        pos['trailing_sl'] = new_trailing_sl
+                        logger.info(f"  TSL_TIGHT: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
+                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%, phase3, trail={r_tight_dist}%)")
 
-                    # Phase 2: Trail when premium gained 25%+ (regime-aware distance)
-                    elif peak_gain_pct >= TSL_TRAIL_GAIN_PCT:
-                        new_trailing_sl = round(peak - (profit_from_entry * r_trail_dist / 100), 2)
-                        new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
-                        if new_trailing_sl > (pos.get('trailing_sl') or 0):
-                            pos['trailing_sl'] = new_trailing_sl
-                            logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
-                                       f"(peak={peak:.2f} +{peak_gain_pct:.0f}%)")
+                # Phase 2: Trail when premium gained 25%+ (regime-aware distance)
+                elif peak_gain_pct >= TSL_TRAIL_GAIN_PCT:
+                    new_trailing_sl = round(peak - (profit_from_entry * r_trail_dist / 100), 2)
+                    new_trailing_sl = max(new_trailing_sl, pos.get('trailing_sl') or 0)
+                    if new_trailing_sl > (pos.get('trailing_sl') or 0):
+                        pos['trailing_sl'] = new_trailing_sl
+                        logger.info(f"  TSL_TRAIL: {pos['id']} SL→Rs {pos['trailing_sl']:.2f} "
+                                   f"(peak={peak:.2f} +{peak_gain_pct:.0f}%)")
 
-                    # v7.7: Signal-based TSL ratchet — if signals STRONG, raise TSL aggressively
-                    if (hold_score >= HOLD_SCORE_STRONG
-                            and peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT
-                            and pos.get('trailing_sl')):
-                        ratchet_tsl = round(current_premium * 0.85, 2)
-                        if ratchet_tsl > pos['trailing_sl']:
-                            old_tsl = pos['trailing_sl']
-                            pos['trailing_sl'] = ratchet_tsl
-                            logger.info(f"  SIGNAL_HOLD_RATCHET: {pos['id']} hold_score={hold_score} "
-                                       f"→ TSL Rs {old_tsl:.2f}→{ratchet_tsl:.2f} "
-                                       f"(85% of current Rs {current_premium:.2f})")
+                # v7.7: Signal-based TSL ratchet — if signals STRONG, raise TSL aggressively
+                if (hold_score >= HOLD_SCORE_STRONG
+                        and peak_gain_pct >= TSL_BREAKEVEN_GAIN_PCT
+                        and pos.get('trailing_sl')):
+                    ratchet_tsl = round(current_premium * 0.85, 2)
+                    if ratchet_tsl > pos['trailing_sl']:
+                        old_tsl = pos['trailing_sl']
+                        pos['trailing_sl'] = ratchet_tsl
+                        logger.info(f"  SIGNAL_HOLD_RATCHET: {pos['id']} hold_score={hold_score} "
+                                   f"→ TSL Rs {old_tsl:.2f}→{ratchet_tsl:.2f} "
+                                   f"(85% of current Rs {current_premium:.2f})")
 
                 # Check trailing SL hit (BUY: premium drops below trailing SL)
                 if pos.get('trailing_sl') and current_premium <= pos['trailing_sl']:
@@ -5558,27 +4824,6 @@ class PaperTrader:
 
             exit_reason = None
 
-            # ---- v13.8: MOMENTUM EXIT — spot reverses against direction ----
-            if MOMENTUM_EXIT_ENABLED and exit_reason is None:
-                _me_entry_spot = pos.get('details', {}).get('spot', 0) if isinstance(pos.get('details'), dict) else 0
-                _me_spot_now = spot  # Already computed above in exit loop
-                _me_entry_ts = pos.get('timestamp', '')
-                if _me_entry_spot > 0 and _me_spot_now > 0 and _me_entry_ts:
-                    try:
-                        _me_entry_dt = datetime.fromisoformat(_me_entry_ts)
-                        _me_hold_min = (datetime.now() - _me_entry_dt).total_seconds() / 60
-                        if _me_hold_min >= MOMENTUM_EXIT_MIN_MINUTES:
-                            _me_change = (_me_spot_now - _me_entry_spot) / _me_entry_spot * 100
-                            _me_is_ce = 'CE' in pos.get('signal_type', '')
-                            _me_against = (_me_is_ce and _me_change < -MOMENTUM_EXIT_SPOT_PCT) or                                           (not _me_is_ce and _me_change > MOMENTUM_EXIT_SPOT_PCT)
-                            if _me_against and pos.get('unrealized_pnl', 0) <= 0:
-                                exit_reason = 'MOMENTUM_EXIT'
-                                logger.info(f"  MOMENTUM_EXIT: {pos['id']} spot {_me_entry_spot:.0f}->{_me_spot_now:.0f} "
-                                           f"({_me_change:+.2f}%) after {_me_hold_min:.0f}min")
-                    except Exception:
-                        pass
-
-
             if not pos['is_sell']:
                 # BUY positions
                 if current_premium <= sl:
@@ -5697,17 +4942,12 @@ class PaperTrader:
         }
 
     def run_once(self):
-        """Run one scan cycle (every 1 second in v15)."""
+        """Run one scan cycle."""
         signals = self.scan_all_strategies()
         self.execute_paper_signals(signals)
         self.check_exits()
-        # v15: Full status only every 60s, signals log only when signals exist
-        if (time.time() - self._last_full_log_time) < self._full_log_interval:
-            pass  # skip verbose status on tick cycles
-        else:
-            self.portfolio.print_status()
-        if signals:
-            self.save_signals_log(signals)
+        self.portfolio.print_status()
+        self.save_signals_log(signals)
 
     def save_signals_log(self, signals):
         """Save ALL signals to CSV with full data for future backtests.
@@ -5779,18 +5019,14 @@ class PaperTrader:
         df.to_csv(log_file, index=False)
         logger.info(f"  Signals logged ({len(rows)} rows): {log_file}")
 
-    def run_continuous(self, interval_seconds=1):
-        """Run continuous scanning during market hours.
-        v15: Reduced from 5 min (300s) to 1 second for tick-by-tick responsiveness.
-        All heavy API calls are cache-protected (OHLC 60s, VIX 120s, PCR 60s).
-        """
+    def run_continuous(self, interval_minutes=5):
+        """Run continuous scanning during market hours."""
         self._running = True
         logger.info(f"\n{'='*70}")
-        logger.info("PAPER TRADING SYSTEM STARTED (v15 — TICK-BY-TICK)")
-        logger.info(f"Scanning every {interval_seconds} second(s) during market hours")
+        logger.info("PAPER TRADING SYSTEM STARTED")
+        logger.info(f"Scanning every {interval_minutes} minutes during market hours")
         logger.info(f"Capital: Rs {self.portfolio.capital:,.0f}")
-        logger.info(f"Greeks refresh: every 10s | Option LTP cache: 5s | PCR cache: 60s")
-        logger.info(f"Strategies: CPR, Gamma Blast, Ghost Zone, PCR+VWAP")
+        logger.info(f"Strategies: CPR (88%), Gamma Blast (9.4%), Ghost Zone (2.7%)")
         logger.info(f"Indices: NIFTY, BANKNIFTY, SENSEX")
         logger.info(f"{'='*70}\n")
 
@@ -5804,10 +5040,7 @@ class PaperTrader:
             now = datetime.now().time()
 
             if PRE_MARKET <= now <= MARKET_CLOSE:
-                try:
-                    self.run_once()
-                except Exception as e:
-                    logger.error(f"  SCAN_ERROR: {e}")
+                self.run_once()
             elif now > MARKET_CLOSE:
                 logger.info("Market closed. Final status:")
                 self.portfolio.print_status()
@@ -5822,7 +5055,7 @@ class PaperTrader:
                     time.sleep(min(wait, 300))
                     continue
 
-            time.sleep(interval_seconds)
+            time.sleep(interval_minutes * 60)
 
     def _save_daily_report(self):
         """Save end-of-day report."""
@@ -5873,7 +5106,7 @@ def main():
     parser = argparse.ArgumentParser(description='Paper Trading System')
     parser.add_argument('--status', action='store_true', help='Show current status')
     parser.add_argument('--once', action='store_true', help='Run single scan (no loop)')
-    parser.add_argument('--interval', type=int, default=1, help='Scan interval in seconds (v15: default 1s, was 5 min)')
+    parser.add_argument('--interval', type=int, default=5, help='Scan interval (minutes)')
     parser.add_argument('--offline', action='store_true', help='Run offline (no API, use historical)')
     parser.add_argument('--reset', action='store_true', help='Reset paper portfolio')
     args = parser.parse_args()
@@ -5910,7 +5143,7 @@ def main():
         if args.once:
             trader.run_once()
         else:
-            trader.run_continuous(interval_seconds=args.interval)
+            trader.run_continuous(args.interval)
     else:
         logger.warning("Angel API connection failed. Running in offline mode...")
         trader.run_once()
