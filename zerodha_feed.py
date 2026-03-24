@@ -601,6 +601,49 @@ class ZerodhaFeed:
             logger.debug(f"[Zerodha] Historical data failed for {symbol}: {e}")
             return []
 
+
+    def get_option_historical(self, symbol, strike, opt_type, expiry_dt=None, interval="day", days=2):
+        """Get historical OHLCV for a specific option contract."""
+        if not self._connected:
+            return []
+        try:
+            cfg = {**INDEX_MAP, **MCX_MAP}.get(symbol)
+            if not cfg:
+                return []
+            exchange = cfg.get("opt_exchange", "NFO")
+            name = cfg.get("opt_prefix", symbol)
+            if expiry_dt is None:
+                from datetime import date as _date
+                today = _date.today()
+                dow = today.weekday()
+                if symbol == "BANKNIFTY":
+                    exp_dow = 2
+                elif symbol == "SENSEX":
+                    exp_dow = 0
+                else:
+                    exp_dow = 3
+                days_ahead = (exp_dow - dow) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+                expiry_dt = today + __import__("datetime").timedelta(days=days_ahead)
+            inst = self._find_option_instrument(exchange, name, strike, opt_type, expiry_dt)
+            if not inst:
+                return []
+            key = f"{exchange}:{inst}"
+            token = None
+            with self._lock:
+                if key in self._inst_lookup:
+                    token = self._inst_lookup[key]
+            if not token:
+                return []
+            from_date = __import__("datetime").datetime.now() - __import__("datetime").timedelta(days=days)
+            to_date = __import__("datetime").datetime.now()
+            candles = self.kite.historical_data(token, from_date, to_date, interval)
+            return candles
+        except Exception as e:
+            logger.debug(f"[Zerodha] Option historical failed {symbol} {strike} {opt_type}: {e}")
+            return []
+
     # ─── Properties ───────────────────────────────────────────────────────────
 
     @property

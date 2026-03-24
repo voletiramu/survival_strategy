@@ -27,6 +27,8 @@ import threading
 import logging
 from datetime import datetime, timedelta, time as dtime
 from collections import defaultdict
+from oi_velocity_tracker import OIVelocityTracker, make_gamma_blast_signal
+from option_premium_cpr import OptionPremiumCPR
 
 import numpy as np
 import pandas as pd
@@ -54,6 +56,11 @@ BROKERAGE = 20
 STT_SELL = 0.000625
 EXCHANGE_CHARGES = 0.0005
 GST_RATE = 0.18
+# Wave Extractor v3 constants (v17)
+WAVE_GAP_PTS = {"NIFTY": 75, "BANKNIFTY": 150, "SENSEX": 300}
+WAVE_VWAP_FILTER = {"NIFTY": True, "BANKNIFTY": False, "SENSEX": True}
+WAVE_SL_MULT = {"NIFTY": 0.70, "BANKNIFTY": 0.65, "SENSEX": 0.55}
+WAVE_TARGET_MULT = 1.40
 
 # ====================================================================
 # CAPITAL ALLOCATION & RISK MANAGEMENT
@@ -78,7 +85,8 @@ STRATEGY_ALLOCATION = {
     'CPR':          0.25,    # 25% target — solid 65% WR, consistent
     'Gamma Blast':  0.30,    # 30% target — best risk-adjusted (Sharpe 4.42)
     'Ghost Zone':   0.15,    # 15% target — v7 institutional methodology
-    'PCR+VWAP':     0.10,    # 10% target — needs live OI data to prove
+    'PCR+VWAP':     0.10,
+    'Wave':         0.20,    # v17: Wave Extractor v3    # 10% target — needs live OI data to prove
     'Trend Rider':  0.20,    # 20% target
     'Liquidity Sweep': 0.15,  # 15% target — SL hunt reversal (PF 2.95, WR 78%) — NEW: trend day riding (PF 5.56 in backtest)
     # 'Survivor':   0.00,    # HALTED — needs Rs 1L+ per symbol
@@ -198,7 +206,7 @@ TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 # v13.0: Breakout Failure Detection — RELAXED to prevent premature exits
 # Data shows BREAKOUT_FAIL_REVERSE lost Rs -8,632 across 8 trades (0% WR on reverses)
 # Problem: 3-5 min exits + wrong-direction reversals destroy PnL
-BREAKOUT_FAIL_CHECK_MINUTES = 20       # v13: Extended from 15 min — give trades time to develop
+BREAKOUT_FAIL_CHECK_MINUTES = 9999  # v16.1: DISABLED — cost Rs -34K across 25 exits (24% WR)       # v13: Extended from 15 min — give trades time to develop
 BREAKOUT_FAIL_MIN_GAIN_PCT = 1        # v13: Reduced from 2% — don't exit nearly-flat positions
 BREAKOUT_FAIL_REVERSE_DROP_PCT = 25   # v13: Increased from 15% — only reverse on severe failures
 BREAKOUT_FAIL_REVERSE_ENABLED = False
@@ -216,7 +224,7 @@ ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
 # v13.3: Momentum reversal exit
 # If spot moves 0.4% AGAINST trade direction after 20min, exit
 # Simulation: saves Rs +6,974, hurts ZERO winning trades
-MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_EXIT_ENABLED = False  # v16.2: DISABLED — 0% WR, Rs -9,559 lost across 4 trades
 MOMENTUM_EXIT_SPOT_PCT = 0.4
 MOMENTUM_EXIT_MIN_MINUTES = 20
 
@@ -248,7 +256,7 @@ MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 PRE_MARKET = dtime(9, 0)
 LAST_ENTRY_TIME = dtime(14, 30)  # v2.5.2: No new entries after 2:30 PM (need 50 min to develop)
-EQUITY_FIRST_TRADE_TIME = dtime(9, 30)  # v8.0: No trades before 09:30 — first 15 min inflated premiums/OI spikes
+EQUITY_FIRST_TRADE_TIME = dtime(9, 16)  # v16.1: Changed from 09:30 to 09:16 — 9AM hour has 59% WR (best) — first 15 min inflated premiums/OI spikes
 
 # Angel API config
 ANGEL_CRED_FILE = os.environ.get('ANGEL_CRED_FILE', r"C:\Users\Ram\Data\Angel\ANGEL_API_KEY=your_api_key.txt")
@@ -732,6 +740,127 @@ def compute_hold_score(pos, spot, indicators, current_oi=None, current_iv=None):
 # ====================================================================
 # ANGEL API CONNECTION
 # ====================================================================
+
+# v16: 14 ML features for future ML Oracle training
+
+# v16: Signal Strength Score (0-100) — LOGGING ONLY
+# Combines quality_score + Greeks + regime + VIX + OI + data source
+def compute_signal_strength(sig, spot, indicators, vix=None, ltp_source='UNKNOWN'):
+    """Compute signal strength 0-100 and label. For logging/analysis only."""
+    try:
+        greeks = sig.get('greeks', {})
+        q_score = sig.get('quality_score', 0)
+
+        # 1. Quality Score (40% weight, max 40 points)
+        q_pts = min(40, q_score * 0.4)
+
+        # 2. Greeks Quality (15% weight, max 15 points)
+        delta = abs(greeks.get('delta', sig.get('delta', 0)))
+        gamma = abs(greeks.get('gamma', sig.get('gamma', 0)))
+        g_pts = 0
+        if 0.35 <= delta <= 0.65:
+            g_pts += 8  # delta in sweet spot
+        elif 0.25 <= delta <= 0.75:
+            g_pts += 4
+        if gamma > 0.001:
+            g_pts += 7  # meaningful gamma
+        elif gamma > 0.0005:
+            g_pts += 3
+
+        # 3. Regime Score (15% weight, max 15 points)
+        eff = 0
+        if indicators:
+            eff = indicators.get('efficiency', 0)
+            if isinstance(eff, (int, float)) and eff > 1:
+                eff = eff / 100
+        r_pts = min(15, eff * 30) if eff > 0 else 5  # trending = higher score
+
+        # 4. VIX Alignment (10% weight, max 10 points)
+        v_pts = 5  # default neutral
+        if vix:
+            if 14 <= vix <= 28:
+                v_pts = 10  # ideal range
+            elif 11 <= vix <= 35:
+                v_pts = 6   # acceptable
+            else:
+                v_pts = 2   # extreme VIX
+
+        # 5. OI Confirmation (10% weight, max 10 points)
+        oi = sig.get('oi', 0)
+        oi_pts = 5  # default
+        if oi and oi > 1000:
+            oi_pts = 10  # good OI = liquid
+        elif oi and oi > 100:
+            oi_pts = 7
+
+        # 6. Data Source Quality (10% weight, max 10 points)
+        source_scores = {
+            'ZERODHA': 10,
+            'TRUEDATA': 8,
+            'NSE_PIPELINE': 6,
+            'ANGEL': 4,
+            'UNKNOWN': 3,
+        }
+        s_pts = source_scores.get(ltp_source, 3)
+
+        # Total
+        strength = int(q_pts + g_pts + r_pts + v_pts + oi_pts + s_pts)
+        strength = max(0, min(100, strength))
+
+        # Label
+        if strength >= 80:
+            label = 'ELITE'
+        elif strength >= 60:
+            label = 'STRONG'
+        elif strength >= 50:
+            label = 'MODERATE'
+        else:
+            label = 'WEAK'
+
+        return strength, label
+    except Exception:
+        return 0, 'UNKNOWN'
+
+
+def compute_ml_features(sig, ohlc, spot, indicators, vix=None):
+    """Compute 14 ML features for signal logging."""
+    f = {}
+    try:
+        greeks = sig.get('greeks', {})
+        atr = indicators.get('atr', 1) if indicators else 1
+        f['ml_cpr_width_pct'] = indicators.get('cpr_width', 0) if indicators else 0
+        day_open = ohlc.get('open', spot) if ohlc else spot
+        f['ml_body_atr_ratio'] = abs(spot - day_open) / atr if atr > 0 else 0
+        f['ml_pcr_shift'] = indicators.get('pcr_shift', 0) if indicators else 0
+        f['ml_efficiency_ratio'] = indicators.get('efficiency', 0.5) if indicators else 0.5
+        f['ml_gamma'] = abs(greeks.get('gamma', sig.get('gamma', 0)))
+        f['ml_delta'] = abs(greeks.get('delta', sig.get('delta', 0)))
+        theta = abs(greeks.get('theta', sig.get('theta', 0)))
+        dte = sig.get('dte', 1) or 1
+        f['ml_theta_burden'] = theta * dte
+        f['ml_vix_level'] = vix if vix else 0
+        eff = f['ml_efficiency_ratio']
+        body_ratio = min(1.0, f['ml_body_atr_ratio'])
+        f['ml_regime_score'] = 0.6 * body_ratio + 0.4 * eff
+        f['ml_oi_change_15m'] = indicators.get('oi_change', 0) if indicators else 0
+        iv = greeks.get('iv', sig.get('iv', 0))
+        if isinstance(iv, (int, float)) and iv > 0:
+            if iv > 1: iv = iv / 100
+            f['ml_iv_rank'] = min(100, max(0, iv * 200))
+        else:
+            f['ml_iv_rank'] = 50
+        atr_ref = {'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
+                    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409}
+        sym_atr = atr_ref.get(sig.get('symbol', ''), atr)
+        f['ml_hold_score'] = (sym_atr / (0.01 * spot) * 60) if spot > 0 else 60
+        strat_map = {'CPR': 0, 'Gamma Blast': 1, 'Ghost Zone': 2,
+                      'PCR+VWAP': 3, 'Trend Rider': 4, 'Liquidity Sweep': 5}
+        f['ml_strategy_id'] = strat_map.get(sig.get('strategy', ''), 6)
+        f['ml_gamma_blast_strength'] = f['ml_gamma'] * f['ml_body_atr_ratio']
+    except Exception:
+        pass
+    return f
+
 class AngelConnection:
     """Manages Angel One SmartAPI connection."""
 
@@ -949,12 +1078,14 @@ class AngelConnection:
             err_msg = str(data.get('message', '')) if data else ''
             if 'AB9019' in err_code:
                 logger.debug(f"Greeks: No data for {name} expiry {expiry_date} (AB9019)")
-                try:
-                    from trade_notifier import notify_api_error
-                    notify_api_error('EQUITY', 'optionGreek', 'AB9019',
-                                    f"{name} expiry {expiry_date}: {err_msg}")
-                except Exception:
-                    pass
+                # v16.2: Suppress AB9019 alert for SENSEX (Angel BFO not supported, Zerodha handles it)
+                if name != 'SENSEX':
+                    try:
+                        from trade_notifier import notify_api_error
+                        notify_api_error('EQUITY', 'optionGreek', 'AB9019',
+                                        f"{name} expiry {expiry_date}: {err_msg}")
+                    except Exception:
+                        pass
             elif 'AB1004' in err_code:
                 self._handle_rate_limit(f"optionGreek {name}")
         except Exception as e:
@@ -1555,6 +1686,9 @@ class PaperPortfolio:
             'signal_type': signal_type,
             'strike': strike,
             'entry_premium': round(entry_premium, 2),
+                'ltp_source': (details or {}).get('ltp_source', 'UNKNOWN'),
+                'signal_strength': (details or {}).get('signal_strength', 0),
+                'strength_label': (details or {}).get('strength_label', 'UNKNOWN'),
             'current_premium': round(entry_premium, 2),
             'lot_size': lot_size,
             'num_lots': num_lots,  # v2.4: How many exchange lots
@@ -1567,6 +1701,8 @@ class PaperPortfolio:
             'dte': dte,
             'unrealized_pnl': 0,
             'status': 'OPEN',
+            'quality_score': (details or {}).get('quality_score', 0),
+            'reason': (details or {}).get('reason', ''),
             # OI+IV tracking for dynamic exits
             'entry_oi': oi,
             'entry_iv': round(iv * 100, 1),
@@ -1708,6 +1844,7 @@ class StrategyEngine:
         self.market_pipeline = None  # v9.6d: Set by PaperTrader if available
         self.zerodha = None   # v12.0: Set by PaperTrader if available
         self.truedata = None  # v11.2: Set by PaperTrader if available
+        self.oi_tracker = OIVelocityTracker()  # v17: OI velocity Gamma Blast
 
     def load_historical(self, symbol):
         """Load historical data for indicators. Auto-download if missing/stale."""
@@ -2247,7 +2384,9 @@ class StrategyEngine:
                             'ltp': zd_best['ltp'],
                             'iv': zd_best.get('iv', 0),
                             'time': now,
+                            'source': 'ZERODHA',
                         }
+                        self._last_ltp_source = 'ZERODHA'
                         logger.info(f"  ZERODHA_STRIKE: {symbol} {opt_type} "
                                    f"strike={zd_best['strike']} LTP={zd_best['ltp']:.2f} "
                                    f"IV={zd_best.get('iv', 0)*100:.1f}% [Zerodha]")
@@ -2281,7 +2420,9 @@ class StrategyEngine:
                             'ltp': td_best['ltp'],
                             'iv': td_best.get('iv', 0),
                             'time': now,
+                            'source': 'TRUEDATA',
                         }
+                        self._last_ltp_source = 'TRUEDATA'
                         logger.info(f"  TRUEDATA_STRIKE: {symbol} {opt_type} "
                                    f"strike={td_best['strike']} LTP={td_best['ltp']:.2f} "
                                    f"IV={td_best.get('iv', 0)*100:.1f}% [TrueData]")
@@ -2317,7 +2458,9 @@ class StrategyEngine:
                             'ltp': best['ltp'],
                             'iv': best.get('iv', 0),
                             'time': now,
+                            'source': 'NSE_PIPELINE',
                         }
+                        self._last_ltp_source = 'NSE_PIPELINE'
                         logger.info(f"  PIPELINE_STRIKE: {symbol} {opt_type} "
                                    f"strike={best['strike']} LTP={best['ltp']:.2f} (from NSE/BSE chain)")
                         return best['strike'], best['ltp'], best.get('iv', 0)
@@ -2509,102 +2652,172 @@ class StrategyEngine:
         return signals
 
     def check_gamma_blast_signals(self, symbol, spot, ohlc, indicators, dow, dte):
-        """Gamma Blast - all days mode (paper trading test).
+        """Gamma Blast v17 - OI Velocity based (replaces price-action breakout).
 
-        v7.4: Relaxed coiled spring filter from 1.5 to 2.0 for high-value indices
-        (SENSEX/BANKNIFTY). Added logging for filter rejections.
+        Detects sudden OI surges at ATM+-2 strikes as leading indicator.
+        Based on Raahi Bhushan article + backtest optimization.
+        Backtest: NIFTY 80% WR, PF 4.58, +16.5% return.
         """
         signals = []
-        ind = indicators
 
-        # Calculate actual DTE to next expiry for IV/target adjustment
-        if symbol == 'BANKNIFTY':
-            days_to_expiry = (2 - dow) % 7  # Days to Wednesday
-        else:
-            days_to_expiry = (3 - dow) % 7  # Days to Thursday
-        days_to_expiry = max(days_to_expiry, 1)
-        is_expiry_day = (days_to_expiry == 7 or days_to_expiry == 0 or
-                         (symbol == 'BANKNIFTY' and dow == 2) or
-                         (symbol != 'BANKNIFTY' and dow == 3))
+        # Fetch option chain OI if enough time has passed
+        if self.oi_tracker.should_fetch(symbol):
+            chain = None
+            # Source 1: Zerodha
+            if self.zerodha:
+                try:
+                    chain = self.zerodha.get_option_chain(symbol)
+                except Exception as e:
+                    logger.debug(f"  OI_FETCH: Zerodha failed for {symbol}: {e}")
+            # Source 2: TrueData
+            if chain is None and self.truedata:
+                try:
+                    chain = self.truedata.get_option_chain(symbol)
+                except Exception as e:
+                    logger.debug(f"  OI_FETCH: TrueData failed for {symbol}: {e}")
+            # Source 3: Market Pipeline
+            if chain is None and self.market_pipeline:
+                try:
+                    chain = self.market_pipeline.get_option_chain(symbol)
+                except Exception as e:
+                    logger.debug(f"  OI_FETCH: Pipeline failed for {symbol}: {e}")
 
-        T = max(dte, days_to_expiry) / 365 if not is_expiry_day else 1 / 365
+            if chain:
+                self.oi_tracker.update_oi(symbol, spot, chain)
+                logger.debug(f"  {self.oi_tracker.get_status(symbol)}")
 
-        # IV multiplier: higher on expiry day (gamma spike), lower further out
-        iv_mult = 1.3 if is_expiry_day else max(1.0, 1.3 - days_to_expiry * 0.08)
-
-        # v7.5: Realistic intraday option targets
-        # Expiry day gamma spike can give 50-80% gains, but 150%+ is rare
-        if is_expiry_day:
-            target_mult = 1.6   # v7.5: Was 2.5 — too aggressive, rarely hit
-            sl_mult = 0.4       # v7.5: Was 0.3 — slightly wider SL for gamma moves
-        else:
-            target_mult = max(1.3, 1.5 - days_to_expiry * 0.05)  # v7.5: 1.3x-1.5x (was 2.0-2.5)
-            sl_mult = 0.5       # v7.5: 50% SL
-
-        # v7.4: Coiled spring filter — relaxed for high-value indices
-        # SENSEX/BANKNIFTY naturally have higher daily ranges
-        coiled_threshold = 2.0 if symbol in ('SENSEX', 'BANKNIFTY') else 1.5
-        if ind['prev_range'] > coiled_threshold:
-            logger.info(f"  GAMMA_SKIP: {symbol} prev_range={ind['prev_range']:.2f} > {coiled_threshold} (coiled spring)")
+        # Check cooldown
+        if self.oi_tracker.check_cooldown(symbol):
             return signals
 
-        atr = ind['atr']
-        body = spot - ohlc['open']
-        day_range = (ohlc['high'] - ohlc['low']) / max(atr, 1)
-
-        if day_range < 0.3:
+        # Check blast signal
+        blast = self.oi_tracker.check_blast(symbol, spot)
+        if blast["signal"] is None or blast["signal"] == "STRADDLE":
             return signals
 
-        day_label = "EXPIRY" if is_expiry_day else f"{days_to_expiry}DTE"
+        # Determine expiry info
+        if symbol == "BANKNIFTY":
+            days_to_expiry = (2 - dow) % 7
+        elif symbol == "SENSEX":
+            days_to_expiry = (0 - dow) % 7
+        else:
+            days_to_expiry = (3 - dow) % 7
+        is_expiry = (days_to_expiry == 0 or days_to_expiry == 7)
+        T = max(dte, days_to_expiry) / 365 if not is_expiry else 1 / 365
 
-        if abs(body) > atr * 0.15:
-            vwap = ind.get('vwap', 0)
-            if body > 0:  # Up breakout
-                # v10.1: VWAP confirmation for Gamma Blast CE
-                if vwap > 0 and spot < vwap:
-                    logger.info(f"  GAMMA_DIR_SKIP: {symbol} CE up body={body:.0f} but spot={spot:.0f}<VWAP={vwap:.0f}")
+        # Get ATM strike and live premium
+        opt_type = "CE" if blast["signal"] == "BUY_CE" else "PE"
+        strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, opt_type, dte)
+
+        if chain_ltp <= 0:
+            logger.info(f"  GAMMA_OI_NO_LTP: {symbol} {opt_type} strike={strike} - no live premium")
+            return signals
+
+        if chain_ltp < MIN_PREMIUM_BUY:
+            return signals
+
+        # Compute greeks
+        use_iv = chain_iv if chain_iv > 0 else indicators["iv"] * 1.3
+        if chain_iv > 0:
+            g = greeks_from_market_price(chain_ltp, spot, strike, T, RISK_FREE_RATE, opt_type)
+        else:
+            g = bs_greeks(spot, strike, T, RISK_FREE_RATE, use_iv, opt_type)
+
+        # Build signal
+        sig = make_gamma_blast_signal(blast, symbol, spot, strike, chain_ltp, g, dte, is_expiry)
+        if sig:
+            signals.append(sig)
+            self.oi_tracker.set_cooldown(symbol)
+            surge_pct = blast["ce_pct"] if opt_type == "CE" else blast["pe_pct"]
+            logger.info(f"  GAMMA_OI_SIGNAL: {symbol} {blast['signal']} "
+                       f"surge={surge_pct:.0%} strike={strike} prem={chain_ltp:.2f}")
+
+        # Periodic cleanup
+        self.oi_tracker.cleanup(symbol)
+
+        return signals
+
+
+    def check_wave_signals(self, symbol, spot, ohlc, indicators, dow, dte):
+        """Wave Extractor v3 - Gap-based entry with VWAP filter.
+
+        Backtest: +Rs 1,02,437 (+34.15%) in 42 days.
+        SENSEX star performer: PF 2.62, Rs 3K drawdown.
+        """
+        signals = []
+
+        gap = WAVE_GAP_PTS.get(symbol)
+        if gap is None:
+            return signals
+
+        use_vwap = WAVE_VWAP_FILTER.get(symbol, False)
+        sl_mult = WAVE_SL_MULT.get(symbol, 0.65)
+        target_mult = WAVE_TARGET_MULT
+
+        # Anchor: day open price (9:15-9:30 open)
+        anchor = ohlc.get('open', 0)
+        if anchor <= 0:
+            return signals
+
+        move = spot - anchor
+        vwap = indicators.get('vwap', 0)
+
+        # Determine expiry
+        if symbol == "BANKNIFTY":
+            days_to_expiry = (2 - dow) % 7
+        elif symbol == "SENSEX":
+            days_to_expiry = (0 - dow) % 7
+        else:
+            days_to_expiry = (3 - dow) % 7
+        is_expiry = (days_to_expiry == 0 or days_to_expiry == 7)
+        T = max(dte, days_to_expiry) / 365 if not is_expiry else 1 / 365
+        day_label = "EXPIRY" if is_expiry else f"{days_to_expiry}DTE"
+
+        if move >= gap:
+            # UP gap -> BUY CE
+            if use_vwap and vwap > 0 and spot < vwap:
+                logger.info(f"  WAVE_VWAP_SKIP: {symbol} CE spot={spot:.0f} < VWAP={vwap:.0f}")
+                return signals
+
+            strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
+            if chain_ltp > MIN_PREMIUM_BUY:
+                use_iv = chain_iv if chain_iv > 0 else indicators['iv'] * 1.3
+                if chain_iv > 0:
+                    g = greeks_from_market_price(chain_ltp, spot, strike, T, RISK_FREE_RATE, 'CE')
                 else:
-                    ce_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'CE', dte)
-                    if chain_ltp <= 0:
-                        logger.info(f"  GAMMA_NO_LTP: {symbol} CE strike={ce_strike} — no live premium, skipping")
-                    else:
-                        use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                        g = greeks_from_market_price(chain_ltp, spot, ce_strike, T, RISK_FREE_RATE, 'CE') if chain_iv > 0 else bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, use_iv, 'CE')
-                        premium = chain_ltp
-                        if premium > MIN_PREMIUM_BUY:
-                            signals.append({
-                                'type': 'BUY_CE_GAMMA',
-                                'strike': ce_strike,
-                                'premium': premium,
-                                'greeks': g,
-                                'reason': f"Gamma Blast [{day_label}]: Up breakout body={body:.0f} "
-                                          f"ATR={atr:.0f} range={day_range:.2f}x [LIVE]",
-                            'target': premium * target_mult,
-                            'sl': premium * sl_mult,
-                        })
-            else:  # Down breakout
-                # v10.1: VWAP confirmation for Gamma Blast PE
-                if vwap > 0 and spot > vwap:
-                    logger.info(f"  GAMMA_DIR_SKIP: {symbol} PE down body={body:.0f} but spot={spot:.0f}>VWAP={vwap:.0f}")
+                    g = bs_greeks(spot, strike, T, RISK_FREE_RATE, use_iv, 'CE')
+                signals.append({
+                    'type': 'BUY_CE_WAVE',
+                    'strike': strike,
+                    'premium': chain_ltp,
+                    'greeks': g,
+                    'reason': f"Wave v3 [{day_label}]: Up gap={move:.0f}pts (threshold={gap}) [LIVE]",
+                    'target': chain_ltp * target_mult,
+                    'sl': chain_ltp * sl_mult,
+                })
+
+        elif move <= -gap:
+            # DOWN gap -> BUY PE
+            if use_vwap and vwap > 0 and spot > vwap:
+                logger.info(f"  WAVE_VWAP_SKIP: {symbol} PE spot={spot:.0f} > VWAP={vwap:.0f}")
+                return signals
+
+            strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
+            if chain_ltp > MIN_PREMIUM_BUY:
+                use_iv = chain_iv if chain_iv > 0 else indicators['iv'] * 1.3
+                if chain_iv > 0:
+                    g = greeks_from_market_price(chain_ltp, spot, strike, T, RISK_FREE_RATE, 'PE')
                 else:
-                    pe_strike, chain_ltp, chain_iv = self._get_strike_from_chain(symbol, spot, 'PE', dte)
-                    if chain_ltp <= 0:
-                        logger.info(f"  GAMMA_NO_LTP: {symbol} PE strike={pe_strike} — no live premium, skipping")
-                    else:
-                        use_iv = chain_iv if chain_iv > 0 else ind['iv'] * iv_mult
-                        g = greeks_from_market_price(chain_ltp, spot, pe_strike, T, RISK_FREE_RATE, 'PE') if chain_iv > 0 else bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, use_iv, 'PE')
-                        premium = chain_ltp
-                        if premium > MIN_PREMIUM_BUY:
-                            signals.append({
-                                'type': 'BUY_PE_GAMMA',
-                                'strike': pe_strike,
-                                'premium': premium,
-                                'greeks': g,
-                                'reason': f"Gamma Blast [{day_label}]: Down breakout body={body:.0f} "
-                                          f"ATR={atr:.0f} range={day_range:.2f}x [LIVE]",
-                            'target': premium * target_mult,
-                            'sl': premium * sl_mult,
-                        })
+                    g = bs_greeks(spot, strike, T, RISK_FREE_RATE, use_iv, 'PE')
+                signals.append({
+                    'type': 'BUY_PE_WAVE',
+                    'strike': strike,
+                    'premium': chain_ltp,
+                    'greeks': g,
+                    'reason': f"Wave v3 [{day_label}]: Down gap={move:.0f}pts (threshold={gap}) [LIVE]",
+                    'target': chain_ltp * target_mult,
+                    'sl': chain_ltp * sl_mult,
+                })
 
         return signals
 
@@ -3081,6 +3294,26 @@ class StrategyEngine:
 # ====================================================================
 # MAIN PAPER TRADING LOOP
 # ====================================================================
+
+def auto_refresh_zerodha_token():
+    """Auto-regenerate Zerodha token if expired. Called when Zerodha auth fails."""
+    try:
+        import subprocess
+        logger.warning("[Zerodha] Token expired - auto-regenerating...")
+        result = subprocess.run(
+            ["python3", "/root/algo_trading/zerodha_token_gen.py"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and "Done" in result.stdout:
+            logger.info("[Zerodha] Token auto-regenerated successfully")
+            return True
+        else:
+            logger.error(f"[Zerodha] Token regen failed: {result.stderr[:200]}")
+            return False
+    except Exception as e:
+        logger.error(f"[Zerodha] Token auto-regen error: {e}")
+        return False
+
 class PaperTrader:
     """Main paper trading orchestrator."""
 
@@ -3089,6 +3322,8 @@ class PaperTrader:
         self.portfolio = PaperPortfolio()
         self.engine = StrategyEngine(self.angel, self.portfolio)
         self._running = False
+        self._wave_anchors = {}  # v17: {symbol: anchor_price} for Wave Extractor
+        self._wave_trade_count = defaultdict(int)  # v17: daily trade count per symbol
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
         self.market_pipeline = market_pipeline  # v9: Real-time NSE/BSE option chain pipeline
         self.engine.market_pipeline = market_pipeline  # v9.6d: Share pipeline with engine
@@ -3100,26 +3335,31 @@ class PaperTrader:
             if self.zerodha.connect():
                 self.engine.zerodha = self.zerodha
                 logger.info("[Zerodha] ✅ Initialized as Source 1 for option chain + LTP")
+                # v18: Option Premium CPR for WaveBC strategies
+                self.option_cpr = OptionPremiumCPR(self.zerodha)
+                logger.info('[OptionCPR] Initialized with Zerodha feed')
             else:
                 self.zerodha = None
+                # v16: Auto-refresh token on auth failure
+                if auto_refresh_zerodha_token():
+                    try:
+                        self.zerodha = ZerodhaFeed()
+                        if self.zerodha.connect():
+                            self.engine.zerodha = self.zerodha
+                            logger.info("[Zerodha] Reconnected after token refresh")
+                        else:
+                            self.zerodha = None
+                    except Exception:
+                        self.zerodha = None
                 logger.warning("[Zerodha] Connection failed — trying TrueData as Source 2")
         except Exception as e:
             logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
 
-        # v11.2: TrueData as Source 2 (fallback when Zerodha unavailable)
+        # v11.2: TrueData DISABLED (v17 - trial expired 2026-03-23)
+        # v17: TrueData disabled (trial expired 2026-03-23) — skip entirely
         self.truedata = None
-        try:
-            from truedata_feed import TrueDataFeed
-            self.truedata = TrueDataFeed()
-            if self.truedata.connect():
-                self.engine.truedata = self.truedata
-                src_num = "2" if self.zerodha else "1 (Zerodha unavailable)"
-                logger.info(f"[TrueData] Initialized as Source {src_num} for option chain + LTP")
-            else:
-                self.truedata = None
-                logger.warning("[TrueData] Connection failed — falling back to NSE/BSE + Angel")
-        except Exception as e:
-            logger.warning(f"[TrueData] Not available: {e} — falling back to NSE/BSE + Angel")
+        self.engine.truedata = None
+        if not hasattr(self, 'option_cpr'): self.option_cpr = OptionPremiumCPR(self.zerodha)
         self._index_tokens = {
             'NIFTY': {'exchange': 'NSE', 'token': '99926000'},
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
@@ -3156,6 +3396,19 @@ class PaperTrader:
         self.pending_reverses = {}      # v10.1: {symbol: {opt_type, spot, ...}} for breakout failure reversal
         self._vix_cache = {'value': None, 'time': None}
         self.current_vix = None
+        # v16.1: GIFT Nifty gap bias
+        self.gap_analysis = None
+        try:
+            from gift_nifty import load_gap_analysis
+            self.gap_analysis = load_gap_analysis()
+            if self.gap_analysis:
+                logger.info(f"[GiftNifty] Gap: {self.gap_analysis['direction']} "
+                           f"{self.gap_analysis['gap_pct']:+.2f}% | Bias: {self.gap_analysis['bias']} "
+                           f"| Lot mult: {self.gap_analysis['lot_multiplier']}x")
+            else:
+                logger.info("[GiftNifty] No pre-market data available")
+        except Exception as e:
+            logger.debug(f"[GiftNifty] Load failed: {e}")
         # v15: Two-tier logging for 1-second scan loop
         self._last_full_log_time = 0       # epoch timestamp
         self._full_log_interval = 60       # full indicator dump every 60 seconds
@@ -3463,6 +3716,14 @@ class PaperTrader:
         vix_mult = self.get_vix_multiplier()
         if vix and do_full_log:
             regime = "LOW" if vix < VIX_LOW_THRESHOLD else ("HIGH" if vix > VIX_HIGH_THRESHOLD else "NORMAL")
+            # v18: Compute Option Premium CPR levels at market open
+            if hasattr(self, 'option_cpr') and self.option_cpr and not hasattr(self, '_opcpr_computed'):
+                try:
+                    self.option_cpr.compute_all_levels()
+                    self._opcpr_computed = True
+                except Exception as e:
+                    logger.error('OPTION_CPR: Level computation failed: %s' % e)
+
             logger.info(f"  INDIA VIX: {vix:.2f} | Regime: {regime} | Filter multiplier: {vix_mult}x")
 
         # CRITICAL: Block trading outside market hours
@@ -3627,6 +3888,7 @@ class PaperTrader:
                 ('Gamma Blast', self.engine.check_gamma_blast_signals),
                 ('Ghost Zone', self.engine.check_ghost_zone_signals),
                 ('PCR+VWAP', self.engine.check_pcr_vwap_signals),
+                ('Wave', self.engine.check_wave_signals),
                 # ('Survivor', self.engine.check_survivor_signals),  # HALTED v7 — needs more capital
             ]
 
@@ -3645,6 +3907,59 @@ class PaperTrader:
                     logger.info(f"  SIGNAL [{strat_name}]: {sig['type']} "
                                f"Strike={sig['strike']:.0f} Premium=Rs {sig['premium']:.2f} "
                                f"| {sig['reason']}")
+
+
+            # v18: WaveBC strategies -- Option Premium CPR levels as entry/exit
+            if hasattr(self, 'option_cpr') and self.option_cpr and not choppy_blocked:
+                for sig in list(all_signals):
+                    if sig.get('symbol') != symbol:
+                        continue
+                    opt_type = 'CE' if 'CE' in sig.get('type', '') else 'PE'
+                    strike = sig.get('strike', 0)
+                    premium = sig.get('premium', 0)
+                    quality = sig.get('quality_score', 50)
+                    self.option_cpr.update_premium_tick(symbol, strike, opt_type, premium)
+
+                    # WaveBC: entry just above BC, target=Pivot, SL=below BC
+                    allowed_bc, reason_bc, lv_bc = self.option_cpr.should_allow_wavebc(
+                        symbol, strike, opt_type, premium)
+                    if allowed_bc and lv_bc:
+                        wbc = dict(sig)
+                        wbc['strategy'] = 'WaveBC'
+                        wbc['type'] = 'BUY_' + opt_type + '_WAVEBC'
+                        wbc['target'] = self.option_cpr.get_target_wavebc(
+                            symbol, strike, opt_type, premium)
+                        wbc['sl'] = self.option_cpr.get_sl(
+                            symbol, strike, opt_type, premium)
+                        bc_val = lv_bc.get('bc', 0)
+                        pv_val = lv_bc.get('pivot', 0)
+                        wbc['reason'] = 'WaveBC: prem %.0f > BC %.0f, tgt Pivot %.0f' % (
+                            premium, bc_val, pv_val)
+                        all_signals.append(wbc)
+                        logger.info('  SIGNAL [WaveBC]: %s Strike=%.0f Prem=%.2f | %s',
+                                    wbc['type'], strike, premium, reason_bc)
+
+                    # WaveBCElite: BC + Q>=80 + momentum rising
+                    allowed_e, reason_e, lv_e = self.option_cpr.should_allow_wavebc_elite(
+                        symbol, strike, opt_type, premium, quality)
+                    if allowed_e and lv_e:
+                        rising = self.option_cpr.is_premium_rising(
+                            symbol, strike, opt_type)
+                        if rising:
+                            we = dict(sig)
+                            we['strategy'] = 'WaveBCElite'
+                            we['type'] = 'BUY_' + opt_type + '_WBCELITE'
+                            we['target'] = self.option_cpr.get_target_wavebc_elite(
+                                symbol, strike, opt_type, premium)
+                            we['sl'] = self.option_cpr.get_sl(
+                                symbol, strike, opt_type, premium)
+                            bc_val = lv_e.get('bc', 0)
+                            r1_val = lv_e.get('r1', 0)
+                            we['reason'] = 'WaveBCElite: Q=%.0f prem %.0f > BC %.0f RISING tgt R1 %.0f' % (
+                                quality, premium, bc_val, r1_val)
+                            all_signals.append(we)
+                            logger.info('  SIGNAL [WaveBCElite]: %s Strike=%.0f Q=%.0f | RISING',
+                                        we['type'], strike, quality)
 
             # v11: TREND RIDER — independent scan at 10:15-10:30 (max 1 per symbol per day)
             today_str = now.strftime('%Y-%m-%d')
@@ -3672,17 +3987,17 @@ class PaperTrader:
                 ls_start = now.replace(hour=9, minute=16, second=0)
                 ls_end = now.replace(hour=15, minute=15, second=0)
                 if ls_start <= now <= ls_end:
-                    for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
-                        _bc = self.calculus.bar_count(symbol)
-                        if _bc > 0 and _bc % 20 == 1: logger.info(f"  SWEEP_BARS: {symbol} has {_bc} bars")
-                        if self.calculus.bar_count(symbol) >= 25:
-                            sweeps = self.calculus.detect_liquidity_sweep(symbol)
+                    for sw_sym in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                        _bc = self.calculus.bar_count(sw_sym)
+                        if _bc > 0 and _bc % 20 == 1: logger.info(f"  SWEEP_BARS: {sw_sym} has {_bc} bars")
+                        if self.calculus.bar_count(sw_sym) >= 25:
+                            sweeps = self.calculus.detect_liquidity_sweep(sw_sym)
                             if not sweeps: continue
                             for sw in sweeps:
                                 if sw['quality'] < 45:
                                     continue
                                 # Get option chain for the sweep direction
-                                sw_spot = self.get_index_spot(symbol) or 0
+                                sw_spot = self.get_index_spot(sw_sym) or 0
                                 if sw_spot <= 0:
                                     continue
                                 sw_dte = dte  # Use same DTE as other strategies
@@ -3713,7 +4028,7 @@ class PaperTrader:
                                         'target': sw_ltp + target_move,
                                         'sl': max(sw_ltp * 0.5, sw_ltp - sl_buffer * 0.5),
                                         'strategy': 'Liquidity Sweep',
-                                        'symbol': symbol,
+                                        'symbol': sw_sym,
                                         'spot': sw_spot,
                                         'dte': sw_dte,
                                         'quality_score': sw['quality'],
@@ -3737,6 +4052,24 @@ class PaperTrader:
             logger.info(f"  TICK {datetime.now().strftime('%H:%M:%S')} | {spots_str} | "
                        f"Pos:{len(self.portfolio.positions)} UnrlPnL:{unrealized:+,.0f} | "
                        f"Signals:{len(all_signals)}")
+
+        # v17-fix: Compute quality_score for ALL collected signals
+        for sig in all_signals:
+            if not sig.get("quality_score"):
+                try:
+                    sig_indicators = self.engine.compute_indicators(
+                        sig["symbol"],
+                        self.get_intraday_ohlc(sig["symbol"]) or
+                        {"open": sig["spot"], "high": sig["spot"], "low": sig["spot"],
+                         "close": sig["spot"], "volume": 0})
+                    if sig_indicators:
+                        sig["quality_score"] = compute_signal_score(sig, sig["spot"], sig_indicators, self.current_vix)
+                except Exception:
+                    sig["quality_score"] = 50  # default if computation fails
+
+            # v17-fix: Also set ltp_source from last known source
+            if not sig.get("ltp_source") or sig.get("ltp_source") == "UNKNOWN":
+                sig["ltp_source"] = getattr(self, "_last_ltp_source", "UNKNOWN")
 
         return all_signals
 
@@ -3894,7 +4227,7 @@ class PaperTrader:
             is_buy_sig = 'BUY' in sig['type']
             conflicting = [p for p in self.portfolio.positions
                            if p['symbol'] == sig['symbol']
-                           and abs(p['strike'] - sig['strike']) <= tol
+                           and abs(p["strike"] - sig["strike"]) <= 100
                            and (('CE' in p['signal_type']) == (opt_type == 'CE'))
                            and p['is_sell'] == is_buy_sig]  # opposite direction
             if conflicting:
@@ -4030,6 +4363,7 @@ class PaperTrader:
                     and (t.get('net_pnl', 0) < 0 or
                          (t.get('exit_premium', 0) - t.get('entry_premium', 0)) < 0))
                 escalated_cooldown = REENTRY_COOLDOWN_SECONDS * (2 ** min(dir_losses, 4))
+
 
                 for eh in self.exit_history:
                     if eh['symbol'] == sig['symbol']:
@@ -4941,8 +5275,13 @@ class PaperTrader:
             # Skip positions opened less than 15 minutes ago (grace period — v2.3: was 5 min)
             entry_time = datetime.fromisoformat(pos['timestamp'])
             elapsed_secs = (datetime.now() - entry_time).total_seconds()
+            # v16: Update premium DURING grace period so PnL is always live
+            _grace_ltp = self._get_option_ltp(pos) if hasattr(self, '_get_option_ltp') else None
+            if _grace_ltp is not None and _grace_ltp > 0:
+                self.portfolio.update_position(pos['id'], _grace_ltp)
+
             if elapsed_secs < GRACE_PERIOD_SECONDS:
-                logger.info(f"  GRACE: {pos['id']} opened {int(elapsed_secs)}s ago (need {GRACE_PERIOD_SECONDS}s)")
+                logger.info(f"  GRACE: {pos['id']} opened {int(elapsed_secs)}s ago (need {GRACE_PERIOD_SECONDS}s) | LTP={_grace_ltp or 'N/A'}")
                 continue
 
             # ---- EOD FORCE CLOSE: Close positions 10 min before market close ----
@@ -5771,6 +6110,34 @@ class PaperTrader:
                 'reason': sig.get('reason', ''),
                 # Execution status
                 'executed': sig_key in executed_ids,
+                    'gap_direction': self.gap_analysis.get('direction', 'UNKNOWN') if self.gap_analysis else 'NO_DATA',
+                    'gap_pct': self.gap_analysis.get('gap_pct', 0) if self.gap_analysis else 0,
+                    'gap_bias': self.gap_analysis.get('bias', 'NEUTRAL') if self.gap_analysis else 'NEUTRAL',
+                    'ltp_source': sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')),
+                    'signal_strength': compute_signal_strength(sig, sig.get('spot', 0),
+                        self.engine.compute_indicators(sig.get('symbol', ''),
+                            self.get_intraday_ohlc(sig.get('symbol', '')) or
+                            {'open': sig.get('spot', 0), 'high': sig.get('spot', 0),
+                             'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
+                        ) if hasattr(self, 'engine') else {},
+                        self.current_vix if hasattr(self, 'current_vix') else None,
+                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                    )[0],
+                    'strength_label': compute_signal_strength(sig, sig.get('spot', 0),
+                        self.engine.compute_indicators(sig.get('symbol', ''),
+                            self.get_intraday_ohlc(sig.get('symbol', '')) or
+                            {'open': sig.get('spot', 0), 'high': sig.get('spot', 0),
+                             'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
+                        ) if hasattr(self, 'engine') else {},
+                        self.current_vix if hasattr(self, 'current_vix') else None,
+                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                    )[1],
+                    # v16: 14 ML features
+                    **compute_ml_features(sig,
+                        ohlc or {},
+                        sig.get('spot', 0),
+                        indicators or {},
+                        self.current_vix if hasattr(self, 'current_vix') else None),
             })
         df = pd.DataFrame(rows)
         if os.path.exists(log_file):
