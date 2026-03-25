@@ -306,6 +306,67 @@ class OptionPremiumCPR:
         except Exception as e:
             logger.debug("OPTION_CPR: Cache save failed: %s", e)
 
+    def get_ladder_exit(self, symbol, strike, opt_type, entry_premium, current_premium, phase):
+        """Level-Locking Ladder exit logic.
+
+        Phase 1: SL=BC-5%, Target=Pivot
+        Phase 2: SL=Pivot-2%, Target=R1
+        Phase 3: SL=R1-2%, Target=R2
+        Phase 4: Hit R2 -> EXIT
+
+        Returns: (new_phase, sl_price, target_price, exit_now, exit_reason)
+        """
+        lv = self.get_levels(symbol, strike, opt_type)
+        if lv is None:
+            # Fallback to percentage-based
+            return phase, entry_premium * 0.85, entry_premium * 1.30, False, None
+
+        # Sort levels ascending (fix inverted CPR for some options)
+        bc, pivot, r1, r2 = lv['bc'], lv['pivot'], lv['r1'], lv['r2']
+        sorted_lvls = sorted([bc, pivot, r1, r2])
+        bc, pivot, r1, r2 = sorted_lvls[0], sorted_lvls[1], sorted_lvls[2], sorted_lvls[3]
+
+        lock_buffer = 0.02  # 2% below locked level
+
+        new_phase = phase
+        sl_price = bc * (1 - 0.05)  # Default: BC - 5%
+        target_price = pivot
+        exit_now = False
+        exit_reason = None
+
+        if phase == 1:
+            sl_price = bc * (1 - 0.05)
+            target_price = pivot
+            if current_premium >= pivot:
+                new_phase = 2
+                sl_price = pivot * (1 - lock_buffer)
+                target_price = r1
+        elif phase == 2:
+            sl_price = pivot * (1 - lock_buffer)
+            target_price = r1
+            if current_premium >= r1:
+                new_phase = 3
+                sl_price = r1 * (1 - lock_buffer)
+                target_price = r2
+        elif phase == 3:
+            sl_price = r1 * (1 - lock_buffer)
+            target_price = r2
+            if current_premium >= r2:
+                exit_now = True
+                exit_reason = 'TARGET_R2'
+
+        # Check SL hit
+        if current_premium <= sl_price:
+            exit_now = True
+            exit_reason = 'SL_P%d' % phase
+
+        # Hard SL backup (25%)
+        if current_premium <= entry_premium * 0.75:
+            exit_now = True
+            exit_reason = 'HARD_SL'
+
+        return new_phase, sl_price, target_price, exit_now, exit_reason
+
     def _load_cache(self):
         """Load levels from cache."""
         try:

@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, time as dtime
 from collections import defaultdict
 from oi_velocity_tracker import OIVelocityTracker, make_gamma_blast_signal
 from option_premium_cpr import OptionPremiumCPR
+from ghost_zone_v8 import GhostZoneV8
 
 import numpy as np
 import pandas as pd
@@ -1686,7 +1687,7 @@ class PaperPortfolio:
             'signal_type': signal_type,
             'strike': strike,
             'entry_premium': round(entry_premium, 2),
-                'ltp_source': (details or {}).get('ltp_source', 'UNKNOWN'),
+                'ltp_source': (details or {}).get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')),
                 'signal_strength': (details or {}).get('signal_strength', 0),
                 'strength_label': (details or {}).get('strength_label', 'UNKNOWN'),
             'current_premium': round(entry_premium, 2),
@@ -3335,6 +3336,8 @@ class PaperTrader:
             if self.zerodha.connect():
                 self.engine.zerodha = self.zerodha
                 logger.info("[Zerodha] ✅ Initialized as Source 1 for option chain + LTP")
+                self._last_ltp_source = 'ZERODHA'
+                self.engine._last_ltp_source = 'ZERODHA'
                 # v18: Option Premium CPR for WaveBC strategies
                 self.option_cpr = OptionPremiumCPR(self.zerodha)
                 logger.info('[OptionCPR] Initialized with Zerodha feed')
@@ -3360,6 +3363,7 @@ class PaperTrader:
         self.truedata = None
         self.engine.truedata = None
         if not hasattr(self, 'option_cpr'): self.option_cpr = OptionPremiumCPR(self.zerodha)
+        if not hasattr(self, "ghost_v8"): self.ghost_v8 = GhostZoneV8()
         self._index_tokens = {
             'NIFTY': {'exchange': 'NSE', 'token': '99926000'},
             'BANKNIFTY': {'exchange': 'NSE', 'token': '99926009'},
@@ -3872,8 +3876,8 @@ class PaperTrader:
             dte = max(1, (3 - dow) + 1) if dow <= 3 else 1
 
             # v11.1: Choppy day detection — block late entries if morning efficiency < 15%
-            choppy_blocked = False
-            if now.time() >= CHOPPY_DAY_BLOCK_AFTER:
+            choppy_blocked = False  # v19: choppy shield DISABLED — both strategies work in all regimes
+            if False:  # v19: DISABLED — choppy shield removed
                 day_range = ohlc['high'] - ohlc['low']
                 net_move = abs(spot - ohlc['open'])
                 day_eff = net_move / day_range * 100 if day_range > 0 else 100
@@ -3893,7 +3897,7 @@ class PaperTrader:
             ]
 
             for strat_name, check_fn in strategy_checks:
-                if choppy_blocked:
+                if False:  # v19: choppy shield disabled
                     logger.debug(f"  CHOPPY_SKIP: {strat_name} blocked on choppy day")
                     continue
                 signals = check_fn(symbol, spot, ohlc, indicators, dow, dte)
@@ -3909,8 +3913,9 @@ class PaperTrader:
                                f"| {sig['reason']}")
 
 
+# v19: Ghost Zone v8 — Institutional zone detection (no choppy shield)            if hasattr(self, "ghost_v8") and self.ghost_v8:                self.ghost_v8.update_tick(symbol, spot, now)                gz8_signals = self.ghost_v8.get_signals(symbol, now)                for gz_sig in gz8_signals:                    # Get option premium from Zerodha                    gz_opt_type = "CE" if "CE" in gz_sig["type"] else "PE"                    gz_strike, gz_ltp, gz_iv = self._get_strike_from_chain(symbol, spot, gz_opt_type, dte)                    if gz_ltp > 0:                        from math import log, sqrt, exp                        T = dte / 365                        g = bs_greeks(spot, gz_strike, T, RISK_FREE_RATE, gz_iv if gz_iv > 0 else 0.20, gz_opt_type)                        gz_entry = {                            "type": gz_sig["type"],                            "strategy": "Ghost Zone v8",                            "symbol": symbol,                            "strike": gz_strike,                            "premium": gz_ltp,                            "greeks": g,                            "spot": spot,                            "dte": dte,                            "target": gz_ltp * (1 + gz_sig.get("target_pct", 20) / 100),                            "sl": gz_ltp * (1 - gz_sig.get("sl_pct", 10) / 100),                            "reason": gz_sig["reason"],                            "quality_score": 85,                        }                        all_signals.append(gz_entry)                        logger.info(f"  SIGNAL [Ghost Zone v8]: {gz_sig[chr(39)+type+chr(39)]} "                                   f"Strike={gz_strike:.0f} Premium=Rs {gz_ltp:.2f} "                                   f"| {gz_sig[chr(39)+reason+chr(39)]}")
             # v18: WaveBC strategies -- Option Premium CPR levels as entry/exit
-            if hasattr(self, 'option_cpr') and self.option_cpr and not choppy_blocked:
+            if hasattr(self, 'option_cpr') and self.option_cpr : # v19: choppy removed
                 for sig in list(all_signals):
                     if sig.get('symbol') != symbol:
                         continue
@@ -3983,7 +3988,7 @@ class PaperTrader:
             # Hybrid sizing: Q>=45 half-lot, Q>=60 full-lot
             # Backtested 6 days: PF=1.98-2.95, WR=70-78%, DD<1%
             # Timing: 09:20 to 15:15 (needs 5+ bars of data)
-            if hasattr(self, 'calculus') and not choppy_blocked:
+            if hasattr(self, 'calculus') : # v19: choppy removed
                 ls_start = now.replace(hour=9, minute=16, second=0)
                 ls_end = now.replace(hour=15, minute=15, second=0)
                 if ls_start <= now <= ls_end:
@@ -4069,7 +4074,7 @@ class PaperTrader:
 
             # v17-fix: Also set ltp_source from last known source
             if not sig.get("ltp_source") or sig.get("ltp_source") == "UNKNOWN":
-                sig["ltp_source"] = getattr(self, "_last_ltp_source", "UNKNOWN")
+                sig["ltp_source"] = getattr(self.engine, "_last_ltp_source", getattr(self, "_last_ltp_source", "UNKNOWN"))
 
         return all_signals
 
@@ -4434,7 +4439,7 @@ class PaperTrader:
             # ---- v13.0: CALCULUS-BASED DIRECTION VALIDATION (replaces v10.1 static VWAP checks) ----
             dir_ohlc = self.get_intraday_ohlc(sig['symbol']) or {
                 'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0}
-            dir_indicators = self.engine.compute_indicators(sig['symbol'], dir_ohlc)
+            dir_indicators = self.engine.compute_indicators(sig['symbol'], dir_ohlc) or {}
 
             # v13.0: Use calculus engine as PRIMARY direction gate
             calc_dir_valid = True
@@ -4514,7 +4519,7 @@ class PaperTrader:
 
             # ---- v9.5: Signal quality score check (MANDATORY — no bypass) ----
             min_score_required = sig.get('_escalated_min_score', MIN_SIGNAL_SCORE)
-            indicators = dir_indicators or self.engine.compute_indicators(sig['symbol'], dir_ohlc)
+            indicators = dir_indicators or self.engine.compute_indicators(sig['symbol'], dir_ohlc) or {}
             if indicators:
                 score = compute_signal_score(sig, sig['spot'], indicators, self.current_vix)
                 score = max(0, min(100, score + dir_adj))  # v10.1: direction adjustment
@@ -6123,7 +6128,7 @@ class PaperTrader:
                     'gap_direction': self.gap_analysis.get('direction', 'UNKNOWN') if self.gap_analysis else 'NO_DATA',
                     'gap_pct': self.gap_analysis.get('gap_pct', 0) if self.gap_analysis else 0,
                     'gap_bias': self.gap_analysis.get('bias', 'NEUTRAL') if self.gap_analysis else 'NEUTRAL',
-                    'ltp_source': sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')),
+                    'ltp_source': sig.get('ltp_source', getattr(self.engine, '_last_ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))),
                     'signal_strength': compute_signal_strength(sig, sig.get('spot', 0),
                         self.engine.compute_indicators(sig.get('symbol', ''),
                             self.get_intraday_ohlc(sig.get('symbol', '')) or
@@ -6131,7 +6136,7 @@ class PaperTrader:
                              'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
                         ) if hasattr(self, 'engine') else {},
                         self.current_vix if hasattr(self, 'current_vix') else None,
-                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                        sig.get('ltp_source', getattr(self.engine, '_last_ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')))
                     )[0],
                     'strength_label': compute_signal_strength(sig, sig.get('spot', 0),
                         self.engine.compute_indicators(sig.get('symbol', ''),
@@ -6140,7 +6145,7 @@ class PaperTrader:
                              'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
                         ) if hasattr(self, 'engine') else {},
                         self.current_vix if hasattr(self, 'current_vix') else None,
-                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                        sig.get('ltp_source', getattr(self.engine, '_last_ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')))
                     )[1],
                     # v16: 14 ML features
                     **compute_ml_features(sig,
