@@ -93,7 +93,7 @@ TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
 TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 
 # v13.0: Breakout Failure Detection — RELAXED (was causing premature exits)
-BREAKOUT_FAIL_CHECK_MINUTES = 20       # v13: Extended from 5 min — stocks need time to develop
+BREAKOUT_FAIL_CHECK_MINUTES = 9999  # v16.1: DISABLED — cost Rs -34K across 25 exits (24% WR)       # v13: Extended from 5 min — stocks need time to develop
 BREAKOUT_FAIL_MIN_GAIN_PCT = 1        # v13: Reduced from 2%
 BREAKOUT_FAIL_REVERSE_DROP_PCT = 25   # v13: Increased from 15% — only reverse on severe failures
 BREAKOUT_FAIL_REVERSE_ENABLED = False
@@ -111,9 +111,13 @@ ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
 # v13.3: Momentum reversal exit
 # If spot moves 0.4% AGAINST trade direction after 20min, exit
 # Simulation: saves Rs +6,974, hurts ZERO winning trades
-MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_EXIT_ENABLED = False  # v16.2: DISABLED — 0% WR, Rs -9,559 lost across 4 trades
 MOMENTUM_EXIT_SPOT_PCT = 0.4
 MOMENTUM_EXIT_MIN_MINUTES = 20
+
+# v16: Choppy Day Shield (proven +Rs 20K benefit in equity backtest)
+CHOPPY_DAY_EFF_THRESHOLD = 15    # Block entries if efficiency < 15%
+CHOPPY_DAY_BLOCK_AFTER = dtime(11, 0)  # Block new entries after 11:00 on choppy days
 
 # OI/IV exit thresholds
 OI_SURGE_FIRST_HOUR_PCT = 50
@@ -149,7 +153,7 @@ LOT_TIER_STRONG = 60
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 PRE_MARKET = dtime(9, 0)
-FIRST_TRADE_TIME = dtime(9, 30)
+FIRST_TRADE_TIME = dtime(9, 16)  # v16.1: 9:16 (was 9:30) — 9AM hour best WR
 LAST_ENTRY_TIME = dtime(14, 30)
 EOD_FORCE_CLOSE_TIME = dtime(15, 20)
 
@@ -336,8 +340,8 @@ def validate_signal_direction(signal_type, spot, ohlc, indicators):
     else:
         checks.append('MOM-')
 
-    is_valid = passed >= 3
-    score_adj = (passed - 3) * 5
+    is_valid = passed >= 2  # v16.3: Lowered from 3 — stocks at open lack TREND/INTRA/MOM data
+    score_adj = (passed - 2) * 5  # v16.3: Adjusted baseline from 3 to 2
     reason = f"DIR({passed}/5: {' '.join(checks)})"
     return is_valid, reason, score_adj
 
@@ -696,6 +700,127 @@ class _NullAngel:
         def null_method(*args, **kwargs):
             return None
         return null_method
+
+
+# v16: 14 ML features for future ML Oracle training
+
+# v16: Signal Strength Score (0-100) — LOGGING ONLY
+# Combines quality_score + Greeks + regime + VIX + OI + data source
+def compute_signal_strength(sig, spot, indicators, vix=None, ltp_source='UNKNOWN'):
+    """Compute signal strength 0-100 and label. For logging/analysis only."""
+    try:
+        greeks = sig.get('greeks', {})
+        q_score = sig.get('quality_score', 0)
+
+        # 1. Quality Score (40% weight, max 40 points)
+        q_pts = min(40, q_score * 0.4)
+
+        # 2. Greeks Quality (15% weight, max 15 points)
+        delta = abs(greeks.get('delta', sig.get('delta', 0)))
+        gamma = abs(greeks.get('gamma', sig.get('gamma', 0)))
+        g_pts = 0
+        if 0.35 <= delta <= 0.65:
+            g_pts += 8  # delta in sweet spot
+        elif 0.25 <= delta <= 0.75:
+            g_pts += 4
+        if gamma > 0.001:
+            g_pts += 7  # meaningful gamma
+        elif gamma > 0.0005:
+            g_pts += 3
+
+        # 3. Regime Score (15% weight, max 15 points)
+        eff = 0
+        if indicators:
+            eff = indicators.get('efficiency', 0)
+            if isinstance(eff, (int, float)) and eff > 1:
+                eff = eff / 100
+        r_pts = min(15, eff * 30) if eff > 0 else 5  # trending = higher score
+
+        # 4. VIX Alignment (10% weight, max 10 points)
+        v_pts = 5  # default neutral
+        if vix:
+            if 14 <= vix <= 28:
+                v_pts = 10  # ideal range
+            elif 11 <= vix <= 35:
+                v_pts = 6   # acceptable
+            else:
+                v_pts = 2   # extreme VIX
+
+        # 5. OI Confirmation (10% weight, max 10 points)
+        oi = sig.get('oi', 0)
+        oi_pts = 5  # default
+        if oi and oi > 1000:
+            oi_pts = 10  # good OI = liquid
+        elif oi and oi > 100:
+            oi_pts = 7
+
+        # 6. Data Source Quality (10% weight, max 10 points)
+        source_scores = {
+            'ZERODHA': 10,
+            'TRUEDATA': 8,
+            'NSE_PIPELINE': 6,
+            'ANGEL': 4,
+            'UNKNOWN': 3,
+        }
+        s_pts = source_scores.get(ltp_source, 3)
+
+        # Total
+        strength = int(q_pts + g_pts + r_pts + v_pts + oi_pts + s_pts)
+        strength = max(0, min(100, strength))
+
+        # Label
+        if strength >= 80:
+            label = 'ELITE'
+        elif strength >= 60:
+            label = 'STRONG'
+        elif strength >= 50:
+            label = 'MODERATE'
+        else:
+            label = 'WEAK'
+
+        return strength, label
+    except Exception:
+        return 0, 'UNKNOWN'
+
+
+def compute_ml_features(sig, ohlc, spot, indicators, vix=None):
+    """Compute 14 ML features for signal logging."""
+    f = {}
+    try:
+        greeks = sig.get('greeks', {})
+        atr = indicators.get('atr', 1) if indicators else 1
+        f['ml_cpr_width_pct'] = indicators.get('cpr_width', 0) if indicators else 0
+        day_open = ohlc.get('open', spot) if ohlc else spot
+        f['ml_body_atr_ratio'] = abs(spot - day_open) / atr if atr > 0 else 0
+        f['ml_pcr_shift'] = indicators.get('pcr_shift', 0) if indicators else 0
+        f['ml_efficiency_ratio'] = indicators.get('efficiency', 0.5) if indicators else 0.5
+        f['ml_gamma'] = abs(greeks.get('gamma', sig.get('gamma', 0)))
+        f['ml_delta'] = abs(greeks.get('delta', sig.get('delta', 0)))
+        theta = abs(greeks.get('theta', sig.get('theta', 0)))
+        dte = sig.get('dte', 1) or 1
+        f['ml_theta_burden'] = theta * dte
+        f['ml_vix_level'] = vix if vix else 0
+        eff = f['ml_efficiency_ratio']
+        body_ratio = min(1.0, f['ml_body_atr_ratio'])
+        f['ml_regime_score'] = 0.6 * body_ratio + 0.4 * eff
+        f['ml_oi_change_15m'] = indicators.get('oi_change', 0) if indicators else 0
+        iv = greeks.get('iv', sig.get('iv', 0))
+        if isinstance(iv, (int, float)) and iv > 0:
+            if iv > 1: iv = iv / 100
+            f['ml_iv_rank'] = min(100, max(0, iv * 200))
+        else:
+            f['ml_iv_rank'] = 50
+        atr_ref = {'NIFTY': 313, 'BANKNIFTY': 851, 'SENSEX': 1094,
+                    'GOLDM': 3322, 'SILVERM': 9537, 'CRUDEOILM': 409}
+        sym_atr = atr_ref.get(sig.get('symbol', ''), atr)
+        f['ml_hold_score'] = (sym_atr / (0.01 * spot) * 60) if spot > 0 else 60
+        strat_map = {'CPR': 0, 'Gamma Blast': 1, 'Ghost Zone': 2,
+                      'PCR+VWAP': 3, 'Trend Rider': 4, 'Liquidity Sweep': 5}
+        f['ml_strategy_id'] = strat_map.get(sig.get('strategy', ''), 6)
+        f['ml_gamma_blast_strength'] = f['ml_gamma'] * f['ml_body_atr_ratio']
+    except Exception:
+        pass
+    return f
 
 class StockAngelConnection:
     """Manages Angel One SmartAPI connection for stock options.
@@ -1645,6 +1770,9 @@ class StockPortfolio:
             'signal_type': signal_type,
             'strike': strike,
             'entry_premium': round(entry_premium, 2),
+                'ltp_source': (details or {}).get('ltp_source', 'UNKNOWN'),
+                'signal_strength': (details or {}).get('signal_strength', 0),
+                'strength_label': (details or {}).get('strength_label', 'UNKNOWN'),
             'current_premium': round(entry_premium, 2),
             'lot_size': lot_size,
             'delta': delta,
@@ -2097,7 +2225,7 @@ class StockPaperTrader:
     def __init__(self):
         """Initialize the stock paper trader with all subsystems."""
         self.fno_config = StockFnOConfig()
-        self.angel = _NullAngel()  # v13.5: Angel DISABLED
+        self.angel = StockAngelConnection()  # v16.3: Re-enabled (was _NullAngel since v13.5)
         self.angel.fno_config_ref = self.fno_config  # Back-reference for strike selection
         self.portfolio = StockPortfolio()
         self.scanner = StockCPRScanner(self.fno_config, self.angel)
@@ -2137,19 +2265,10 @@ class StockPaperTrader:
         except Exception as e:
             logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
 
-        # v11.2: TrueData as Source 2 for option chain + LTP
+        # v11.2: TrueData as Source 2 — DISABLED v16: Trial expired 2026-03-23
+        # TrueData causes infinite reconnect loop + RecursionError when subscription expired
         self.truedata = None
-        try:
-            from truedata_feed import TrueDataFeed
-            self.truedata = TrueDataFeed()
-            if self.truedata.connect():
-                src_num = "2" if self.zerodha else "1 (Zerodha unavailable)"
-                logger.info(f"[TrueData] Initialized as Source {src_num} for stock option chain + LTP")
-            else:
-                self.truedata = None
-                logger.warning("[TrueData] Connection failed — falling back to NSE/BSE + Angel")
-        except Exception as e:
-            logger.warning(f"[TrueData] Not available: {e} — falling back to NSE/BSE + Angel")
+        logger.info("[TrueData] DISABLED — trial expired 2026-03-23. Using Zerodha + NSE/BSE + Angel.")
 
         # Wire data sources into StockAngelConnection for select_optimal_strike
         self.angel.zerodha = self.zerodha
@@ -2731,8 +2850,13 @@ class StockPaperTrader:
             # ---- Grace period: Skip positions opened < 3 min ago ----
             entry_time = datetime.fromisoformat(pos['timestamp'])
             elapsed_secs = (datetime.now() - entry_time).total_seconds()
+            # v16: Update premium DURING grace period so PnL is always live
+            _grace_ltp = self._get_option_ltp(pos) if hasattr(self, '_get_option_ltp') else None
+            if _grace_ltp is not None and _grace_ltp > 0:
+                self.portfolio.update_position(pos['id'], _grace_ltp)
+
             if elapsed_secs < GRACE_PERIOD_SECONDS:
-                logger.info(f"  GRACE: {pos['id']} opened {int(elapsed_secs)}s ago (need {GRACE_PERIOD_SECONDS}s)")
+                logger.info(f"  GRACE: {pos['id']} opened {int(elapsed_secs)}s ago (need {GRACE_PERIOD_SECONDS}s) | LTP={_grace_ltp or 'N/A'}")
                 continue
 
             # ---- EOD FORCE CLOSE: 10 min before market close ----
@@ -3493,6 +3617,7 @@ class StockPaperTrader:
                                         'spot': _sw_spot,
                                         'strategy': 'Liquidity Sweep',
                                         'reason': 'Liquidity Sweep: ' + _sw['spike_dir'] + ' spike Q=' + str(_q) + ' [LIVE]',
+                            'ltp_source': getattr(self, '_last_ltp_source', 'UNKNOWN'),
                                         'target': _sw_ltp * 1.5,
                                         'sl': _sw_ltp * 0.5,
                                         'quality_score': _q,
@@ -3589,10 +3714,32 @@ class StockPaperTrader:
                 logger.warning(f"  SKIP_VIX_EXTREME_LOW: VIX={self.current_vix:.1f} < {VIX_BLOCK_LOW} — blocking {len(signals)} stock entries")
                 return
 
+        # v16: Choppy Day Shield — block entries after 11:00 on low-efficiency days
+        choppy_blocked = False
+        now_time = datetime.now().time()
+        if now_time >= CHOPPY_DAY_BLOCK_AFTER:
+            try:
+                # Use calculus engine efficiency if available
+                if hasattr(self, 'calculus'):
+                    for _sym in set(s.get('symbol','') for s in signals):
+                        if self.calculus.bar_count(_sym) >= 15:
+                            _eff = self.calculus.get_efficiency(_sym)
+                            if _eff is not None and _eff * 100 < CHOPPY_DAY_EFF_THRESHOLD:
+                                choppy_blocked = True
+                                logger.info(f'  CHOPPY_DAY: {_sym} efficiency {_eff*100:.1f}% < {CHOPPY_DAY_EFF_THRESHOLD}% — blocking after 11:00')
+                                break
+            except Exception as e:
+                logger.debug(f'  Choppy check error: {e}')
+
         executed = 0
         skipped = 0
 
         for sig in signals:
+            # v16: Choppy Shield — skip signals on choppy days after 11:00
+            if choppy_blocked and now_time >= CHOPPY_DAY_BLOCK_AFTER:
+                logger.debug(f'  CHOPPY_SKIP: {sig.get(strategy,)} {sig.get(symbol,)} blocked')
+                skipped += 1
+                continue
             # Position limits
             if len(self.portfolio.positions) >= MAX_TOTAL_POSITIONS:
                 logger.info(f"  MAX_POSITIONS: Already at {MAX_TOTAL_POSITIONS}, skipping remaining")
@@ -4075,8 +4222,11 @@ class StockPaperTrader:
         # v10.5b: Fetch VIX (needed for DCI + regime detector)
         self.get_india_vix()
 
-        # Check exits first (before scanning for new signals)
-        self.check_exits()
+        # v16: check_exits() protected — open trades ALWAYS get SL/target checked
+        try:
+            self.check_exits()
+        except Exception as exit_err:
+            logger.error(f"  EXIT_CHECK_FAILED: {exit_err} — open trades unprotected this cycle!")
 
         # Only scan for new signals during trading hours
         now = datetime.now().time()
@@ -4160,6 +4310,25 @@ class StockPaperTrader:
                     'reason': sig.get('reason', ''),
                     # Execution status & data source
                     'executed': sig_key in executed_ids,
+                    'ltp_source': sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')),
+                    'signal_strength': compute_signal_strength(sig, sig.get('spot', 0),
+                        self.engine.compute_indicators(sig.get('symbol', ''),
+                            {} or
+                            {'open': sig.get('spot', 0), 'high': sig.get('spot', 0),
+                             'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
+                        ) if hasattr(self, 'engine') else {},
+                        self.current_vix if hasattr(self, 'current_vix') else None,
+                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                    )[0],
+                    'strength_label': compute_signal_strength(sig, sig.get('spot', 0),
+                        self.engine.compute_indicators(sig.get('symbol', ''),
+                            {} or
+                            {'open': sig.get('spot', 0), 'high': sig.get('spot', 0),
+                             'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
+                        ) if hasattr(self, 'engine') else {},
+                        self.current_vix if hasattr(self, 'current_vix') else None,
+                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                    )[1],
                     'data_source': data_source,
                 })
 
@@ -4175,7 +4344,7 @@ class StockPaperTrader:
     # ================================================================
     # RUN CONTINUOUS — Main trading loop
     # ================================================================
-    def run_continuous(self, interval_seconds=30):
+    def run_continuous(self, interval_seconds=1):
         """Run continuous paper trading loop.
 
         Args:

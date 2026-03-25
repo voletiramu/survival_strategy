@@ -60,6 +60,8 @@ class WebSocketFeed:
         self._last_tick_time = 0
         # v15: Tick callback hooks for event-driven exit checking
         self._tick_callbacks = []   # List of callable(token, ltp) — called on every tick
+        # v16: Per-token tick timestamps for LTP freshness tracking (watchdog)
+        self._last_tick_times = {}  # {token_str: epoch_float}
 
     def start(self, auth_token, api_key, client_code, feed_token):
         """Start WebSocket connection in a daemon thread.
@@ -291,8 +293,10 @@ class WebSocketFeed:
 
             with self._lock:
                 self._prices[token] = ltp
+                self._last_tick_times[token] = time.time()  # v16: Track per-token freshness
 
             self._tick_count += 1
+            self._last_tick_time = time.time()  # Update global tick time
 
             # v15: Fire tick callbacks for event-driven exit checking
             for cb in self._tick_callbacks:
@@ -367,6 +371,38 @@ class WebSocketFeed:
             'subscribed_tokens': len(self._subscribed_tokens),
             'prices': prices_copy,
         }
+
+    def get_ltp_age(self, token):
+        """v16: Get seconds since last tick for a specific token.
+
+        Args:
+            token: Token string (e.g., '99926000')
+
+        Returns:
+            float: Seconds since last tick, or 999.0 if no tick ever received
+        """
+        with self._lock:
+            last = self._last_tick_times.get(str(token))
+        if last is None:
+            return 999.0
+        return time.time() - last
+
+    def get_max_ltp_age(self):
+        """v16: Get maximum LTP age across all subscribed tokens.
+
+        Used by watchdog heartbeat to report worst-case LTP staleness.
+
+        Returns:
+            float: Max seconds since last tick across all tokens, or 0.0 if no tokens
+        """
+        if not self._last_tick_times:
+            return 0.0
+        now = time.time()
+        with self._lock:
+            if not self._last_tick_times:
+                return 0.0
+            ages = [now - t for t in self._last_tick_times.values()]
+        return max(ages) if ages else 0.0
 
     def stop(self):
         """Gracefully shut down WebSocket connection."""

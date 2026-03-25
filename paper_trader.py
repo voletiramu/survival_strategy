@@ -6036,10 +6036,20 @@ class PaperTrader:
         }
 
     def run_once(self):
-        """Run one scan cycle (every 1 second in v15)."""
+        """Run one scan cycle (every 1 second in v15).
+        v16: check_exits() runs FIRST and is protected — if scanning fails,
+        open trades still get their trailing SL/target/stop loss checked.
+        """
+        # v16: ALWAYS check exits first — protects open trades even if scan fails
+        try:
+            self.check_exits()
+        except Exception as exit_err:
+            logger.error(f"  EXIT_CHECK_FAILED: {exit_err} — open trades unprotected this cycle!")
+
+        # Scan for new signals (if this fails, exits above already ran)
         signals = self.scan_all_strategies()
         self.execute_paper_signals(signals)
-        self.check_exits()
+
         # v15: Full status only every 60s, signals log only when signals exist
         if (time.time() - self._last_full_log_time) < self._full_log_interval:
             pass  # skip verbose status on tick cycles

@@ -19,7 +19,7 @@ Usage:
 
 import sys
 
-# v13.7: Consecutive error counters for auto-recovery
+# v13.7: Consecutive error counters for auto-recovery (legacy — replaced by error_reactor v16)
 _eq_err_count = 0
 _cm_err_count = 0
 import os
@@ -221,6 +221,18 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
     """
     logger.info(f"[EquityThread] Starting | Interval: {interval_sec}s | Hours: {EQUITY_OPEN}-{EQUITY_CLOSE}")
 
+    # v16: Error reactor for immediate error classification + action
+    try:
+        from error_reactor import classify_error, ErrorTracker, HeartbeatWriter, send_watchdog_alert, write_crash_dump, try_reconnect
+        _eq_tracker = ErrorTracker()
+        _eq_heartbeat = HeartbeatWriter()
+        logger.info("[EquityThread] Error reactor + heartbeat initialized")
+    except ImportError:
+        _eq_tracker = None
+        _eq_heartbeat = None
+        try_reconnect = None
+        logger.warning("[EquityThread] error_reactor not available — using legacy error handling")
+
     try:
         sys.path.insert(0, BASE_DIR)
         from paper_trader import PaperTrader
@@ -265,6 +277,11 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
                 logger.info(f"[EquityThread] Scan #{scan_count} | {now.strftime('%H:%M:%S')}")
                 try:
                     trader.run_once()
+                    # v16: Reset error counter + write heartbeat on success
+                    if _eq_tracker:
+                        _eq_tracker.reset('equity')
+                    if _eq_heartbeat:
+                        _eq_heartbeat.write('equity', scan_count, ws_feed)
                     # v7.7: Track signal times and detect gaps
                     for sym in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
                         if any(s.get('symbol') == sym for s in getattr(trader, 'daily_signals_all', [])):
@@ -288,13 +305,47 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
                             except Exception:
                                 pass
                 except Exception as e:
-                    logger.error(f"[EquityThread] Scan error: {e}")
-                    global _eq_err_count
-                    _eq_err_count += 1
-                    if _eq_err_count >= 10:
-                        logger.error(f"[EquityThread] AUTO-RECOVERY: {_eq_err_count} consecutive errors — restarting")
-                        import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
-                        break
+                    # v16: EMERGENCY — try to protect open trades even though run_once() failed
+                    try:
+                        if hasattr(trader, 'check_exits') and trader.portfolio.positions:
+                            logger.warning(f"[EquityThread] EMERGENCY EXIT CHECK — {len(trader.portfolio.positions)} open positions")
+                            trader.check_exits()
+                    except Exception as exit_err:
+                        logger.error(f"[EquityThread] Emergency exit check also failed: {exit_err}")
+
+                    # v16: Error reactor — reconnect first, restart only as last resort
+                    if _eq_tracker:
+                        severity, code, _ = classify_error(e)
+                        logger.error(f"[EquityThread] {severity} {code}: {e}")
+                        action = _eq_tracker.record('equity', severity, code)
+                        send_watchdog_alert(severity, code, str(e), action)
+                        if severity == 'FATAL':
+                            write_crash_dump('equity', e)
+
+                        if action == 'reconnect':
+                            # Try in-place reconnect — no service restart, no trade interruption
+                            if try_reconnect(trader, ws_feed, 'equity'):
+                                _eq_tracker.reconnect_succeeded('equity')
+                                logger.info("[EquityThread] Reconnected — continuing trading")
+                            else:
+                                final = _eq_tracker.reconnect_failed('equity')
+                                if final == 'restart_service':
+                                    logger.error("[EquityThread] 3 reconnect failures → RESTART algo-trading (last resort)")
+                                    import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                                    break
+                        elif action == 'restart_service':
+                            logger.error(f"[EquityThread] Error reactor → RESTART algo-trading")
+                            import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                            break
+                    else:
+                        # Legacy fallback if error_reactor not available
+                        logger.error(f"[EquityThread] Scan error: {e}")
+                        global _eq_err_count
+                        _eq_err_count += 1
+                        if _eq_err_count >= 10:
+                            logger.error(f"[EquityThread] AUTO-RECOVERY: {_eq_err_count} consecutive errors — restarting")
+                            import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                            break
                     import traceback
                     traceback.print_exc()
                     # v7.2: Send Telegram notification for scan failure
@@ -358,6 +409,18 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
     """
     logger.info(f"[CommodityThread] Starting | Interval: {interval_sec}s | Hours: {MCX_OPEN}-{MCX_CLOSE}")
 
+    # v16: Error reactor for immediate error classification + action
+    try:
+        from error_reactor import classify_error, ErrorTracker, HeartbeatWriter, send_watchdog_alert, write_crash_dump, try_reconnect
+        _cm_tracker = ErrorTracker()
+        _cm_heartbeat = HeartbeatWriter()
+        logger.info("[CommodityThread] Error reactor + heartbeat initialized")
+    except ImportError:
+        _cm_tracker = None
+        _cm_heartbeat = None
+        try_reconnect = None
+        logger.warning("[CommodityThread] error_reactor not available — using legacy error handling")
+
     try:
         sys.path.insert(0, BASE_DIR)
         from commodity_paper_trader import CommodityPaperTrader, PAPER_TRADE_COMMODITIES
@@ -403,6 +466,11 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                 logger.info(f"[CommodityThread] Scan #{scan_count} | {now.strftime('%H:%M:%S')}")
                 try:
                     trader.run_once()
+                    # v16: Reset error counter + write heartbeat on success
+                    if _cm_tracker:
+                        _cm_tracker.reset('commodity')
+                    if _cm_heartbeat:
+                        _cm_heartbeat.write('commodity', scan_count, ws_feed)
                     # v7.7: Track commodity signal gaps
                     for comm in PAPER_TRADE_COMMODITIES:
                         if any(s.get('commodity') == comm for s in getattr(trader, 'daily_signals_all', [])):
@@ -417,13 +485,46 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                                 except Exception:
                                     pass
                 except Exception as e:
-                    logger.error(f"[CommodityThread] Scan error: {e}", exc_info=True)
-                    global _cm_err_count
-                    _cm_err_count += 1
-                    if _cm_err_count >= 10:
-                        logger.error(f"[CommodityThread] AUTO-RECOVERY: {_cm_err_count} consecutive errors — restarting")
-                        import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
-                        break
+                    # v16: EMERGENCY — try to protect open trades even though run_once() failed
+                    try:
+                        if hasattr(trader, 'check_exits') and trader.portfolio.positions:
+                            logger.warning(f"[CommodityThread] EMERGENCY EXIT CHECK — {len(trader.portfolio.positions)} open positions")
+                            trader.check_exits()
+                    except Exception as exit_err:
+                        logger.error(f"[CommodityThread] Emergency exit check also failed: {exit_err}")
+
+                    # v16: Error reactor — reconnect first, restart only as last resort
+                    if _cm_tracker:
+                        severity, code, _ = classify_error(e)
+                        logger.error(f"[CommodityThread] {severity} {code}: {e}")
+                        action = _cm_tracker.record('commodity', severity, code)
+                        send_watchdog_alert(severity, code, str(e), action)
+                        if severity == 'FATAL':
+                            write_crash_dump('commodity', e)
+
+                        if action == 'reconnect':
+                            if try_reconnect(trader, ws_feed, 'commodity'):
+                                _cm_tracker.reconnect_succeeded('commodity')
+                                logger.info("[CommodityThread] Reconnected — continuing trading")
+                            else:
+                                final = _cm_tracker.reconnect_failed('commodity')
+                                if final == 'restart_service':
+                                    logger.error("[CommodityThread] 3 reconnect failures → RESTART algo-trading (last resort)")
+                                    import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                                    break
+                        elif action == 'restart_service':
+                            logger.error(f"[CommodityThread] Error reactor → RESTART algo-trading")
+                            import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                            break
+                    else:
+                        # Legacy fallback
+                        logger.error(f"[CommodityThread] Scan error: {e}", exc_info=True)
+                        global _cm_err_count
+                        _cm_err_count += 1
+                        if _cm_err_count >= 10:
+                            logger.error(f"[CommodityThread] AUTO-RECOVERY: {_cm_err_count} consecutive errors — restarting")
+                            import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-trading'])
+                            break
                     import traceback
                     traceback.print_exc()
                     # v7.2: Send Telegram notification for scan failure

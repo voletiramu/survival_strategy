@@ -2220,20 +2220,10 @@ class CommodityPaperTrader:
         except Exception as e:
             logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
 
-        # v11.2: TrueData as Source 2 for MCX option chain + LTP
+        # v11.2: TrueData as Source 2 — DISABLED v16: Trial expired 2026-03-23
+        # TrueData causes crash loop (subscription expired → reconnect → RecursionError)
         self.truedata = None
-        try:
-            from truedata_feed import TrueDataFeed
-            self.truedata = TrueDataFeed()
-            if self.truedata.connect():
-                src_num = "2" if self.zerodha else "1 (Zerodha unavailable)"
-                logger.info(f"[TrueData] Initialized as Source {src_num} for MCX option chain + LTP")
-                self.engine.truedata = self.truedata
-            else:
-                self.truedata = None
-                logger.warning("[TrueData] Connection failed — falling back to Angel API")
-        except Exception as e:
-            logger.warning(f"[TrueData] Not available: {e} — falling back to Angel API")
+        logger.info("[TrueData] DISABLED — trial expired 2026-03-23. Using Zerodha + Angel.")
         # v13.0: Calculus engine — intraday VWAP + momentum direction
         from market_calculus import MarketCalculus
         self.calculus = MarketCalculus()
@@ -4135,9 +4125,16 @@ class CommodityPaperTrader:
             logger.error(f"Error writing live scan data: {e}")
 
     def run_once(self):
+        """v16: check_exits() runs FIRST — protects open trades even if scan fails."""
+        # v16: ALWAYS check exits first — protects open trades even if scan fails
+        try:
+            self.check_exits()
+        except Exception as exit_err:
+            logger.error(f"  EXIT_CHECK_FAILED: {exit_err} — open trades unprotected this cycle!")
+
+        # Scan for new signals (if this fails, exits above already ran)
         signals = self.scan_all()
         self.execute_signals(signals)
-        self.check_exits()
         self.portfolio.print_status()
 
         # Save signals log with full data for future backtests (v7.2)

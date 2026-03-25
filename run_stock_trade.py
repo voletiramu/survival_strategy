@@ -21,7 +21,7 @@ Deployment:
 
 import sys
 
-_stk_err_count = 0  # v13.7: Auto-recovery counter
+_stk_err_count = 0  # v13.7: Auto-recovery counter (legacy — replaced by error_reactor v16)
 
 import os
 import time
@@ -50,7 +50,7 @@ EQUITY_CLOSE = dtime(15, 30)
 SCANNER_TIME = dtime(8, 30)     # Morning CPR scan
 
 # Default scan interval
-DEFAULT_INTERVAL = 30  # seconds
+DEFAULT_INTERVAL = 30  # seconds (was 1 — caused 1s scan loop, 26MB log spam)
 
 # Logging
 today_str = datetime.now().strftime('%Y%m%d')
@@ -139,7 +139,7 @@ def print_banner():
 # ====================================================================
 # MAIN TRADING LOOP
 # ====================================================================
-def stock_loop(interval_sec=30, stop_event=None):
+def stock_loop(interval_sec=1, stop_event=None):
     """Main stock options trading loop.
 
     Flow:
@@ -155,6 +155,18 @@ def stock_loop(interval_sec=30, stop_event=None):
     """
     sys.path.insert(0, BASE_DIR)
     from stock_paper_trader import StockPaperTrader
+
+    # v16: Error reactor for immediate error classification + action
+    try:
+        from error_reactor import classify_error, ErrorTracker, HeartbeatWriter, send_watchdog_alert, write_crash_dump, try_reconnect
+        _stk_tracker = ErrorTracker()
+        _stk_heartbeat = HeartbeatWriter()
+        logger.info("[StockLoop] Error reactor + heartbeat initialized")
+    except ImportError:
+        _stk_tracker = None
+        _stk_heartbeat = None
+        try_reconnect = None
+        logger.warning("[StockLoop] error_reactor not available — using legacy error handling")
 
     logger.info(f"[StockLoop] Starting | Interval: {interval_sec}s")
 
@@ -242,14 +254,52 @@ def stock_loop(interval_sec=30, stop_event=None):
                 last_health_check = datetime.now()
             try:
                 trader.run_once()
+                # v16: Reset error counter + write heartbeat on success
+                if _stk_tracker:
+                    _stk_tracker.reset('stock')
+                if _stk_heartbeat:
+                    _stk_heartbeat.write('stock', scan_count)
             except Exception as e:
-                logger.error(f"[StockLoop] Scan error: {e}", exc_info=True)
-                global _stk_err_count
-                _stk_err_count += 1
-                if _stk_err_count >= 10:
-                    logger.error(f"[StockLoop] AUTO-RECOVERY: {_stk_err_count} consecutive errors — restarting")
-                    import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-stock-trading'])
-                    break
+                # v16: EMERGENCY — try to protect open trades even though run_once() failed
+                try:
+                    if hasattr(trader, 'check_exits') and trader.portfolio.positions:
+                        logger.warning(f"[StockLoop] EMERGENCY EXIT CHECK — {len(trader.portfolio.positions)} open positions")
+                        trader.check_exits()
+                except Exception as exit_err:
+                    logger.error(f"[StockLoop] Emergency exit check also failed: {exit_err}")
+
+                # v16: Error reactor — reconnect first, restart only as last resort
+                if _stk_tracker:
+                    severity, code, _ = classify_error(e)
+                    logger.error(f"[StockLoop] {severity} {code}: {e}", exc_info=True)
+                    action = _stk_tracker.record('stock', severity, code)
+                    send_watchdog_alert(severity, code, str(e), action)
+                    if severity == 'FATAL':
+                        write_crash_dump('stock', e)
+
+                    if action == 'reconnect':
+                        if try_reconnect(trader, None, 'stock'):
+                            _stk_tracker.reconnect_succeeded('stock')
+                            logger.info("[StockLoop] Reconnected — continuing trading")
+                        else:
+                            final = _stk_tracker.reconnect_failed('stock')
+                            if final == 'restart_service':
+                                logger.error("[StockLoop] 3 reconnect failures → RESTART algo-stock-trading (last resort)")
+                                import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-stock-trading'])
+                                break
+                    elif action == 'restart_service':
+                        logger.error(f"[StockLoop] Error reactor → RESTART algo-stock-trading")
+                        import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-stock-trading'])
+                        break
+                else:
+                    # Legacy fallback
+                    logger.error(f"[StockLoop] Scan error: {e}", exc_info=True)
+                    global _stk_err_count
+                    _stk_err_count += 1
+                    if _stk_err_count >= 10:
+                        logger.error(f"[StockLoop] AUTO-RECOVERY: {_stk_err_count} consecutive errors — restarting")
+                        import subprocess; subprocess.Popen(['systemctl', 'restart', 'algo-stock-trading'])
+                        break
 
             if stop_event:
                 stop_event.wait(interval_sec)
