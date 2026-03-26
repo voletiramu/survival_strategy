@@ -1,6 +1,7 @@
 """
 COMMODITY PAPER TRADING SYSTEM (v7.1)
 =======================================
+from ghost_zone_v8 import GhostZoneV8
 Paper trading for MCX commodity options using Angel One SmartAPI
 3 ACTIVE STRATEGIES: CPR (45%), Gamma Blast (35%), Ghost Zone (20%)
 Uses Black-76 model (options on futures)
@@ -221,7 +222,7 @@ MCX_MIN_PROFIT_TO_COST_RATIO = 2.0  # Expected profit must be >= 2x total cost
 MCX_GRACE_PERIOD_SECONDS = 180     # v7.6: 3 min (was 10 min — missed fast spikes)
 MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
 MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
-MCX_MAX_TRADES_PER_DAY = 12           # Hard cap on daily commodity trades
+MCX_MAX_TRADES_PER_DAY = 999  # v19: No daily trade limit for paper           # Hard cap on daily commodity trades
 MCX_MAX_SAME_DIRECTION_PER_COMMODITY = 5  # v9.5: Max BUY_CE or BUY_PE per commodity per day
 MCX_SCORE_ESCALATION_PER_REENTRY = 15    # v9.5: Each re-entry same strat+dir needs +15 score
 MCX_MIN_OI_EXIT_PNL = 50              # Min Rs 50 PnL to allow OI/IV exit (covers 2x MCX brokerage)
@@ -729,6 +730,32 @@ def mcx_compute_hold_score(pos, spot, indicators, current_oi=None, current_iv=No
 # ====================================================================
 # PORTFOLIO TRACKER
 # ====================================================================
+
+# LOCAL BLACK-SCHOLES (replaces Angel Greeks API for MCX)
+from scipy.stats import norm as _bs_norm
+
+def _mcx_implied_vol(market_price, S, K, T, r=0.07, opt_type='CE', max_iter=30):
+    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return 0
+    sigma = 0.30
+    for _ in range(max_iter):
+        d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+        d2 = d1 - sigma*np.sqrt(T)
+        if opt_type == 'CE':
+            price = S*_bs_norm.cdf(d1) - K*np.exp(-r*T)*_bs_norm.cdf(d2)
+        else:
+            price = K*np.exp(-r*T)*_bs_norm.cdf(-d2) - S*_bs_norm.cdf(-d1)
+        diff = price - market_price
+        if abs(diff) < 0.01:
+            return sigma
+        vega = S*np.sqrt(T)*_bs_norm.pdf(d1) / 100
+        if abs(vega) < 1e-10:
+            break
+        sigma -= diff / (vega * 100)
+        sigma = max(0.01, min(sigma, 5.0))
+    return sigma if 0.01 < sigma < 5.0 else 0
+
+
 class CommodityPortfolio:
     """Track commodity paper positions."""
 
@@ -1050,6 +1077,7 @@ class CommodityStrategyEngine:
                         if best:
                             logger.info(f"  MCX_ZD_STRIKE: {commodity} {opt_type} ATM={atm} "
                                        f"Selected={best['strike']} LTP={best['greeks']['price']:.2f} [Zerodha]")
+                            self._last_ltp_source = 'ZERODHA'
                             return best
             except Exception as e:
                 logger.debug(f"  MCX_ZD_CHAIN_ERR: {commodity} {opt_type} — {e}")
@@ -1117,6 +1145,7 @@ class CommodityStrategyEngine:
                         if best:
                             logger.info(f"  MCX_TD_STRIKE: {commodity} {opt_type} ATM={atm} "
                                        f"Selected={best['strike']} LTP={best['greeks']['price']:.2f} [TrueData]")
+                            self._last_ltp_source = 'ZERODHA'
                             return best
             except Exception as e:
                 logger.debug(f"  MCX_TD_CHAIN_ERR: {commodity} {opt_type} — {e}")
@@ -1513,21 +1542,21 @@ class CommodityStrategyEngine:
             cpr_label = "Narrow"
             target_hit_mult = 1.5    # 50% gain (Camarilla confirmed)
             target_base_mult = 1.3   # 30% gain (no Camarilla confirmation)
-            sl_mult = 0.5
+            sl_mult = 0.70  # v19: Max 30% loss
             # v13.3: Volatility-adjusted SL
             if VOLATILITY_SL_ENABLED and commodity in ATR_REFERENCE:
                 vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(commodity, 313))
-                sl_mult = max(0.12, min(0.50, vol_sl_mult))  # Clamp 12%-50%
+                sl_mult = max(0.70, min(0.85, vol_sl_mult))  # v19: Max 30% loss (was 88%)  # Clamp 12%-50%
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
             target_hit_mult = 1.4    # 40% gain
             target_base_mult = 1.25  # 25% gain
-            sl_mult = 0.5
+            sl_mult = 0.70  # v19: Max 30% loss
         else:
             cpr_label = "Wide"
             target_hit_mult = 1.3    # 30% gain
             target_base_mult = 1.2   # 20% gain
-            sl_mult = 0.5
+            sl_mult = 0.70  # v19: Max 30% loss
 
         # BUY breakout for Narrow + Moderate CPR (cpr_w <= 0.6)
         vwap = ind.get('vwap', spot)
@@ -1627,11 +1656,11 @@ class CommodityStrategyEngine:
         elif actual_dte <= 7:
             iv_mult = 1.2
             target_mult = 1.5  # 50% gain
-            sl_mult = 0.5
+            sl_mult = 0.70  # v19: Max 30% loss
         else:
             iv_mult = max(1.0, 1.3 - actual_dte * 0.02)   # Gradually decrease
             target_mult = max(1.3, 1.5 - actual_dte * 0.01)  # 30-50% gain
-            sl_mult = 0.5
+            sl_mult = 0.70  # v19: Max 30% loss
 
         if ind['prev_range'] > 1.2:
             return signals
@@ -2533,10 +2562,18 @@ class CommodityPaperTrader:
                         if current_oi is not None:
                             current_oi = float(current_oi)
 
-            # Method 2: get_option_greeks for IV
-            greeks_data = self.angel.get_option_greeks(commodity, expiry)
-            if greeks_data:
-                for item in (greeks_data if isinstance(greeks_data, list) else [greeks_data]):
+            # Method 2: Local BS IV calculation (replaces Angel Greeks)
+            if current_iv is None and spot > 0 and premium > 0:
+                try:
+                    dte_days = max(pos.get('dte', 1), 1)
+                    iv_calc = _mcx_implied_vol(premium, spot, strike, dte_days/365.0, 0.07, opt_type)
+                    if iv_calc > 0:
+                        current_iv = round(iv_calc * 100, 2)
+                except Exception:
+                    pass
+            if False:  # Disabled Angel Greeks
+                greeks_data = None
+                for item in []:
                     item_strike = float(item.get('strikePrice', 0))
                     item_type = item.get('optionType', '')
                     if abs(item_strike - strike) < 1 and item_type == opt_type:
@@ -2935,6 +2972,34 @@ class CommodityPaperTrader:
                                f"| {sig['reason']}")
 
         
+
+            # v19: Ghost Zone v8 - Institutional zone detection (no choppy shield)
+            if hasattr(self, "ghost_v8") and self.ghost_v8:
+                _now = datetime.now()
+                self.ghost_v8.update_tick(commodity, spot, _now)
+                gz8_sigs = self.ghost_v8.get_signals(commodity, _now)
+                for gz_sig in gz8_sigs:
+                    gz_opt_type = "CE" if "CE" in gz_sig["type"] else "PE"
+                    _si = COMMODITIES[commodity]["strike_interval"]
+                    _T = dte / 365
+                    _iv = indicators.get("iv", 0.20)
+                    opt = self.engine.select_strike_live(commodity, spot, _si, _T, RISK_FREE_RATE, _iv, gz_opt_type, MCX_MIN_PREMIUM_BUY)
+                    if opt and opt["greeks"]["price"] > MCX_MIN_PREMIUM_BUY:
+                        gz_prem = opt["greeks"]["price"]
+                        gz_entry = {
+                            "type": gz_sig["type"], "strike": opt["strike"],
+                            "premium": gz_prem, "greeks": opt["greeks"],
+                            "reason": gz_sig["reason"],
+                            "target": gz_prem * 1.20,
+                            "sl": gz_prem * 0.90,
+                            "strategy": "Ghost Zone v8",
+                            "commodity": commodity, "spot": spot, "dte": dte,
+                            "quality_score": 85,
+                        }
+                        all_signals.append(gz_entry)
+                        logger.info("  SIGNAL [Ghost Zone v8]: %s Strike=%s Prem=Rs %.2f | %s",
+                                    gz_sig["type"], opt["strike"], gz_prem, gz_sig["reason"])
+
                         # v13.7: LIQUIDITY SWEEP DISABLED for commodity (causes scan crashes)
             # Will re-enable after Angel->Zerodha migration
 
@@ -4190,6 +4255,7 @@ class CommodityPaperTrader:
                     'reason': s.get('reason', ''),
                     # Execution status
                     'executed': sig_key in executed_keys,
+                    'ltp_source': getattr(self, '_last_ltp_source', 'UNKNOWN'),
                 })
             df = pd.DataFrame(rows)
             if os.path.exists(log_file):

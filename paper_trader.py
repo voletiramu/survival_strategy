@@ -67,14 +67,14 @@ WAVE_TARGET_MULT = 1.40
 # CAPITAL ALLOCATION & RISK MANAGEMENT
 # ====================================================================
 TOTAL_CAPITAL = 600000
-EQUITY_CAPITAL = 300000        # Rs 3L for NIFTY, BANKNIFTY, SENSEX
-COMMODITY_CAPITAL = 300000     # Rs 3L for GOLDM, SILVERM, CRUDEOILM
+EQUITY_CAPITAL = 1000000  # v19: Paper trade - no capital lock        # Rs 3L for NIFTY, BANKNIFTY, SENSEX
+COMMODITY_CAPITAL = 1000000  # v19: Paper trade - no capital lock     # Rs 3L for GOLDM, SILVERM, CRUDEOILM
 MAX_RISK_PCT = 25              # Max 25% of segment capital per trade
-MAX_EQUITY_PER_TRADE = EQUITY_CAPITAL * MAX_RISK_PCT / 100    # Rs 75,000
-MAX_COMMODITY_PER_TRADE = COMMODITY_CAPITAL * MAX_RISK_PCT / 100  # Rs 75,000
-MAX_DAILY_LOSS_EQUITY = EQUITY_CAPITAL * 0.10    # 10% daily loss limit
-MAX_DAILY_LOSS_COMMODITY = COMMODITY_CAPITAL * 0.10
-MAX_POSITIONS_PER_SYMBOL = 3  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
+MAX_EQUITY_PER_TRADE = 500000  # v19: No per-trade cap for paper
+MAX_COMMODITY_PER_TRADE = 500000  # v19: No per-trade cap for paper
+MAX_DAILY_LOSS_EQUITY = 500000  # v19: Paper trade - high limit
+MAX_DAILY_LOSS_COMMODITY = 500000  # v19: Paper trade - high limit
+MAX_POSITIONS_PER_SYMBOL = 10  # v19: Allow more concurrent positions  # Prevent cascade (e.g., 8 BANKNIFTY trades in 4 minutes)
 
 # ====================================================================
 # PER-STRATEGY TRACKING (v7.2) — MONITORING ONLY, NO HARD CAPS
@@ -176,7 +176,7 @@ GRACE_PERIOD_SECONDS = 180       # v7.5: 3 min (was 10 min — missed fast spike
 GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss, no re-entry same direction
 REENTRY_COOLDOWN_SECONDS = 600   # 10 min after any exit before re-entering same symbol
 DIRECTION_FLIP_COOLDOWN_SECONDS = 900  # v9.2: 15 min after DIRECTION_FLIP, no re-entry ANY direction
-MAX_TRADES_PER_DAY = 15          # Hard cap on daily equity trades
+MAX_TRADES_PER_DAY = 999  # v19: No daily trade limit for paper          # Hard cap on daily equity trades
 MAX_SAME_DIRECTION_PER_SYMBOL = 5  # v9.5: Max BUY_CE or BUY_PE per symbol per day (across all strategies)
 SCORE_ESCALATION_PER_REENTRY = 15  # v9.5: Each re-entry same strat+dir needs +15 score
 MIN_OI_EXIT_PNL = 80             # Min Rs 80 PnL to allow OI/IV exit (covers 2x brokerage)
@@ -1651,7 +1651,7 @@ class PaperPortfolio:
             return None
 
         # Check 5: Drawdown-based position scaling (for single-lot trades too)
-        if current_dd_pct > 5:
+        if False:  # v19: DD scaling disabled for paper
             scale_factor = max(0.5, 1.0 - (current_dd_pct - 5) * 0.05)
             scaled_max = max_per_trade * scale_factor
             if trade_cost > scaled_max:

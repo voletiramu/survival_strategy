@@ -1,6 +1,7 @@
 """
 STOCK OPTIONS PAPER TRADING ENGINE (v1.0)
 ==========================================
+from ghost_zone_v8 import GhostZoneV8
 Paper trading for individual stock options (SBIN, RELIANCE, HDFCBANK, etc.)
 Completely independent from the index paper_trader.py.
 
@@ -56,9 +57,9 @@ STOCK_CAPITAL = 200000         # Rs 2L for stock options
 MAX_RISK_PCT = 25              # Max 25% of capital per trade
 MAX_PER_TRADE = 50000          # Max Rs 50K per single trade
 MAX_DAILY_LOSS = 20000         # Rs 20K daily loss limit (circuit breaker)
-MAX_POSITIONS_PER_STOCK = 2    # Max open positions per stock
-MAX_TOTAL_POSITIONS = 5        # Max total open positions across all stocks
-MAX_TRADES_PER_DAY = 10        # Hard cap on daily trades
+MAX_POSITIONS_PER_STOCK = 10  # v19: Allow more concurrent positions    # Max open positions per stock
+MAX_TOTAL_POSITIONS = 20  # v19: Allow more positions for paper        # Max total open positions across all stocks
+MAX_TRADES_PER_DAY = 999  # v19: No daily trade limit for paper        # Hard cap on daily trades
 MAX_LOTS_PER_TRADE = 2         # Max lots per trade (stock options = larger lots)
 
 # Brokerage (NSE equity options)
@@ -349,6 +350,7 @@ def validate_signal_direction(signal_type, spot, ohlc, indicators):
 # ====================================================================
 # STOCK CPR SCANNER -- Morning narrow-CPR stock selector
 # ====================================================================
+# ====================================================================# BLACK-SCHOLES ENGINE (local — replaces Angel Greeks API)# ====================================================================from scipy.stats import norm as _bs_normdef bs_greeks(S, K, T, r, sigma, opt_type="CE"):    """Black-Scholes option pricing with Greeks."""    T = max(T, 1e-6)    sigma = max(sigma, 0.01)    S = max(S, 0.01)    K = max(K, 0.01)    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))    d2 = d1 - sigma*np.sqrt(T)    if opt_type == "CE":        price = S*_bs_norm.cdf(d1) - K*np.exp(-r*T)*_bs_norm.cdf(d2)        delta = _bs_norm.cdf(d1)    else:        price = K*np.exp(-r*T)*_bs_norm.cdf(-d2) - S*_bs_norm.cdf(-d1)        delta = -_bs_norm.cdf(-d1)    gamma = _bs_norm.pdf(d1) / (S*sigma*np.sqrt(T))    theta = -(S*sigma*_bs_norm.pdf(d1))/(2*np.sqrt(T)) - r*K*np.exp(-r*T)*_bs_norm.cdf(d2 if opt_type=="CE" else -d2)    theta /= 365    vega = S*np.sqrt(T)*_bs_norm.pdf(d1) / 100    return {"price": max(price, 0.05), "delta": delta, "gamma": gamma,            "theta": theta, "vega": vega, "iv": sigma}def implied_vol(market_price, S, K, T, r, opt_type="CE", max_iter=50, tol=1e-4):    """Newton-Raphson implied volatility solver."""    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:        return None    sigma = 0.25    for _ in range(max_iter):        g = bs_greeks(S, K, T, r, sigma, opt_type)        diff = g["price"] - market_price        if abs(diff) < tol:            return sigma        v = g["vega"] * 100        if abs(v) < 1e-10:            break        sigma -= diff / v        sigma = max(0.01, min(sigma, 5.0))    return sigma if 0.01 < sigma < 5.0 else None
 class StockCPRScanner:
     """Scans F&O stocks each morning and ranks by CPR width.
 
@@ -1379,6 +1381,7 @@ class StockAngelConnection:
                         logger.info(f"  ZERODHA_STRIKE: {name} {opt_type} ATM={atm_strike} "
                                     f"Selected={zd_best['strike']} OI={zd_best['oi']:,.0f} "
                                     f"LTP={zd_best['ltp']:.2f} [Zerodha]")
+                        self._last_ltp_source = 'ZERODHA'
                         return zd_best
             except Exception as e:
                 logger.debug(f"[Zerodha] Strike lookup failed for {name}: {e}")
@@ -2259,6 +2262,8 @@ class StockPaperTrader:
             self.zerodha = ZerodhaFeed()
             if self.zerodha.connect():
                 logger.info("[Zerodha] ✅ Initialized as Source 1 for stock option chain + LTP")
+                self._last_ltp_source = 'ZERODHA'
+                self.angel._last_ltp_source = 'ZERODHA' if hasattr(self, 'angel') and self.angel else None
             else:
                 self.zerodha = None
                 logger.warning("[Zerodha] Connection failed — trying TrueData as Source 2")
@@ -2595,18 +2600,20 @@ class StockPaperTrader:
                         if mkt_data.get('impliedVolatility'):
                             current_iv = mkt_data['impliedVolatility']
 
-            # Method 2: Option Greeks API for IV
-            if current_iv is None and expiry:
-                greeks_data = self.angel.get_option_greeks(symbol, expiry)
-                if greeks_data and isinstance(greeks_data, list):
-                    for row in greeks_data:
-                        row_strike = float(row.get('strikePrice', row.get('strike', 0)))
-                        row_type = row.get('optionType', row.get('type', ''))
-                        if abs(row_strike - strike) < 10 and opt_type in str(row_type).upper():
-                            current_iv = row.get('impliedVolatility', row.get('iv', None))
-                            if current_oi is None:
-                                current_oi = row.get('openInterest', row.get('oi', None))
-                            break
+            # Method 2: Local Black-Scholes IV (replaces Angel Greeks API)
+            if current_iv is None:
+                try:
+                    spot = pos.get('spot', pos.get('entry_spot', 0))
+                    premium = pos.get('current_premium', pos.get('entry_premium', 0))
+                    dte_days = max(pos.get('dte', 1), 1)
+                    T_years = dte_days / 365.0
+                    if spot > 0 and premium > 0:
+                        iv_calc = implied_vol(premium, spot, strike, T_years, 0.07, opt_type)
+                        if iv_calc:
+                            current_iv = round(iv_calc * 100, 2)
+                            logger.debug(f"  BS_IV: {pos['id']} IV={current_iv}% (local BS)")
+                except Exception as e:
+                    logger.debug(f"  BS_IV_ERR: {pos.get('id', '?')}: {e}")
 
             # Ensure numeric
             if current_oi is not None:
@@ -3572,6 +3579,29 @@ class StockPaperTrader:
                 s['dte'] = dte
             all_signals.extend(pcr_signals)
 
+            # v19: Ghost Zone v8 - Institutional zone detection
+            if hasattr(self, "ghost_v8") and self.ghost_v8:
+                _now = datetime.now()
+                self.ghost_v8.update_tick(symbol, spot, _now)
+                gz8_sigs = self.ghost_v8.get_signals(symbol, _now)
+                for gz_sig in gz8_sigs:
+                    gz_opt_type = "CE" if "CE" in gz_sig["type"] else "PE"
+                    gz_strike, gz_ltp, gz_iv = self.engine._get_strike_from_chain(symbol, spot, gz_opt_type, config.get("dte", 30))
+                    if gz_ltp > 0:
+                        all_signals.append({
+                            "type": gz_sig["type"], "strike": gz_strike,
+                            "premium": gz_ltp, "greeks": {},
+                            "reason": gz_sig["reason"],
+                            "target": gz_ltp * 1.20,
+                            "sl": gz_ltp * 0.90,
+                            "strategy": "Ghost Zone v8",
+                            "symbol": symbol, "spot": spot,
+                            "quality_score": 85,
+                        })
+                        logger.info("  SIGNAL [Ghost Zone v8]: %s %s Strike=%s Prem=Rs %.2f",
+                                    gz_sig["type"], symbol, gz_strike, gz_ltp)
+
+
         # v9.6: Diagnostic logging — spot/indicator summary
         if spots_fail > 0:
             logger.info(f"  [SPOT] OK={spots_ok} FAIL={spots_fail} Raw_signals={len(all_signals)}")
@@ -3617,7 +3647,7 @@ class StockPaperTrader:
                                         'spot': _sw_spot,
                                         'strategy': 'Liquidity Sweep',
                                         'reason': 'Liquidity Sweep: ' + _sw['spike_dir'] + ' spike Q=' + str(_q) + ' [LIVE]',
-                            'ltp_source': getattr(self, '_last_ltp_source', 'UNKNOWN'),
+                            'ltp_source': getattr(self.angel, '_last_ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')),
                                         'target': _sw_ltp * 1.5,
                                         'sl': _sw_ltp * 0.5,
                                         'quality_score': _q,
@@ -4310,7 +4340,7 @@ class StockPaperTrader:
                     'reason': sig.get('reason', ''),
                     # Execution status & data source
                     'executed': sig_key in executed_ids,
-                    'ltp_source': sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')),
+                    'ltp_source': sig.get('ltp_source', getattr(self.angel, '_last_ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))),
                     'signal_strength': compute_signal_strength(sig, sig.get('spot', 0),
                         self.engine.compute_indicators(sig.get('symbol', ''),
                             {} or
@@ -4318,7 +4348,7 @@ class StockPaperTrader:
                              'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
                         ) if hasattr(self, 'engine') else {},
                         self.current_vix if hasattr(self, 'current_vix') else None,
-                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                        sig.get('ltp_source', getattr(self.angel, '_last_ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')))
                     )[0],
                     'strength_label': compute_signal_strength(sig, sig.get('spot', 0),
                         self.engine.compute_indicators(sig.get('symbol', ''),
@@ -4327,7 +4357,7 @@ class StockPaperTrader:
                              'low': sig.get('spot', 0), 'close': sig.get('spot', 0), 'volume': 0}
                         ) if hasattr(self, 'engine') else {},
                         self.current_vix if hasattr(self, 'current_vix') else None,
-                        sig.get('ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN'))
+                        sig.get('ltp_source', getattr(self.angel, '_last_ltp_source', getattr(self, '_last_ltp_source', 'UNKNOWN')))
                     )[1],
                     'data_source': data_source,
                 })

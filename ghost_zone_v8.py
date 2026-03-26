@@ -326,16 +326,18 @@ class GhostZoneV8:
             'type': best.direction + '_GZ8',
             'strategy': 'Ghost Zone v8',
             'zone_type': best.zone_type,
-            'zone_range': '%.0f-%.0f' % (best.zone_bot, best.zone_top),
+            'zone_top': best.zone_top,
+            'zone_bot': best.zone_bot,
+            'zone_range': str(int(best.zone_bot)) + '-' + str(int(best.zone_top)),
             'zone_mult': best.zone_mult,
             'spot': best.spot,
             'signal_type': best.signal_type,
             'bounce_pct': best.bounce_pct,
-            'reason': "GZ v8 %s retest: zone=%.0f-%.0f (%.1fx) bounce=%.2f%% [GHST_ST]" % (
-                best.zone_type, best.zone_bot, best.zone_top,
-                best.zone_mult, best.bounce_pct),
-            'target_pct': 20,  # 20% target
-            'sl_pct': 10,      # 10% SL
+            'target_pct': 20,
+            'sl_pct': 10,
+            'reason': 'GZ v8 %s zone %d-%d (%.1fx) T=20%% SL=10%%' % (
+                best.zone_type, int(best.zone_bot), int(best.zone_top),
+                best.zone_mult),
         })
 
         self._last_signal_time[symbol] = timestamp
