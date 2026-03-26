@@ -246,6 +246,7 @@ class MCPriceEngine:
         else:
             theta_per_min = premium * THETA_DECAY_PER_MIN_NORMAL
 
+        n_steps = int(n_steps)
         paths = np.zeros((self.n_sims, n_steps + 1))
         paths[:, 0] = premium
 
@@ -283,7 +284,7 @@ class MCPriceEngine:
         Returns:
             dict with 'enter' (bool), probabilities, and reasoning
         """
-        n_steps = min(self.n_steps, max_hold_min)
+        n_steps = int(min(self.n_steps, max_hold_min))
 
         # Simulate premium paths using real calibration
         paths = self._simulate_premium_paths(
@@ -354,7 +355,7 @@ class MCPriceEngine:
             dict with 'hold' (bool), 'exit_now' (bool), probabilities
         """
         remaining_hold = max(max_hold_min - time_in_trade_min, 3)
-        n_steps = min(self.n_steps, remaining_hold)
+        n_steps = int(min(self.n_steps, remaining_hold))
 
         paths = self._simulate_premium_paths(
             premium, dte, n_steps, recent_returns, is_trending)
@@ -436,7 +437,7 @@ class MCPriceEngine:
         Returns:
             dict with optimal target, sl, and their probabilities
         """
-        n_steps = min(self.n_steps, max_hold_min)
+        n_steps = int(min(self.n_steps, max_hold_min))
         spot_paths = simulate_spot_paths(spot, iv, dte, self.n_sims, n_steps)
         prem_paths = compute_premium_paths_vectorized(
             spot_paths, strike, opt_type, iv, dte)
