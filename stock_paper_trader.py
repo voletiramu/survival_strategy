@@ -3570,14 +3570,14 @@ class StockPaperTrader:
             for s in gamma_signals:
                 s['_indicators'] = indicators
                 s['dte'] = dte
-            all_signals.extend(gamma_signals)
+            # DISABLED v19.5 (MC REJECTED): all_signals.extend(gamma_signals)
 
             # Check PCR+VWAP
             pcr_signals = self.engine.check_pcr_vwap_signals(symbol, spot, indicators, config)
             for s in pcr_signals:
                 s['_indicators'] = indicators
                 s['dte'] = dte
-            all_signals.extend(pcr_signals)
+            # DISABLED v19.5 (MC REJECTED): all_signals.extend(pcr_signals)
 
             # v19: Ghost Zone v8 - Institutional zone detection
             if hasattr(self, "ghost_v8") and self.ghost_v8:
@@ -3656,6 +3656,21 @@ class StockPaperTrader:
 
         except Exception as _sweep_err:
             logger.debug(f"  SWEEP_SKIP: {_sweep_err}")
+
+        # v19.5: Sweep lot boost for ALL stock strategies
+        try:
+            if hasattr(self, "calculus") and self.calculus and all_signals:
+                for _sc in set(s.get("symbol","") for s in all_signals):
+                    if self.calculus.bar_count(_sc) >= 25:
+                        _sw2 = self.calculus.detect_liquidity_sweep(_sc)
+                        if _sw2:
+                            for _s2 in all_signals:
+                                if _s2.get("symbol") == _sc and not _s2.get("_sweep_confirmed"):
+                                    _s2["_sweep_confirmed"] = True
+                                    _s2["_extra_lots"] = 2
+                                    _s2["quality_score"] = min(100, _s2.get("quality_score", 50) + 15)
+        except Exception:
+            pass
 
         # v9.6: Build indicators lookup from watchlist (signals don't carry indicators)
         ind_lookup = {si['symbol']: si.get('indicators', {}) for si in watchlist}
@@ -3784,6 +3799,10 @@ class StockPaperTrader:
             strategy = sig.get('strategy', '')
             score = sig.get('quality_score', 0)
             lot_size = sig.get('lot_size', 1)
+            # v19.5: Sweep extra lots
+            if sig.get("_extra_lots", 0) > 0:
+                lot_size = lot_size * (1 + sig["_extra_lots"])
+                logger.info("  SWEEP_LOT: %s +%d extra -> lot_size=%d" % (symbol, sig["_extra_lots"], lot_size))
 
             # Stock-level position limit
             if self.portfolio.count_positions_for_stock(symbol) >= MAX_POSITIONS_PER_STOCK:

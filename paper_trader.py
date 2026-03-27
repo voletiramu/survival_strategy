@@ -3924,19 +3924,20 @@ class PaperTrader:
 
 
 # v19: Ghost Zone v8 — Institutional zone detection (no choppy shield)            if hasattr(self, "ghost_v8") and self.ghost_v8:                self.ghost_v8.update_tick(symbol, spot, now)                gz8_signals = self.ghost_v8.get_signals(symbol, now)                for gz_sig in gz8_signals:                    # Get option premium from Zerodha                    gz_opt_type = "CE" if "CE" in gz_sig["type"] else "PE"                    gz_strike, gz_ltp, gz_iv = self._get_strike_from_chain(symbol, spot, gz_opt_type, dte)                    if gz_ltp > 0:                        from math import log, sqrt, exp                        T = dte / 365                        g = bs_greeks(spot, gz_strike, T, RISK_FREE_RATE, gz_iv if gz_iv > 0 else 0.20, gz_opt_type)                        gz_entry = {                            "type": gz_sig["type"],                            "strategy": "Ghost Zone v8",                            "symbol": symbol,                            "strike": gz_strike,                            "premium": gz_ltp,                            "greeks": g,                            "spot": spot,                            "dte": dte,                            "target": gz_ltp * (1 + gz_sig.get("target_pct", 20) / 100),                            "sl": gz_ltp * (1 - gz_sig.get("sl_pct", 10) / 100),                            "reason": gz_sig["reason"],                            "quality_score": 85,                        }                        all_signals.append(gz_entry)                        logger.info(f"  SIGNAL [Ghost Zone v8]: {gz_sig[chr(39)+type+chr(39)]} "                                   f"Strike={gz_strike:.0f} Premium=Rs {gz_ltp:.2f} "                                   f"| {gz_sig[chr(39)+reason+chr(39)]}")
-            # v19.4: Sweep boost for Ghost Zone v8 — EXTRA LOTS on sweep-confirmed
+            # v19.5: Sweep lot boost for ALL strategies
+            # If Liquidity Sweep detected near any signal -> add 2 extra lots
             if hasattr(self, 'calculus') and self.calculus:
                 try:
                     if self.calculus.bar_count(symbol) >= 25:
                         _sweeps = self.calculus.detect_liquidity_sweep(symbol)
                         if _sweeps and all_signals:
-                            _last = all_signals[-1]
-                            if _last.get('strategy') == 'Ghost Zone v8':
-                                _last['quality_score'] = min(100, _last.get('quality_score', 85) + 15)
-                                _last['_sweep_confirmed'] = True
-                                _last['_extra_lots'] = 2  # Add 2 extra lots on sweep
-                                _last['reason'] = _last['reason'] + ' [SWEEP+2LOT]'
-                                logger.info('  SWEEP_LOT_BOOST: %s GZ8 sweep-confirmed, adding 2 extra lots' % symbol)
+                            for _sig in all_signals:
+                                if _sig.get('symbol') == symbol and not _sig.get('_sweep_confirmed'):
+                                    _sig['_sweep_confirmed'] = True
+                                    _sig['_extra_lots'] = 2
+                                    _sig['quality_score'] = min(100, _sig.get('quality_score', 50) + 15)
+                                    _sig['reason'] = _sig.get('reason', '') + ' [SWEEP+2LOT]'
+                                    logger.info('  SWEEP_LOT_BOOST: %s %s sweep-confirmed, +2 lots' % (symbol, _sig.get('strategy', '')))
                 except Exception:
                     pass
             # v18: WaveBC strategies -- Option Premium CPR levels as entry/exit
@@ -6215,7 +6216,7 @@ class PaperTrader:
                 try:
                     self.run_once()
                 except Exception as e:
-                    logger.error(f"  SCAN_ERROR: {e}")
+                    logger.error(f"  SCAN_ERROR: {e}", exc_info=True)
             elif now > MARKET_CLOSE:
                 logger.info("Market closed. Final status:")
                 self.portfolio.print_status()
