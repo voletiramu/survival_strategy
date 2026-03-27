@@ -137,6 +137,11 @@ def parse_positions(data, market='equity'):
             'trough_premium': pos.get('trough_premium', 0),
             'breakeven_locked': pos.get('breakeven_locked', False),
             'reason': pos.get('reason', details.get('reason', '')),
+            # v16: Signal strength + data source
+            'ltp_source': pos.get('ltp_source', details.get('ltp_source', 'UNKNOWN')),
+            'signal_strength': pos.get('signal_strength', details.get('signal_strength', 0)),
+            'strength_label': pos.get('strength_label', details.get('strength_label', '')),
+            'quality_score': pos.get('quality_score', details.get('quality_score', 0)),
         })
     return positions
 
@@ -150,9 +155,10 @@ def parse_closed_trades(data, market='equity'):
     for t in data.get('closed_trades', []):
         ts = t.get('timestamp', t.get('entry_time', ''))
         exit_ts = t.get('exit_time', t.get('closed_at', ''))
-        # Filter for today only
-        if today not in ts and today not in exit_ts:
-            continue
+        # v19: Show ALL dates by default (was today-only)
+        # if today not in ts and today not in exit_ts:  # DISABLED v19
+        #     continue  # v19: removed today filter
+
 
         details = t.get('details', {}) if isinstance(t.get('details'), dict) else {}
         pnl = t.get('pnl', 0)
@@ -239,6 +245,12 @@ def parse_closed_trades(data, market='equity'):
             'multiplier': t.get('multiplier', 1),
             'capital_invested': round(t_cap, 2),
             'capital_after': t.get('capital_after', 0),
+            # v16: Signal strength + data source
+            'ltp_source': t.get('ltp_source', details.get('ltp_source', 'UNKNOWN')),
+            'signal_strength': t.get('signal_strength', details.get('signal_strength', 0)),
+            'strength_label': t.get('strength_label', details.get('strength_label', '')),
+            'quality_score': t.get('quality_score', details.get('quality_score', 0)),
+            'reason': t.get('reason', details.get('reason', '')),
         })
 
     # Sort by exit time and compute running capital_after if not present
@@ -1927,5 +1939,179 @@ def api_chart_symbols():
     return jsonify({'symbols': symbols})
 
 
+
+# ── v19.2: Self-Healing + Backtest Results Endpoints ──────────────────────
+
+@app.route("/api/healing_status")
+def api_healing_status():
+    """Self-healing engine status for dashboard."""
+    try:
+        from self_healing import SelfHealingEngine
+        engine = SelfHealingEngine()
+        return jsonify(engine.get_status())
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/backtest_results")
+def api_backtest_results():
+    """Latest backtest validation results."""
+    results_dir = os.path.join(os.path.dirname(__file__), "data", "healing_results")
+    if not os.path.exists(results_dir):
+        return jsonify({"status": "no_results"})
+
+    # Find latest backtest result
+    files = sorted([f for f in os.listdir(results_dir) if f.startswith("backtest_")])
+    if not files:
+        return jsonify({"status": "no_results"})
+
+    latest = os.path.join(results_dir, files[-1])
+    try:
+        with open(latest) as f:
+            data = json.load(f)
+        data["file"] = files[-1]
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/health_digest")
+def api_health_digest():
+    """Latest health digest report."""
+    results_dir = os.path.join(os.path.dirname(__file__), "data", "healing_results")
+    if not os.path.exists(results_dir):
+        return jsonify({"status": "no_results"})
+
+    files = sorted([f for f in os.listdir(results_dir) if f.startswith("health_")])
+    if not files:
+        return jsonify({"status": "no_results"})
+
+    latest = os.path.join(results_dir, files[-1])
+    try:
+        with open(latest) as f:
+            data = json.load(f)
+        data["file"] = files[-1]
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/strategy_validation")
+def api_strategy_validation():
+    """Run live strategy validation and return results."""
+    try:
+        from self_healing import BacktestChecker, WalkForwardValidator, read_portfolio_trades
+        checker = BacktestChecker()
+        validator = WalkForwardValidator()
+        trades = read_portfolio_trades()
+
+        bt = checker.check_all_strategies(trades)
+
+        # Add walk-forward for each strategy
+        for strat in bt.get("strategies", {}):
+            wf = validator.validate(trades, strat)
+            bt["strategies"][strat]["walk_forward"] = wf
+
+        return jsonify(bt)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/run_healing", methods=["POST"])
+def api_run_healing():
+    """Manually trigger self-healing tasks."""
+    task = request.args.get("task", "backtest")
+    try:
+        from self_healing import SelfHealingEngine
+        engine = SelfHealingEngine()
+        if task == "backtest":
+            result = engine.run_backtest_check()
+        elif task == "retention":
+            result = engine.run_data_retention()
+        elif task == "digest":
+            result = engine.run_health_digest()
+        else:
+            return jsonify({"error": "Unknown task: %s" % task})
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/system_health")
+def api_system_health():
+    """Real-time system health check."""
+    health = {}
+
+    # Disk
+    try:
+        import shutil as sh
+        total, used, free = sh.disk_usage("/")
+        health["disk"] = {
+            "total_gb": round(total / (1024**3), 1),
+            "used_gb": round(used / (1024**3), 1),
+            "free_gb": round(free / (1024**3), 1),
+            "pct": round(used / total * 100, 1),
+        }
+    except:
+        health["disk"] = {"pct": 0}
+
+    # Memory
+    try:
+        with open("/proc/meminfo") as f:
+            lines = f.readlines()
+        mem = {}
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 2:
+                mem[parts[0].rstrip(":")] = int(parts[1])
+        total = mem.get("MemTotal", 0)
+        available = mem.get("MemAvailable", 0)
+        health["memory"] = {
+            "total_mb": round(total / 1024),
+            "used_pct": round((total - available) / max(total, 1) * 100, 1),
+        }
+    except:
+        health["memory"] = {"used_pct": 0}
+
+    # Services
+    try:
+        import subprocess
+        eq = subprocess.run(["systemctl", "is-active", "algo-trading"], capture_output=True, text=True)
+        stk = subprocess.run(["systemctl", "is-active", "algo-stock-trading"], capture_output=True, text=True)
+        health["services"] = {
+            "equity": eq.stdout.strip(),
+            "stock": stk.stdout.strip(),
+        }
+    except:
+        health["services"] = {}
+
+    # Log size
+    try:
+        log_dir = os.path.join(os.path.dirname(__file__), "logs")
+        if os.path.exists(log_dir):
+            log_size = sum(os.path.getsize(os.path.join(log_dir, f))
+                         for f in os.listdir(log_dir) if f.endswith(".log"))
+            health["log_size_mb"] = round(log_size / 1024 / 1024, 1)
+    except:
+        health["log_size_mb"] = 0
+
+    # Zerodha token
+    try:
+        token_file = os.path.join(os.path.dirname(__file__), "config", "zerodha_token.json")
+        if os.path.exists(token_file):
+            with open(token_file) as f:
+                token = json.load(f)
+            from datetime import date as dt
+            health["zerodha"] = {
+                "token_date": token.get("date", ""),
+                "fresh": token.get("date") == dt.today().isoformat(),
+            }
+    except:
+        health["zerodha"] = {"fresh": False}
+
+    return jsonify(health)
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
+
+

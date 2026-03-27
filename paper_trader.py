@@ -31,6 +31,8 @@ from oi_velocity_tracker import OIVelocityTracker, make_gamma_blast_signal
 from option_premium_cpr import OptionPremiumCPR
 from ghost_zone_v8 import GhostZoneV8
 
+from self_healing import SelfHealingEngine
+from self_healing import SelfHealingEngine
 import numpy as np
 import pandas as pd
 
@@ -1611,6 +1613,14 @@ class PaperPortfolio:
                     f"avail=Rs {available_capital:,.0f} DD={current_dd_pct:.1f}%")
 
         lot_size = base_lot * num_lots
+
+        # v19.4: Sweep-confirmed Ghost Zone v8 gets extra lots
+        extra = details.get('_extra_lots', 0) if details else 0
+        if extra > 0:
+            num_lots += extra
+            lot_size = base_lot * num_lots
+            logger.info('  SWEEP_LOT: %s adding %d extra lots -> %d total' % (symbol, extra, num_lots))
+
 
         # Capital required for this trade
         if is_sell:
@@ -3889,9 +3899,9 @@ class PaperTrader:
             # Run active strategies (Survivor HALTED — needs Rs 1L+ capital per symbol)
             strategy_checks = [
                 ('CPR', self.engine.check_cpr_signals),
-                ('Gamma Blast', self.engine.check_gamma_blast_signals),
-                ('Ghost Zone', self.engine.check_ghost_zone_signals),
-                ('PCR+VWAP', self.engine.check_pcr_vwap_signals),
+                # DISABLED v19.3 (MC REJECTED): ('Gamma Blast', self.engine.check_gamma_blast_signals),
+                # DISABLED v19.3 (MC REJECTED): ('Ghost Zone', self.engine.check_ghost_zone_signals),
+                # DISABLED v19.3 (MC REJECTED): ('PCR+VWAP', self.engine.check_pcr_vwap_signals),
                 ('Wave', self.engine.check_wave_signals),
                 # ('Survivor', self.engine.check_survivor_signals),  # HALTED v7 — needs more capital
             ]
@@ -3914,6 +3924,21 @@ class PaperTrader:
 
 
 # v19: Ghost Zone v8 — Institutional zone detection (no choppy shield)            if hasattr(self, "ghost_v8") and self.ghost_v8:                self.ghost_v8.update_tick(symbol, spot, now)                gz8_signals = self.ghost_v8.get_signals(symbol, now)                for gz_sig in gz8_signals:                    # Get option premium from Zerodha                    gz_opt_type = "CE" if "CE" in gz_sig["type"] else "PE"                    gz_strike, gz_ltp, gz_iv = self._get_strike_from_chain(symbol, spot, gz_opt_type, dte)                    if gz_ltp > 0:                        from math import log, sqrt, exp                        T = dte / 365                        g = bs_greeks(spot, gz_strike, T, RISK_FREE_RATE, gz_iv if gz_iv > 0 else 0.20, gz_opt_type)                        gz_entry = {                            "type": gz_sig["type"],                            "strategy": "Ghost Zone v8",                            "symbol": symbol,                            "strike": gz_strike,                            "premium": gz_ltp,                            "greeks": g,                            "spot": spot,                            "dte": dte,                            "target": gz_ltp * (1 + gz_sig.get("target_pct", 20) / 100),                            "sl": gz_ltp * (1 - gz_sig.get("sl_pct", 10) / 100),                            "reason": gz_sig["reason"],                            "quality_score": 85,                        }                        all_signals.append(gz_entry)                        logger.info(f"  SIGNAL [Ghost Zone v8]: {gz_sig[chr(39)+type+chr(39)]} "                                   f"Strike={gz_strike:.0f} Premium=Rs {gz_ltp:.2f} "                                   f"| {gz_sig[chr(39)+reason+chr(39)]}")
+            # v19.4: Sweep boost for Ghost Zone v8 — EXTRA LOTS on sweep-confirmed
+            if hasattr(self, 'calculus') and self.calculus:
+                try:
+                    if self.calculus.bar_count(symbol) >= 25:
+                        _sweeps = self.calculus.detect_liquidity_sweep(symbol)
+                        if _sweeps and all_signals:
+                            _last = all_signals[-1]
+                            if _last.get('strategy') == 'Ghost Zone v8':
+                                _last['quality_score'] = min(100, _last.get('quality_score', 85) + 15)
+                                _last['_sweep_confirmed'] = True
+                                _last['_extra_lots'] = 2  # Add 2 extra lots on sweep
+                                _last['reason'] = _last['reason'] + ' [SWEEP+2LOT]'
+                                logger.info('  SWEEP_LOT_BOOST: %s GZ8 sweep-confirmed, adding 2 extra lots' % symbol)
+                except Exception:
+                    pass
             # v18: WaveBC strategies -- Option Premium CPR levels as entry/exit
             if hasattr(self, 'option_cpr') and self.option_cpr : # v19: choppy removed
                 for sig in list(all_signals):
@@ -6181,6 +6206,7 @@ class PaperTrader:
             self._running = False
 
         signal.signal(signal.SIGINT, signal_handler)
+# v19.2: Start self-healing background scheduler        try:            self._healer = SelfHealingEngine()            self._healer.start()            logger.info("[SelfHealing] Auto-validation engine started (4h backtest, daily digest)")        except Exception as e:            logger.warning("[SelfHealing] Failed to start: %s" % e)
 
         while self._running:
             now = datetime.now().time()
