@@ -245,10 +245,9 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
 
         if not offline:
             try:
-                if not trader.connect():
-                    logger.warning("[EquityThread] Angel API connect returned False, continuing with offline data")
+                trader.connect()  # v24: Best-effort — Dhan/Zerodha already connected in __init__
             except Exception as e:
-                logger.warning(f"[EquityThread] Angel connection error: {e}. Continuing with offline data.")
+                logger.info(f"[EquityThread] connect() note: {e} — Dhan/Zerodha are primary")
 
         scan_count = 0
         _last_signal_time = {}  # v7.7: Track last signal time per symbol for gap alerts
@@ -281,7 +280,30 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
                     if _eq_tracker:
                         _eq_tracker.reset('equity')
                     if _eq_heartbeat:
-                        _eq_heartbeat.write('equity', scan_count, ws_feed)
+                        _eq_heartbeat.write('equity', scan_count, ws_feed, zerodha_feed=getattr(trader, 'zerodha', None))
+                    # v30.1: Hourly Telegram status update (every ~60 min)
+                    try:
+                        _hourly_key = '_last_hourly_tg'
+                        _last_hourly = getattr(trader, _hourly_key, 0)
+                        if time.time() - _last_hourly > 3300:  # 55 min
+                            setattr(trader, _hourly_key, time.time())
+                            from trade_notifier import notify_hourly_status
+                            _md = {}
+                            for _sym in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                                _spot = trader.get_index_spot(_sym)
+                                _ohlc = trader.get_intraday_ohlc(_sym)
+                                _ind = trader.engine.compute_indicators(_sym, _ohlc) if hasattr(trader, 'engine') else None
+                                if _spot and _ind:
+                                    _md[_sym] = {'spot': _spot, 'cpr_width': _ind.get('cpr_width', 0)}
+                            _md['vix'] = getattr(trader, '_last_vix', 0)
+                            _md['open_positions'] = len(trader.portfolio.positions)
+                            _md['trades_today'] = len(trader.portfolio.closed_trades)
+                            _md['pnl_today'] = sum(t.get('pnl', 0) for t in trader.portfolio.closed_trades)
+                            _md['signals_generated'] = scan_count
+                            _md['signals_blocked'] = 0
+                            notify_hourly_status(_md)
+                    except Exception:
+                        pass  # Never let status update crash the scan loop
                     # v7.7: Track signal times and detect gaps
                     for sym in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
                         if any(s.get('symbol') == sym for s in getattr(trader, 'daily_signals_all', [])):
@@ -316,7 +338,7 @@ def equity_loop(interval_sec=15, offline=False, stop_event=None, ws_feed=None, m
                     # v16: Error reactor — reconnect first, restart only as last resort
                     if _eq_tracker:
                         severity, code, _ = classify_error(e)
-                        logger.error(f"[EquityThread] {severity} {code}: {e}")
+                        logger.error("[EquityThread] %s %s: %s" % (severity, code, e), exc_info=True)
                         action = _eq_tracker.record('equity', severity, code)
                         send_watchdog_alert(severity, code, str(e), action)
                         if severity == 'FATAL':
@@ -433,10 +455,9 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
 
         if not offline:
             try:
-                if not trader.connect():
-                    logger.warning("[CommodityThread] Angel API connect returned False, continuing with offline data")
+                trader.connect()  # v24: Best-effort — Dhan/Zerodha already connected in __init__
             except Exception as e:
-                logger.warning(f"[CommodityThread] Angel connection error: {e}. Continuing with offline data.")
+                logger.info(f"[CommodityThread] connect() note: {e} — Dhan/Zerodha are primary")
 
         scan_count = 0
         _last_comm_signal_time = {}  # v7.7: Track last signal time per commodity
@@ -470,7 +491,7 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                     if _cm_tracker:
                         _cm_tracker.reset('commodity')
                     if _cm_heartbeat:
-                        _cm_heartbeat.write('commodity', scan_count, ws_feed)
+                        _cm_heartbeat.write('commodity', scan_count, ws_feed, zerodha_feed=getattr(trader, 'zerodha', None))
                     # v7.7: Track commodity signal gaps
                     for comm in PAPER_TRADE_COMMODITIES:
                         if any(s.get('commodity') == comm for s in getattr(trader, 'daily_signals_all', [])):
@@ -496,7 +517,7 @@ def commodity_loop(interval_sec=10, offline=False, stop_event=None, ws_feed=None
                     # v16: Error reactor — reconnect first, restart only as last resort
                     if _cm_tracker:
                         severity, code, _ = classify_error(e)
-                        logger.error(f"[CommodityThread] {severity} {code}: {e}")
+                        logger.error(f"[CommodityThread] {severity} {code}: {e}", exc_info=True)
                         action = _cm_tracker.record('commodity', severity, code)
                         send_watchdog_alert(severity, code, str(e), action)
                         if severity == 'FATAL':
@@ -572,15 +593,21 @@ def _send_heartbeat(instance_id='local'):
     # v9.2: Proactive token health check — re-authenticate before expiry
     try:
         eq_trader = _trader_refs.get('equity')
-        if eq_trader and hasattr(eq_trader, 'angel') and eq_trader.angel:
-            eq_trader.angel.check_token_health()
+        if eq_trader and hasattr(eq_trader, 'angel') and eq_trader.angel and eq_trader.angel._connected:
+            try:
+                eq_trader.angel.check_token_health()
+            except Exception:
+                pass  # Angel is optional Source 2
     except Exception as e:
         logger.warning(f"  [Heartbeat] Equity token health check failed: {e}")
 
     try:
         comm_trader = _trader_refs.get('commodity')
-        if comm_trader and hasattr(comm_trader, 'angel') and comm_trader.angel:
-            comm_trader.angel.check_token_health()
+        if comm_trader and hasattr(comm_trader, 'angel') and comm_trader.angel and comm_trader.angel._connected:
+            try:
+                comm_trader.angel.check_token_health()
+            except Exception:
+                pass  # Angel is optional Source 2
     except Exception as e:
         logger.warning(f"  [Heartbeat] Commodity token health check failed: {e}")
 

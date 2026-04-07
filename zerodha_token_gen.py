@@ -72,8 +72,8 @@ def setup_credentials():
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CREDS_FILE.write_text(json.dumps(creds, indent=2))
-    print(f"\n  ✅ Credentials saved to {CREDS_FILE}")
-    print("  ⚠️  Keep this file secure — it contains your login credentials!")
+    print(f"\n  [OK] Credentials saved to {CREDS_FILE}")
+    print("  [WARN]  Keep this file secure — it contains your login credentials!")
     print()
     return creds
 
@@ -265,7 +265,7 @@ def generate_token_manual(creds):
     data = kite.generate_session(request_token, api_secret=api_secret)
     access_token = data['access_token']
 
-    logger.info(f"✅ Access token generated: {access_token[:8]}...")
+    logger.info(f"[OK] Access token generated: {access_token[:8]}...")
     return access_token
 
 
@@ -294,7 +294,7 @@ def main():
 
     # Load credentials
     if not CREDS_FILE.exists():
-        print(f"  ❌ Credentials file not found: {CREDS_FILE}")
+        print(f"  [ERROR] Credentials file not found: {CREDS_FILE}")
         print(f"  Run: python zerodha_token_gen.py --setup")
         return
 
@@ -305,9 +305,13 @@ def main():
         existing = json.loads(TOKEN_FILE.read_text())
         if existing.get('date') == datetime.now().strftime('%Y-%m-%d'):
             logger.info(f"Today's token already exists (generated at {existing.get('generated_at')})")
-            response = input("  Regenerate? (y/N): ").strip().lower()
-            if response != 'y':
-                return
+            # v17.1: Auto-skip if non-interactive (called from auto_refresh_zerodha_token)
+            if not sys.stdin.isatty():
+                logger.info("Non-interactive mode — forcing token regeneration")
+            else:
+                response = input("  Regenerate? (y/N): ").strip().lower()
+                if response != 'y':
+                    return
 
     # Generate token
     if args.manual or not creds.get('totp_seed'):
@@ -321,10 +325,10 @@ def main():
 
     if access_token:
         save_token(access_token)
-        print(f"\n  ✅ Done! Token valid for today ({datetime.now().strftime('%Y-%m-%d')})")
+        print(f"\n  [OK] Done! Token valid for today ({datetime.now().strftime('%Y-%m-%d')})")
         print(f"  Your bots will use Zerodha as Source 1 automatically.")
     else:
-        print(f"\n  ❌ Token generation failed. Check credentials and try again.")
+        print(f"\n  [ERROR] Token generation failed. Check credentials and try again.")
 
 
 if __name__ == '__main__':

@@ -72,12 +72,12 @@ EQUITY_CLOSE = dtime(15, 30)
 MCX_CLOSE = dtime(23, 30)
 
 # ── Config ───────────────────────────────────────────────────────
-HEARTBEAT_STALE_SECONDS = 30       # Bot zombie if heartbeat > 30s old
+HEARTBEAT_STALE_SECONDS = 120      # Bot zombie if heartbeat > 120s old (scan cycle ~30s)
 HEARTBEAT_CHECK_INTERVAL = 10      # Check every 10s
 HEARTBEAT_GRACE_PERIOD = 90        # 90s grace after restart before checking
 
-LTP_WARN_AGE = 30                  # Warn if LTP > 30s stale
-LTP_CRITICAL_AGE = 60              # Signal reconnect if > 60s stale
+LTP_WARN_AGE = 120                 # Warn if LTP > 120s stale (Zerodha REST cache)
+LTP_CRITICAL_AGE = 300             # Signal reconnect if > 300s stale (5 min = truly dead)
 LTP_CHECK_INTERVAL = 15
 
 RESOURCE_CHECK_INTERVAL = 300      # 5 minutes
@@ -90,13 +90,44 @@ LOG_CHECK_INTERVAL = 5
 LOSS_CHECK_INTERVAL = 60
 
 # Anti-flap: max restarts per service in a window
-MAX_RESTARTS = 3
-RESTART_WINDOW = 900               # 15 minutes
+MAX_RESTARTS = 2
+RESTART_WINDOW = 1800              # 30 minutes
 
 # Capital for loss % calculations
 EQUITY_CAPITAL = 300000
 COMMODITY_CAPITAL = 300000
 STOCK_CAPITAL = 200000
+
+# ── Market Holidays 2026 (NSE/BSE/MCX) ──────────────────────────
+# NSE holidays where equity is closed. MCX may have partial sessions.
+from datetime import date
+NSE_HOLIDAYS_2026 = {
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 2, 26),   # Maha Shivaratri
+    date(2026, 3, 10),   # Holi
+    date(2026, 3, 31),   # Shri Mahavir Jayanti / Eid
+    date(2026, 4, 2),    # Ram Navami
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 5, 25),   # Buddha Purnima
+    date(2026, 6, 27),   # Eid ul Adha (Bakri Id)
+    date(2026, 7, 27),   # Muharram
+    date(2026, 8, 15),   # Independence Day
+    date(2026, 8, 16),   # Janmashtami
+    date(2026, 9, 25),   # Milad-un-Nabi
+    date(2026, 10, 2),   # Mahatma Gandhi Jayanti / Dussehra
+    date(2026, 10, 21),  # Diwali (Laxmi Puja)
+    date(2026, 10, 22),  # Diwali (Balipratipada)
+    date(2026, 11, 5),   # Guru Nanak Jayanti / Prakash Utsav
+    date(2026, 12, 25),  # Christmas
+}
+
+def _is_holiday():
+    """Check if today is a market holiday."""
+    return datetime.now().date() in NSE_HOLIDAYS_2026
+
+
 
 # Loss escalation thresholds (% of capital)
 LOSS_WARN_THRESHOLDS = [5, 7, 9]
@@ -133,11 +164,15 @@ def _is_market_hours():
     now = datetime.now()
     t = now.time()
     weekday = now.weekday() <= 4
+    if _is_holiday():
+        return False  # Market holiday — skip all monitoring
     return weekday and (EQUITY_OPEN <= t <= MCX_CLOSE)
 
 
 def _is_equity_hours():
     now = datetime.now()
+    if _is_holiday():
+        return False
     return now.weekday() <= 4 and EQUITY_OPEN <= now.time() <= EQUITY_CLOSE
 
 
@@ -205,8 +240,8 @@ def heartbeat_monitor(stop_event):
             continue
 
         for thread_name, service in THREAD_SERVICE_MAP.items():
-            # Skip stock during non-equity hours (stock only runs 9:15-15:30)
-            if thread_name == 'stock' and not _is_equity_hours():
+            # Skip equity & stock outside equity hours (they shut down at 15:30)
+            if thread_name in ('equity', 'stock') and not _is_equity_hours():
                 continue
 
             hb = _read_heartbeat(thread_name)
@@ -243,6 +278,11 @@ def heartbeat_monitor(stop_event):
                 restart_history[service] = recent
 
                 if len(recent) >= MAX_RESTARTS:
+                    flap_key = service + '_flap_last'
+                    flap_last = restart_history.get(flap_key, 0)
+                    if now - flap_last < 900:
+                        continue  # Already alerted, skip spam
+                    restart_history[flap_key] = now
                     logger.error(
                         f"{thread_name}: Heartbeat stale ({age:.0f}s) but {MAX_RESTARTS} "
                         f"restarts in {RESTART_WINDOW}s — ANTI-FLAP, manual intervention needed"
@@ -281,7 +321,7 @@ def ltp_staleness_monitor(stop_event):
             continue
 
         for thread_name in THREAD_SERVICE_MAP:
-            if thread_name == 'stock' and not _is_equity_hours():
+            if thread_name in ('equity', 'stock') and not _is_equity_hours():
                 continue
 
             hb = _read_heartbeat(thread_name)

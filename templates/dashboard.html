@@ -375,6 +375,11 @@
         .trades-table tr:hover { background: var(--bg-card-hover); }
         .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--radius); border: 1px solid var(--border); }
         .tag-exit { background: rgba(122,139,158,0.1); color: var(--text-secondary); font-size: 10px; padding: 2px 6px; border-radius: 3px; }
+        .tag-dhan { background: rgba(59,130,246,0.15); color: #60a5fa; font-size: 9px; padding: 1px 5px; border-radius: 3px; }
+        .tag-zerodha { background: rgba(52,211,153,0.15); color: #34d399; font-size: 9px; padding: 1px 5px; border-radius: 3px; }
+        .tag-angel { background: rgba(251,146,60,0.15); color: #fb923c; font-size: 9px; padding: 1px 5px; border-radius: 3px; }
+        .tag-pipeline { background: rgba(167,139,250,0.15); color: #a78bfa; font-size: 9px; padding: 1px 5px; border-radius: 3px; }
+        .tag-unknown { background: rgba(122,139,158,0.1); color: var(--text-muted); font-size: 9px; padding: 1px 5px; border-radius: 3px; }
 
         /* v10.3: Multi-strategy grouped trades */
         .trades-table tr.grouped-trade { background: rgba(30,45,61,0.25); }
@@ -1317,6 +1322,7 @@
                                 <th>Exit Date</th>
                                 <th>Exit Reason</th>
                                 <th>Hold</th>
+                                <th>Src</th>
                             </tr>
                         </thead>
                         <tbody id="closedTableBody">
@@ -1463,6 +1469,18 @@
             if (type.includes('CE')) tags += '<span class="tag tag-ce">CE</span>';
             else if (type.includes('PE')) tags += '<span class="tag tag-pe">PE</span>';
             return tags;
+        }
+        function sourceTag(src) {
+            const map = {
+                'DHAN': ['DHN', 'tag-dhan'],
+                'ZERODHA': ['ZRD', 'tag-zerodha'],
+                'ANGEL': ['ANG', 'tag-angel'],
+                'PIPELINE': ['PIP', 'tag-pipeline'],
+                'TRUEDATA': ['TRD', 'tag-pipeline'],
+            };
+            const s = (src || '').toUpperCase();
+            const m = map[s] || [s.substring(0,3) || '?', 'tag-unknown'];
+            return `<span class="tag ${m[1]}">${m[0]}</span>`;
         }
         function fmtTime(isoStr) {
             if (!isoStr) return '--';
@@ -1734,6 +1752,7 @@
                                 <span class="tag tag-strategy">${p.strategy}</span>
                                 ${p.score ? `<span class="tag tag-score">${p.score}</span>` : ''}
                                 <span class="tag tag-market">${p.market.toUpperCase()}</span>
+                                ${sourceTag(p.ltp_source)}
                             </div>
                         </div>
                         <div class="pos-pnl">
@@ -1926,7 +1945,7 @@
             document.getElementById('closedBadge').textContent = trades.length;
 
             if (trades.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="16" class="empty-state">No closed trades today</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="17" class="empty-state">No closed trades today</td></tr>';
                 return;
             }
             trades.sort((a, b) => (b.exit_time || '').localeCompare(a.exit_time || ''));
@@ -1954,6 +1973,7 @@
                     <td style="font-size:11px">${fmtDateTime(t.exit_time)}</td>
                     <td><span class="tag-exit">${t.exit_reason}</span></td>
                     <td>${t.hold_duration}</td>
+                    <td>${sourceTag(t.ltp_source)}</td>
                 </tr>`;
             }).join('');
 

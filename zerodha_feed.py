@@ -49,6 +49,33 @@ MCX_MAP = {
 }
 
 
+
+# Local IV solver (Zerodha does not provide IV)
+import numpy as np
+from scipy.stats import norm as _norm
+
+def _implied_vol(market_price, S, K, T, r=0.07, opt_type='CE', max_iter=30):
+    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return 0
+    sigma = 0.25
+    for _ in range(max_iter):
+        d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+        d2 = d1 - sigma*np.sqrt(T)
+        if opt_type == 'CE':
+            price = S*_norm.cdf(d1) - K*np.exp(-r*T)*_norm.cdf(d2)
+        else:
+            price = K*np.exp(-r*T)*_norm.cdf(-d2) - S*_norm.cdf(-d1)
+        diff = price - market_price
+        if abs(diff) < 0.01:
+            return sigma
+        vega = S*np.sqrt(T)*_norm.pdf(d1) / 100
+        if abs(vega) < 1e-10:
+            break
+        sigma -= diff / (vega * 100)
+        sigma = max(0.01, min(sigma, 5.0))
+    return sigma if 0.01 < sigma < 5.0 else 0
+
+
 class ZerodhaFeed:
     """Real-time data feed from Zerodha Kite Connect API.
 
@@ -353,7 +380,7 @@ class ZerodhaFeed:
                             'ltp': ltp,
                             'oi': data.get('oi', 0),
                             'volume': data.get('volume', 0),
-                            'iv': 0,  # Kite doesn't provide IV directly — calculated by greeks.py
+                            'iv': _implied_vol(ltp, spot, meta['strike'], max((expiry_dt - datetime.now().date()).days, 1)/365.0, 0.07, meta['opt_type']),  # Live IV — calculated by greeks.py
                             'bid': data.get('depth', {}).get('buy', [{}])[0].get('price', 0),
                             'ask': data.get('depth', {}).get('sell', [{}])[0].get('price', 0),
                             'token': meta['token'],

@@ -34,6 +34,12 @@ paper_trades_commodity/commodity_portfolio_state.json
 !stock_paper_trades/stock_signals_*.csv
 !paper_trades_commodity/commodity_signals_*.csv
 
+# Live trades (JSON logs)
+live_trades/
+
+# MC-optimal paper trades
+paper_trades_mc/
+
 # Instance lock files
 locks/
 

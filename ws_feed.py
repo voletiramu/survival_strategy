@@ -99,6 +99,18 @@ class WebSocketFeed:
             retry_duration=480,        # Keep trying for 8 hours (full trading day)
         )
 
+        # v23: Monkey-patch SmartWebSocketV2._on_close to accept extra args
+        # websocket-client passes (wsapp, close_status_code, close_msg) but
+        # SmartAPI 1.5.5 _on_close(self, wsapp) only accepts 2 args → crash loop
+        original_internal_close = self.sws._on_close.__func__ if hasattr(self.sws._on_close, '__func__') else None
+        def _patched_on_close(wsapp, *args):
+            try:
+                self.sws.on_close(wsapp, *args)
+            except Exception as e:
+                logger.debug(f'[WS_FEED] _on_close callback error (safe): {e}')
+        import types
+        self.sws._on_close = types.MethodType(lambda self_sws, wsapp, *args: _patched_on_close(wsapp, *args), self.sws)
+
         # Set callbacks
         self.sws.on_open = self._on_open
         self.sws.on_data = self._on_data

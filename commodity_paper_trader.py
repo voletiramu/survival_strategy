@@ -1,17 +1,25 @@
 """
-COMMODITY PAPER TRADING SYSTEM (v7.1)
+COMMODITY PAPER TRADING SYSTEM (v26)
 =======================================
-from ghost_zone_v8 import GhostZoneV8
-Paper trading for MCX commodity options using Angel One SmartAPI
-3 ACTIVE STRATEGIES: CPR (45%), Gamma Blast (35%), Ghost Zone (20%)
+Paper trading for MCX commodity options using Dhan + Zerodha feeds
+3 ACTIVE STRATEGIES: CPR (45%), Wave (30%), Gamma Blast (25%)
 Uses Black-76 model (options on futures)
 
-Focus: Gold Mini, Crude Oil Mini (affordable with Rs 3L)
+Focus: Gold Mini, Silver Mini, Crude Oil Mini (per-commodity QS filters)
+
+v26 Changes (Apr 2026):
+  - GOLDM kept with QS≥80 (low liquidity, 4 strikes on Dhan — elite signals only)
+  - Ghost Zone removed (v20 audit: not viable for commodities)
+  - Wave strategy added (5-bar swing + 3-bar momentum, ported from live_trader.py)
+  - SILVERM MC-optimal params: SL=30%, TGT=40%, Cool=15min, QS≥70
+  - Strategy priority dedup: CPR(100) > Wave(95) > Gamma Blast(85)
+  - TSL params updated to v24 MC-optimal
+  - COMMODITY_PAUSED removed — bot is active
 
 Per-Strategy Capital Allocation (Rs 3L total):
   CPR:          45% = Rs 1,35,000 — best Sharpe on commodities
-  Gamma Blast:  35% = Rs 1,05,000 — solid across all commodities
-  Ghost Zone:   20% = Rs 60,000 — good WR, lower Sharpe
+  Wave:         30% = Rs 90,000 — momentum breakouts
+  Gamma Blast:  25% = Rs 75,000 — expiry-day gamma plays
 
 Trading Hours: MCX 9:00 AM - 11:30 PM (extended vs equity 9:15-3:30)
 
@@ -48,13 +56,16 @@ for d in [PAPER_DIR, LOG_DIR]:
     os.makedirs(d, exist_ok=True)
 
 INITIAL_CAPITAL = 300000  # Rs 3L for commodities (all strategies share this pool)
+
+# v26: Commodity trading ACTIVE — SILVERM MC-validated, CRUDEOILM data collection
+COMMODITY_PAUSED = False
 RISK_FREE_RATE = 0.065
 
 # Focus on MINI contracts (affordable with Rs 3L capital)
 COMMODITIES = {
     'GOLDM': {
         'lot_size': 1, 'multiplier': 10, 'margin': 15000,
-        'strike_interval': 100, 'vol_adj': 1.0,
+        'strike_interval': 500, 'vol_adj': 1.0,  # MCX: Rs 500 intervals above Rs 1L
         'file': 'GOLDM_spot_one_day_2000d.csv',
         'exchange': 'MCX', 'description': 'Gold Mini (100g)',
     },
@@ -96,10 +107,10 @@ COMMODITIES = {
     },
 }
 
-# For paper trading with Rs 3L, focus on affordable mini contracts
-# v10.2: Re-enabled SILVERM — old calc was wrong (used lot=5 but config has lot_size=1).
-# Actual cost: premium × 1 × 5. OTM/ATM premiums Rs 2K-10K → Rs 10K-50K per trade.
-# Well within Rs 75K per-trade limit. Deep ITM (>Rs 15K) auto-skipped by RISK_LIMIT.
+# v26: All 3 mini commodities active — quality score filtering per-commodity
+# GOLDM: Low liquidity (4 strikes on Dhan), QS≥80 required to filter noise
+# SILVERM: MC-validated profitable with QS≥70 (100% WR, PF 305917)
+# CRUDEOILM: Best OI (24K CE + 28K PE), collecting signals for future MC analysis
 PAPER_TRADE_COMMODITIES = ['GOLDM', 'SILVERM', 'CRUDEOILM']
 
 # ====================================================================
@@ -118,8 +129,16 @@ MAX_DAILY_LOSS = COMMODITY_CAPITAL * 0.10               # Rs 30,000 (10% daily l
 # Strategies compete for the same capital — no per-strategy hard limits.
 MCX_STRATEGY_ALLOCATION = {
     'CPR':          0.45,    # 45% target — best Sharpe on commodities
-    'Gamma Blast':  0.35,    # 35% target — solid across all commodities
-    'Ghost Zone':   0.20,    # 20% target — good WR but lower Sharpe
+    'Wave':         0.30,    # 30% target — momentum breakouts (new v26)
+    'Gamma Blast':  0.25,    # 25% target — solid across all commodities
+}
+
+# v26: Strategy priority dedup (matching live_trader.py logic)
+# Higher priority strategy blocks lower priority on same symbol+direction
+MCX_STRATEGY_PRIORITY = {
+    'CPR': 100,
+    'Wave': 95,
+    'Gamma Blast': 85,
 }
 
 def get_mcx_strategy_used_capital(positions, strategy_name, commodities_spec=None):
@@ -141,12 +160,12 @@ MCX_LOT_TIER_ELITE = 80     # Score >= 80: allocate 30% of available capital
 MCX_LOT_TIER_STRONG = 60    # Score >= 60: allocate 20% of available capital
 MCX_LOT_TIER_STANDARD = 50  # Score >= 50: allocate 10% of available capital
 
-# v7.6: TSL based on PREMIUM GAIN % (not target distance %) — matches equity v7.5
-TSL_BREAKEVEN_GAIN_PCT = 15      # Phase 1: Lock breakeven when premium gains 15%
-TSL_TRAIL_GAIN_PCT = 25          # Phase 2: Start trailing when premium gains 25%
-TSL_TRAIL_DISTANCE_PCT = 30      # Phase 2 trail: 30% below peak profit
-TSL_TIGHT_GAIN_PCT = 40          # Phase 3: Tight trail at 40%+ gain
-TSL_TIGHT_DISTANCE_PCT = 20      # Phase 3 trail: 20% below peak profit
+# v26: TSL params — MC-optimal for SILVERM (SL=30%, TGT=40%)
+TSL_BREAKEVEN_GAIN_PCT = 5       # v27: MC-optimal breakeven at +5%
+TSL_TRAIL_GAIN_PCT = 3           # v27: MC-optimal trail trigger at +3%
+TSL_TRAIL_DISTANCE_PCT = 3       # v27: MC-optimal 3% below peak
+TSL_TIGHT_GAIN_PCT = 15          # v27: MC-optimal tight at +15%
+TSL_TIGHT_DISTANCE_PCT = 3       # v27: MC-optimal 3% trail
 
 # v10.4: Phase 0 TSL — micro-trail for early gains before breakeven lock
 TSL_MICRO_GAIN_PCT = 5
@@ -156,7 +175,7 @@ TSL_MICRO_MIN_HOLD_SECONDS = 300
 # v10.1: Trailing Target — extend target instead of hard exit
 TARGET_TRAIL_ENABLED = True
 TARGET_TRAIL_EXTEND_PCT = 20          # Extend target by 20% of current premium when hit
-TARGET_TRAIL_TSL_DISTANCE_PCT = 15    # TSL at 15% below peak after target hit
+TARGET_TRAIL_TSL_DISTANCE_PCT = 3     # v27: MC-optimal 3% below peak after target hit
 TARGET_TRAIL_MAX_EXTENSIONS = 5       # Max extensions (safety cap)
 
 # v10.1: Breakout Failure Detection
@@ -178,7 +197,7 @@ ATR_BASE_SYMBOL = 'NIFTY'  # Reference for scaling
 # v13.3: Momentum reversal exit
 # If spot moves 0.4% AGAINST trade direction after 20min, exit
 # Simulation: saves Rs +6,974, hurts ZERO winning trades
-MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_EXIT_ENABLED = False  # v20: Disabled — simulation showed it hurts winning trades
 MOMENTUM_EXIT_SPOT_PCT = 0.4
 MOMENTUM_EXIT_MIN_MINUTES = 20
 
@@ -200,8 +219,9 @@ MCX_GAMMA_SHIELD_THRESHOLD = 0.003  # Exit short if gamma > this
 # v2.4: Strategy-specific OI/IV exit multipliers for commodities
 MCX_STRATEGY_EXIT_MULT = {
     'CPR':          {'oi': 1.0, 'iv': 1.0},
+    'Wave':         {'oi': 1.0, 'iv': 1.0},     # v26: Wave strategy (same as CPR)
     'Gamma Blast':  {'oi': 1.0, 'iv': 1.0},
-    'Ghost Zone':   {'oi': 0.7, 'iv': 0.8},    # 30% LOWER threshold → exits faster
+    'Ghost Zone':   {'oi': 0.7, 'iv': 0.8},    # Legacy — kept for backward compat
     'PCR+VWAP':     {'oi': 1.0, 'iv': 1.0},
     'Survivor':     {'oi': 2.0, 'iv': 2.0},    # 2x HIGHER threshold → tolerates swings
 }
@@ -210,6 +230,12 @@ MCX_STRATEGY_EXIT_MULT = {
 MCX_MIN_PREMIUM_BUY = 5         # Min Rs 5 premium for commodity BUY trades
 MCX_MIN_PREMIUM_SELL = 10       # Min Rs 10 premium for commodity SELL trades
 MCX_MIN_SIGNAL_SCORE = 50       # v2.5: Quality score 0-100, reject below 50 (was 40)
+# v26: Per-commodity quality score thresholds (MC-validated)
+MCX_MIN_SIGNAL_SCORE_PER_COMMODITY = {
+    'GOLDM': 80,       # Low liquidity — only fire on elite signals (4 strikes on Dhan)
+    'SILVERM': 70,     # MC: 100% WR at QS≥70, 0% profit at QS=0
+    'CRUDEOILM': 50,   # Collecting data — standard threshold
+}
 MCX_DIRECTION_FLIP_MIN_SCORE = 70  # v7.6.2: Higher bar for DIRECTION_FLIP (closing existing to flip)
 
 # v7.7: Signal-Based Hold Score — controls exits
@@ -219,11 +245,15 @@ MCX_HOLD_SCORE_MIN_HOLD_MINS = 30 # Minimum hold time before computing hold scor
 MCX_MIN_PROFIT_TO_COST_RATIO = 2.0  # Expected profit must be >= 2x total cost
 
 # Cooldowns & Limits (commodity)
-MCX_GRACE_PERIOD_SECONDS = 180     # v7.6: 3 min (was 10 min — missed fast spikes)
+MCX_GRACE_PERIOD_SECONDS = 60      # v22: 1 min (was 3 min — too slow for commodities)
+EMERGENCY_SL_TIER1_PCT = 8
+EMERGENCY_SL_TIER1_SECONDS = 30
+EMERGENCY_SL_TIER2_PCT = 12
+EMERGENCY_SL_MAX_PCT = 25  # v22-final: Wider emergency SL (was 15)
 MCX_GHOST_ZONE_COOLDOWN_SECONDS = 1800  # 30 min after Ghost Zone loss
-MCX_REENTRY_COOLDOWN_SECONDS = 600     # 10 min after any exit, same symbol
+MCX_REENTRY_COOLDOWN_SECONDS = 900     # v26: MC-optimal 15 min for SILVERM (was 600s)
 MCX_MAX_TRADES_PER_DAY = 999  # v19: No daily trade limit for paper           # Hard cap on daily commodity trades
-MCX_MAX_SAME_DIRECTION_PER_COMMODITY = 5  # v9.5: Max BUY_CE or BUY_PE per commodity per day
+MCX_MAX_SAME_DIRECTION_PER_COMMODITY = 2  # v22: Was 5 — tighter to prevent overtrading
 MCX_SCORE_ESCALATION_PER_REENTRY = 15    # v9.5: Each re-entry same strat+dir needs +15 score
 MCX_MIN_OI_EXIT_PNL = 50              # Min Rs 50 PnL to allow OI/IV exit (covers 2x MCX brokerage)
 
@@ -1026,7 +1056,72 @@ class CommodityStrategyEngine:
         if target_strike:
             candidates.add(target_strike)
 
-        # --- Source 1: Zerodha Kite option chain (primary — solves MCX Access denied) ---
+        # --- Source 0: Dhan option chain (primary — native IV/Greeks, OI change) ---
+        if hasattr(self, 'dhan') and self.dhan and self.dhan.is_connected:
+            try:
+                dh_chain = self.dhan.get_option_chain(commodity)
+                if dh_chain:
+                    contracts = dh_chain.get(opt_type, [])
+                    if target_strike:
+                        for c in contracts:
+                            if int(c['strike']) == int(target_strike) and c.get('ltp', 0) >= min_premium:
+                                result = {
+                                    'strike': int(c['strike']),
+                                    'greeks': {
+                                        'delta': c.get('delta', 0),
+                                        'gamma': c.get('gamma', 0),
+                                        'theta': c.get('theta', 0),
+                                        'vega': c.get('vega', 0),
+                                        'iv': c.get('iv', 0),
+                                        'price': c['ltp'],
+                                    },
+                                }
+                                logger.info(f"  MCX_DHAN_TARGET: {commodity} {int(target_strike)}{opt_type} "
+                                           f"LTP={c['ltp']:.2f} IV={c.get('iv', 0):.3f} [Dhan]")
+                                return result
+                    else:
+                        best_score = -1
+                        best = None
+                        for c in contracts:
+                            if c['strike'] not in candidates:
+                                continue
+                            ltp = c.get('ltp', 0)
+                            if ltp < min_premium:
+                                continue
+                            oi = c.get('oi', 0)
+                            volume = c.get('volume', 0)
+                            if oi < MIN_ENTRY_OI:
+                                continue
+                            moneyness = abs(c['strike'] - spot) / spot
+                            delta_proxy = abs(c.get('delta', 0)) if c.get('delta', 0) else max(0, 1 - moneyness * 20)
+                            if delta_proxy < 0.1:
+                                continue
+                            oi_norm = min(oi / 100000, 1.0)
+                            vol_norm = min(volume / 10000, 1.0)
+                            score = (delta_proxy * 50) + (oi_norm * 30) + (vol_norm * 20)
+                            if score > best_score and ltp > 0:
+                                best_score = score
+                                best = {
+                                    'strike': int(c['strike']),
+                                    'greeks': {
+                                        'delta': c.get('delta', 0),
+                                        'gamma': c.get('gamma', 0),
+                                        'theta': c.get('theta', 0),
+                                        'vega': c.get('vega', 0),
+                                        'iv': c.get('iv', 0),
+                                        'price': ltp,
+                                    },
+                                }
+                        if best:
+                            logger.info(f"  MCX_DHAN_STRIKE: {commodity} {opt_type} ATM={atm} "
+                                       f"Selected={best['strike']} LTP={best['greeks']['price']:.2f} "
+                                       f"Delta={best['greeks']['delta']:.3f} [Dhan]")
+                            self._last_ltp_source = 'DHAN'
+                            return best
+            except Exception as e:
+                logger.debug(f"  MCX_DHAN_CHAIN_ERR: {commodity} {opt_type} — {e}")
+
+        # --- Source 1: Zerodha Kite option chain (secondary — solves MCX Access denied) ---
         if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
             try:
                 zd_chain = self.zerodha.get_option_chain(commodity)
@@ -1145,135 +1240,14 @@ class CommodityStrategyEngine:
                         if best:
                             logger.info(f"  MCX_TD_STRIKE: {commodity} {opt_type} ATM={atm} "
                                        f"Selected={best['strike']} LTP={best['greeks']['price']:.2f} [TrueData]")
-                            self._last_ltp_source = 'ZERODHA'
+                            self._last_ltp_source = 'TRUEDATA'
                             return best
             except Exception as e:
                 logger.debug(f"  MCX_TD_CHAIN_ERR: {commodity} {opt_type} — {e}")
 
-        # --- Source 2: Angel API greeks ---
-        if self.angel and self.angel._connected:
-            try:
-                # v10.3d-3: Get nearest MCX expiry for API call (was missing → "Invalid expiry date")
-                expiry = None
-                # Lazy-load instruments if not yet loaded
-                if self.angel.instruments is None:
-                    cache = os.path.join(DATA_DIR, 'instrument_master.csv')
-                    if os.path.exists(cache):
-                        self.angel.instruments = pd.read_csv(cache, low_memory=False)
-                        logger.info(f"  MCX instruments loaded: {len(self.angel.instruments)} from cache")
-                if self.angel.instruments is not None:
-                    mask = (self.angel.instruments['name'] == commodity) & \
-                           (self.angel.instruments['exch_seg'] == 'MCX') & \
-                           (self.angel.instruments['instrumenttype'] == 'OPTFUT')
-                    matches = self.angel.instruments[mask]
-                    if len(matches) > 0:
-                        today = datetime.now().date()
-                        exp_dates = []
-                        for exp_str in matches['expiry'].unique():
-                            try:
-                                exp_date = pd.to_datetime(exp_str).date()
-                                if exp_date >= today:
-                                    exp_dates.append(exp_date)
-                            except Exception:
-                                continue
-                        if exp_dates:
-                            expiry = min(exp_dates).strftime('%d%b%Y').upper()
-
-                greeks_data = self.angel.get_option_greeks(commodity, expiry)
-                if greeks_data and len(greeks_data) > 0:
-                    # v10.7: If target_strike specified, find that exact strike (SELL signals)
-                    if target_strike:
-                        for item in greeks_data:
-                            try:
-                                item_strike = float(item.get('strikePrice', 0))
-                            except (ValueError, TypeError):
-                                continue
-                            if int(item_strike) != int(target_strike):
-                                continue
-                            item_type = item.get('optionType', '').upper()
-                            if item_type != opt_type:
-                                continue
-                            ltp = float(item.get('ltp', 0) or 0)
-                            if ltp > 0 and ltp >= min_premium:
-                                result = {
-                                    'strike': int(item_strike),
-                                    'greeks': {
-                                        'delta': float(item.get('delta', 0) or 0),
-                                        'gamma': float(item.get('gamma', 0) or 0),
-                                        'theta': float(item.get('theta', 0) or 0),
-                                        'vega': float(item.get('vega', 0) or 0),
-                                        'iv': float(item.get('impliedVolatility', 0) or 0) / 100,
-                                        'price': ltp,
-                                    },
-                                }
-                                logger.info(f"  MCX_LIVE_TARGET: {commodity} {int(target_strike)}{opt_type} "
-                                           f"LTP={ltp:.2f} Delta={result['greeks']['delta']:.3f} [API]")
-                                return result
-                        # target_strike not found in live data — fall through to skip
-                        logger.info(f"  MCX_SKIP_NO_LIVE: {commodity} {int(target_strike)}{opt_type} — "
-                                   f"target strike not found in live API data")
-                        return None
-
-                    best_score = -1
-                    best = None
-                    for item in greeks_data:
-                        try:
-                            item_strike = float(item.get('strikePrice', 0))
-                        except (ValueError, TypeError):
-                            continue
-                        if item_strike not in candidates:
-                            continue
-                        item_type = item.get('optionType', '').upper()
-                        if item_type != opt_type:
-                            continue
-                        ltp = float(item.get('ltp', 0) or 0)
-                        if ltp < min_premium:
-                            continue
-                        delta = abs(float(item.get('delta', 0) or 0))
-                        gamma = float(item.get('gamma', 0) or 0)
-                        oi = float(item.get('opnInterest', 0) or 0)
-                        volume = float(item.get('tradeVolume', 0) or 0)
-
-                        # Skip flat/illiquid strikes
-                        if delta < 0.35 or delta > 0.65:
-                            continue
-                        if oi < MIN_ENTRY_OI:
-                            logger.debug(f"  MCX_SKIP_LOW_OI: {commodity} {int(item_strike)}{opt_type} OI={oi:.0f}")
-                            continue
-
-                        delta_score = max(0, 1 - abs(delta - 0.50) * 3.33)
-                        gamma_score = gamma * 10000  # No cap — highest gamma wins
-                        oi_norm = min(oi / 100000, 1.0)
-                        vol_norm = min(volume / 10000, 1.0)
-                        # Weighted: Gamma(40%) + Delta(30%) + OI(20%) + Volume(10%)
-                        score = (gamma_score * 40) + (delta_score * 30) + (oi_norm * 20) + (vol_norm * 10)
-
-                        if score > best_score and ltp > 0:
-                            best_score = score
-                            best = {
-                                'strike': int(item_strike),
-                                'greeks': {
-                                    'delta': float(item.get('delta', 0) or 0),
-                                    'gamma': gamma,
-                                    'theta': float(item.get('theta', 0) or 0),
-                                    'vega': float(item.get('vega', 0) or 0),
-                                    'iv': float(item.get('impliedVolatility', 0) or 0) / 100,
-                                    'price': ltp,
-                                },
-                            }
-                    if best:
-                        logger.info(f"  MCX_LIVE_STRIKE: {commodity} {opt_type} ATM={atm} "
-                                   f"Selected={best['strike']} Delta={best['greeks']['delta']:.3f} "
-                                   f"Gamma={best['greeks']['gamma']:.6f} LTP={best['greeks']['price']:.2f} [API]")
-                        return best
-                    else:
-                        logger.debug(f"  MCX_API_NO_MATCH: {commodity} {opt_type} — no candidate passed filters")
-            except Exception as e:
-                logger.debug(f"  MCX_API_GREEKS_ERR: {commodity} {opt_type} — {e}")
-
         # v10.5: NO fallback to Black-76 model — live exchange data ONLY
         logger.info(f"  MCX_SKIP_NO_LIVE: {commodity} {opt_type} ATM={atm} — "
-                   f"no live data from Angel MCX API, signal blocked (zero BS tolerance)")
+                   f"no live data from Dhan/Zerodha, signal blocked (zero BS tolerance)")
         return None
 
     def load_historical(self, commodity):
@@ -1541,22 +1515,22 @@ class CommodityStrategyEngine:
         if cpr_w < 0.3:
             cpr_label = "Narrow"
             target_hit_mult = 1.5    # 50% gain (Camarilla confirmed)
-            target_base_mult = 1.3   # 30% gain (no Camarilla confirmation)
-            sl_mult = 0.70  # v19: Max 30% loss
+            target_base_mult = 1.40  # v26: MC-optimal 40% target (was 30%)
+            sl_mult = 0.70  # v26: MC-optimal 30% SL
             # v13.3: Volatility-adjusted SL
             if VOLATILITY_SL_ENABLED and commodity in ATR_REFERENCE:
                 vol_sl_mult = sl_mult * (ATR_REFERENCE.get(ATR_BASE_SYMBOL, 313) / ATR_REFERENCE.get(commodity, 313))
-                sl_mult = max(0.70, min(0.85, vol_sl_mult))  # v19: Max 30% loss (was 88%)  # Clamp 12%-50%
+                sl_mult = max(0.65, min(0.75, vol_sl_mult))  # v22-final: Clamp 25%-35% loss
         elif cpr_w <= 0.6:
             cpr_label = "Moderate"
-            target_hit_mult = 1.4    # 40% gain
-            target_base_mult = 1.25  # 25% gain
-            sl_mult = 0.70  # v19: Max 30% loss
+            target_hit_mult = 1.5    # v26: MC-optimal 50% gain (was 40%)
+            target_base_mult = 1.40  # v26: MC-optimal 40% gain (was 25%)
+            sl_mult = 0.70  # v26: MC-optimal 30% SL
         else:
             cpr_label = "Wide"
-            target_hit_mult = 1.3    # 30% gain
-            target_base_mult = 1.2   # 20% gain
-            sl_mult = 0.70  # v19: Max 30% loss
+            target_hit_mult = 1.40   # v26: MC-optimal 40% gain (was 30%)
+            target_base_mult = 1.30  # 30% gain
+            sl_mult = 0.70  # v26: MC-optimal 30% SL
 
         # BUY breakout for Narrow + Moderate CPR (cpr_w <= 0.6)
         vwap = ind.get('vwap', spot)
@@ -1633,6 +1607,92 @@ class CommodityStrategyEngine:
                         })
         return signals
 
+    def check_wave_signals(self, commodity, spot, ohlc, ind, dow, dte):
+        """v26: Wave strategy — 5-bar swing high/low detection + 3-bar momentum confirmation.
+        Ported from live_trader.py _check_wave() logic.
+        Uses market_calculus spot bars for swing detection.
+        """
+        signals = []
+        spec = COMMODITIES[commodity]
+        strike_int = spec['strike_interval']
+        iv = ind['iv']
+        T = dte / 365
+
+        # Need at least 6 bars (5 for swing + 1 current)
+        if not hasattr(self, 'calculus') or self.calculus.bar_count(commodity) < 6:
+            return signals
+
+        bar_data = self.calculus._bars.get(commodity, {})
+        if not bar_data or len(bar_data.get('high', [])) < 6:
+            return signals
+
+        # 5-bar swing high: bars[-3] higher than bars[-5,-4,-2,-1]
+        highs = list(bar_data['high'][-5:])
+        lows = list(bar_data['low'][-5:])
+
+        swing_high = None
+        swing_low = None
+
+        # Check if bar[2] (middle of 5) is swing high
+        if len(highs) >= 5 and highs[2] > max(highs[0], highs[1], highs[3], highs[4]):
+            swing_high = highs[2]
+
+        # Check if bar[2] (middle of 5) is swing low
+        if len(lows) >= 5 and lows[2] < min(lows[0], lows[1], lows[3], lows[4]):
+            swing_low = lows[2]
+
+        # 3-bar momentum confirmation
+        recent_closes = list(bar_data['close'][-3:])
+        momentum_up = all(recent_closes[i] > recent_closes[i-1] for i in range(1, len(recent_closes)))
+        momentum_down = all(recent_closes[i] < recent_closes[i-1] for i in range(1, len(recent_closes)))
+
+        vwap = ind.get('vwap', spot)
+
+        # BUY CE: Swing low formed + momentum up + spot above VWAP
+        if swing_low and momentum_up and spot > vwap:
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'CE', MCX_MIN_PREMIUM_BUY)
+            if opt:
+                g = opt['greeks']
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    # v26: MC-optimal targets — SL=30%, TGT=40%
+                    sl_mult = 0.70   # 30% SL
+                    tgt_mult = 1.40  # 40% target
+                    signals.append({
+                        'type': 'BUY_CE_WAVE', 'strike': opt['strike'],
+                        'premium': g['price'], 'greeks': g,
+                        'reason': f"Wave bullish: swing_low={swing_low:.0f} + 3-bar momentum up + spot>VWAP",
+                        'target': g['price'] * tgt_mult, 'sl': g['price'] * sl_mult,
+                        'indicator_levels': {
+                            'swing_high': swing_high, 'swing_low': swing_low,
+                            'vwap': vwap, 'momentum': 'UP',
+                        },
+                    })
+                    logger.info(f"  WAVE_CE: {commodity} swing_low={swing_low:.0f} "
+                               f"mom=UP spot={spot:.0f}>VWAP={vwap:.0f}")
+
+        # BUY PE: Swing high formed + momentum down + spot below VWAP
+        if swing_high and momentum_down and spot < vwap:
+            opt = self.select_strike_live(commodity, spot, strike_int, T, RISK_FREE_RATE, iv, 'PE', MCX_MIN_PREMIUM_BUY)
+            if opt:
+                g = opt['greeks']
+                if g['price'] > MCX_MIN_PREMIUM_BUY:
+                    sl_mult = 0.70   # 30% SL
+                    tgt_mult = 1.40  # 40% target
+                    signals.append({
+                        'type': 'BUY_PE_WAVE', 'strike': opt['strike'],
+                        'premium': g['price'], 'greeks': g,
+                        'reason': f"Wave bearish: swing_high={swing_high:.0f} + 3-bar momentum down + spot<VWAP",
+                        'target': g['price'] * tgt_mult, 'sl': g['price'] * sl_mult,
+                        'indicator_levels': {
+                            'swing_high': swing_high, 'swing_low': swing_low,
+                            'vwap': vwap, 'momentum': 'DOWN',
+                        },
+                    })
+                    logger.info(f"  WAVE_PE: {commodity} swing_high={swing_high:.0f} "
+                               f"mom=DOWN spot={spot:.0f}<VWAP={vwap:.0f}")
+
+        return signals
+
     def check_gamma_blast_signals(self, commodity, spot, ohlc, ind, dow, dte):
         """Gamma Blast — fires on ALL trading days with DTE-aware parameters.
         v9.6: IV multiplier and targets scale based on DTE (MCX monthly expiry).
@@ -1652,7 +1712,7 @@ class CommodityStrategyEngine:
         if actual_dte <= 3:
             iv_mult = 1.3      # Near expiry: gamma spike
             target_mult = 1.6  # 60% gain target
-            sl_mult = 0.4      # Wider SL for gamma moves
+            sl_mult = 0.75     # v22-final: (was 0.80)
         elif actual_dte <= 7:
             iv_mult = 1.2
             target_mult = 1.5  # 50% gain
@@ -2013,61 +2073,6 @@ class AngelMCXConnection:
             logger.warning(f"MCX TOKEN_HEALTH: Ping failed ({e}), reconnecting...")
             return self.reconnect()
 
-    def connect(self):
-        try:
-            from SmartApi import SmartConnect
-            import pyotp
-        except ImportError:
-            os.system("pip install smartapi-python pyotp logzero websocket-client")
-            from SmartApi import SmartConnect
-            import pyotp
-
-        creds = {}; current_app = {}
-        with open(ANGEL_CRED_FILE, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                if '=' in line:
-                    key, val = line.split('=', 1)
-                    key = key.strip(); raw_val = val.strip()
-                    if key == 'ANGEL_TOTP_KEY' and '#' in raw_val:
-                        parts = raw_val.split('#')
-                        val = parts[-1].strip() if 'your_' in parts[0].strip().lower() else parts[0].strip()
-                    else:
-                        val = raw_val.split('#')[0].strip()
-                    current_app[key] = val
-                    if key == 'BROKER_NAME':
-                        creds[current_app.get('ANGEL_APP_TYPE', 'Unknown')] = current_app.copy()
-                        current_app = {}
-
-        app = creds.get('Historical', creds.get('Market', {}))
-
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Connecting to Angel MCX... attempt {attempt+1}/{max_retries}")
-                self.obj = SmartConnect(api_key=app['ANGEL_API_KEY'])
-                totp = pyotp.TOTP(app['ANGEL_TOTP_KEY']).now()
-                session = self.obj.generateSession(app['ANGEL_CLIENT_CODE'], app['ANGEL_PIN'], totp)
-
-                if session and session.get('status'):
-                    self._connected = True
-                    self._auth_time = time.time()  # v9.2: Track auth time
-                    logger.info(f"Angel MCX connected")
-                    self._load_mcx_tokens()
-                    return True
-                else:
-                    logger.warning(f"Angel MCX login failed (attempt {attempt+1}): {session}")
-            except Exception as e:
-                logger.warning(f"Angel MCX connection error (attempt {attempt+1}): {e}")
-
-            if attempt < max_retries - 1:
-                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s, 16s, 32s
-                logger.info(f"  Retrying in {wait}s...")
-                time.sleep(wait)
-
-        logger.error(f"Angel MCX connection failed after {max_retries} attempts")
-        return False
 
     def _load_mcx_tokens(self):
         """Find nearest futures tokens for each commodity."""
@@ -2230,24 +2235,38 @@ class AngelMCXConnection:
 class CommodityPaperTrader:
 
     def __init__(self, ws_feed=None):
-        self.angel = AngelMCXConnection()
+        self.angel = AngelMCXConnection()  # v25: kept for instrument master only
         self.portfolio = CommodityPortfolio()
         self.engine = CommodityStrategyEngine(self.portfolio, self.angel)
         self._running = False
         self.ws_feed = ws_feed  # Real-time WebSocket price feed (optional)
-        # v12.0: Zerodha Kite Connect as Source 1 (primary — solves MCX "Access denied")
+        # v23: Dhan as Source 0 (primary — native IV/Greeks, OI change, bid/ask)
+        self.dhan = None
+        try:
+            from dhan_feed import DhanFeed
+            self.dhan = DhanFeed()
+            if self.dhan.connect():
+                self.engine.dhan = self.dhan
+                logger.info("[Dhan] Initialized as Source 0 for MCX option chain + LTP + Greeks")
+            else:
+                self.dhan = None
+                logger.warning("[Dhan] Connection failed — falling back to Zerodha")
+        except Exception as e:
+            logger.warning(f"[Dhan] Not available: {e} — falling back to Zerodha")
+
+        # v12.0: Zerodha Kite Connect as Source 1 (secondary)
         self.zerodha = None
         try:
             from zerodha_feed import ZerodhaFeed
             self.zerodha = ZerodhaFeed()
             if self.zerodha.connect():
                 self.engine.zerodha = self.zerodha
-                logger.info("[Zerodha] ✅ Initialized as Source 1 for MCX option chain + LTP")
+                logger.info("[Zerodha] Initialized as Source 1 for MCX option chain + LTP")
             else:
                 self.zerodha = None
-                logger.warning("[Zerodha] Connection failed — trying TrueData as Source 2")
+                logger.warning("[Zerodha] Connection failed — trying Angel as fallback")
         except Exception as e:
-            logger.warning(f"[Zerodha] Not available: {e} — trying TrueData as Source 2")
+            logger.warning(f"[Zerodha] Not available: {e} — trying Angel as fallback")
 
         # v11.2: TrueData as Source 2 — DISABLED v16: Trial expired 2026-03-23
         # TrueData causes crash loop (subscription expired → reconnect → RecursionError)
@@ -2261,6 +2280,38 @@ class CommodityPaperTrader:
         # v14.0: Trade Intelligence engine
         from trade_intelligence import TradeIntelligence
         self.trade_intel = TradeIntelligence()
+
+        # v25: OI Heatmap exit for commodity positions
+        self.oi_heatmap = None
+        try:
+            from oi_heatmap import OIHeatmap
+            self.oi_heatmap = OIHeatmap(
+                dhan_feed=None,  # Will set after dhan init
+                zerodha_feed=None,
+            )
+            logger.info("[OIHeatmap] Initialized for commodity OI-based exits")
+        except Exception as e:
+            logger.warning(f"[OIHeatmap] Not available: {e}")
+
+        # v25: Reversal Detector for commodity DIRECTION_FLIP re-entry
+        self.reversal_detector = None
+        try:
+            from reversal_detector import ReversalDetector
+            self.reversal_detector = ReversalDetector(
+                oi_heatmap=self.oi_heatmap,
+            )
+            logger.info("[ReversalDetector] Initialized for commodity V-reversal detection")
+        except Exception as e:
+            logger.warning(f"[ReversalDetector] Not available: {e}")
+
+        # v25: Wire data feeds to OI heatmap (must be after both feeds and heatmap are created)
+        if self.oi_heatmap:
+            if self.dhan and self.dhan.is_connected:
+                self.oi_heatmap.dhan_feed = self.dhan
+            if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
+                self.oi_heatmap.zerodha_feed = self.zerodha
+        if self.reversal_detector and self.oi_heatmap:
+            self.reversal_detector.oi_heatmap = self.oi_heatmap
 
         # Caches to reduce REST API calls
         self._option_ltp_cache = {}  # {cache_key: {'ltp': float, 'time': datetime}}
@@ -2291,11 +2342,34 @@ class CommodityPaperTrader:
         self._last_logged_regime = {}
 
     def connect(self):
-        connected = self.angel.connect()
-        # Share MCX futures tokens with WebSocket feed for subscription
-        if connected and self.ws_feed and self.angel._futures_tokens:
-            self.ws_feed.set_mcx_tokens(self.angel._futures_tokens)
-        return connected
+        """v25: Connect data sources. Angel for historical only, Dhan/Zerodha for signals/LTP."""
+        has_primary = (self.dhan and self.dhan.is_connected) or (hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected)
+
+        # Load instrument master for expiry lookup
+        try:
+            cache = os.path.join(DATA_DIR, 'instrument_master.csv')
+            if os.path.exists(cache) and not getattr(self, '_instruments_df', None):
+                self._instruments_df = pd.read_csv(cache, low_memory=False)
+                logger.info(f"[Instruments] Loaded {len(self._instruments_df)} from cache")
+                if self.angel:
+                    self.angel.instruments = self._instruments_df
+        except Exception as e:
+            logger.warning(f"[Instruments] Load failed: {e}")
+
+        # Angel for historical data download only
+        try:
+            if self.angel:
+                self.angel.connect()
+                logger.info("[Angel MCX] Connected (historical data only)")
+        except Exception:
+            logger.info("[Angel MCX] Not available — Dhan/Zerodha are primary")
+
+        if has_primary:
+            logger.info(f"[DataSources] Primary: {'Dhan' if self.dhan else 'Zerodha'} | v25: Angel for historical only")
+            return True
+
+        logger.warning("[DataSources] No primary source (Dhan/Zerodha) — running offline")
+        return False
 
     def _fetch_india_vix(self):
         """v9.6: Fetch India VIX. Cached 120s. Same VIX affects commodity sentiment.
@@ -2304,9 +2378,29 @@ class CommodityPaperTrader:
         cached = self._vix_cache
         if cached['value'] and cached['time'] and (datetime.now() - cached['time']).total_seconds() < 120:
             return cached['value']
-        for token in ['26017', '99926004']:
+        # v21: VIX from Zerodha ATM IV or pipeline (Angel MCX get_ltp doesn't support NSE)
+        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
             try:
-                ltp = self.angel.get_ltp('NSE', token)
+                chain = self.zerodha.get_option_chain('NIFTY')
+                if chain:
+                    ivs = []
+                    for ot in ['CE', 'PE']:
+                        for c in chain.get(ot, [])[:3]:
+                            iv_val = c.get('iv', 0)
+                            if iv_val and iv_val > 0:
+                                ivs.append(iv_val * 100 if iv_val < 1 else iv_val)
+                    if ivs:
+                        avg_iv = sum(ivs) / len(ivs)
+                        if 5 < avg_iv < 80:
+                            self._vix_cache = {'value': avg_iv, 'time': datetime.now()}
+                            self.current_vix = avg_iv
+                            return avg_iv
+            except Exception:
+                pass
+        # Legacy: Angel NSE VIX (disabled — get_ltp signature mismatch)
+        for token in ['_disabled']:
+            try:
+                ltp = None  # self.angel.get_ltp('NSE', token) — wrong signature
                 if ltp and ltp > 0:
                     vix = ltp
                     # Normalize: Angel may return VIX x100 or x1000
@@ -2339,9 +2433,18 @@ class CommodityPaperTrader:
 
     def get_spot(self, commodity):
         """Get current spot price for commodity.
-        v12.0 Priority: Zerodha -> TrueData -> WebSocket cache -> REST API -> historical close.
+        v23 Priority: Dhan -> Zerodha -> WebSocket cache -> REST API -> historical close.
         """
-        # v12.0 Source 1: Zerodha spot (primary — solves MCX "Access denied")
+        # v23 Source 0: Dhan spot (primary — via option chain last_price)
+        if hasattr(self, 'dhan') and self.dhan and self.dhan.is_connected:
+            try:
+                dh_spot = self.dhan.get_spot(commodity)
+                if dh_spot and dh_spot > 0:
+                    return dh_spot
+            except Exception:
+                pass
+
+        # Source 1: Zerodha spot (secondary — solves MCX "Access denied")
         if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
             try:
                 zd_spot = self.zerodha.get_spot(commodity)
@@ -2359,61 +2462,58 @@ class CommodityPaperTrader:
             except Exception:
                 pass
 
-        # Source 2: WebSocket cache (instant, no API call)
-        if self.ws_feed and commodity in self.angel._futures_tokens:
-            ws_ltp = self.ws_feed.get_ltp(self.angel._futures_tokens[commodity])
-            if ws_ltp:
-                return ws_ltp
-
-        # Source 3: REST API
-        ltp = self.angel.get_ltp(commodity)
-        if ltp:
-            return ltp
-
-        # Source 4: historical close
+        # Source 3: historical close (last resort)
         df = self.engine.historical_data.get(commodity)
         if df is not None and len(df) > 0:
             return df['Close'].iloc[-1]
         return None
 
     def get_intraday_ohlc(self, commodity):
-        """v2.5.2: Get today's intraday OHLC from 5-min candles (like equity does).
-        Without this, Gamma Blast never fires (body = spot - open = 0 always).
+        """v25: Get today's intraday OHLC. Dhan/Zerodha primary, Angel historical removed.
         Cached for 60s to avoid rate limiting.
         """
-        token = self.angel._futures_tokens.get(commodity)
-        if not token:
-            return None
-
         # Check cache (60-second TTL)
         cached = self._ohlc_cache.get(commodity)
         if cached and (datetime.now() - cached['time']).total_seconds() < 60:
             return cached['data']
 
+        # v25: Try Zerodha historical API for intraday candles
+        if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
+            try:
+                zd_ohlc = self.zerodha.get_intraday_ohlc(commodity)
+                if zd_ohlc:
+                    self._ohlc_cache[commodity] = {'data': zd_ohlc, 'time': datetime.now()}
+                    return zd_ohlc
+            except Exception:
+                pass
+
+        # v25: Try Angel historical API as fallback (still works for candle data)
         try:
-            today = datetime.now()
-            from_date = today.strftime('%Y-%m-%d 09:00')
-            to_date = today.strftime('%Y-%m-%d %H:%M')
-            data = self.angel.get_historical(
-                'MCX', token, 'FIVE_MINUTE', from_date, to_date
-            )
-            if data:
-                opens = [c[1] for c in data]
-                highs = [c[2] for c in data]
-                lows = [c[3] for c in data]
-                closes = [c[4] for c in data]
-                volumes = [c[5] for c in data]
-                ohlc = {
-                    'open': opens[0],
-                    'high': max(highs),
-                    'low': min(lows),
-                    'close': closes[-1],
-                    'volume': sum(volumes),
-                }
-                self._ohlc_cache[commodity] = {'data': ohlc, 'time': datetime.now()}
-                return ohlc
+            token = self.angel._futures_tokens.get(commodity) if self.angel else None
+            if token:
+                today = datetime.now()
+                from_date = today.strftime('%Y-%m-%d 09:00')
+                to_date = today.strftime('%Y-%m-%d %H:%M')
+                data = self.angel.get_historical(
+                    'MCX', token, 'FIVE_MINUTE', from_date, to_date
+                )
+                if data:
+                    opens = [c[1] for c in data]
+                    highs = [c[2] for c in data]
+                    lows = [c[3] for c in data]
+                    closes = [c[4] for c in data]
+                    volumes = [c[5] for c in data]
+                    ohlc = {
+                        'open': opens[0],
+                        'high': max(highs),
+                        'low': min(lows),
+                        'close': closes[-1],
+                        'volume': sum(volumes),
+                    }
+                    self._ohlc_cache[commodity] = {'data': ohlc, 'time': datetime.now()}
+                    return ohlc
         except Exception as e:
-            logger.error(f"MCX intraday OHLC error for {commodity}: {e}")
+            logger.debug(f"MCX intraday OHLC error for {commodity}: {e}")
 
         # Fallback: use spot for all (old behavior)
         spot = self.get_spot(commodity)
@@ -2423,31 +2523,28 @@ class CommodityPaperTrader:
 
     def _get_commodity_option_ltp(self, pos):
         """Get real-time option LTP for a commodity position.
-        v10.5: WebSocket first (instant, no rate limit), then REST API fallback.
+        v25: Dhan (primary) → Zerodha (fallback). Angel removed.
         Returns LTP float or None if unavailable.
         """
-        details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
-        option_token = details.get('option_token')
+        # v25: Angel token lookup removed — Dhan/Zerodha handle all LTP
 
-        # Backfill for positions opened before this fix (no stored token)
-        if not option_token:
-            commodity = pos['commodity']
-            opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
-            expiry = self._get_nearest_mcx_expiry(commodity)
-            if expiry:
-                option_info = self.angel.find_option_tokens(commodity, expiry, pos['strike'], opt_type)
-                if option_info:
-                    option_token = str(option_info.get('token', ''))
-                    # Store in position so we don't re-lookup every cycle
-                    if isinstance(details, dict):
-                        details['option_token'] = option_token
-                    else:
-                        pos['details'] = {'option_token': option_token}
-                    # v10.5: Subscribe to WebSocket for real-time updates
-                    if self.ws_feed and option_token:
-                        self.ws_feed.subscribe_mcx_options([option_token])
+        # v24 Source 0: Dhan option LTP (primary — native Greeks, no rate limits)
+        if hasattr(self, 'dhan') and self.dhan and self.dhan.is_connected:
+            try:
+                commodity_name = pos['commodity']
+                opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                dh_chain = self.dhan.get_option_chain(commodity_name)
+                if dh_chain:
+                    for c in dh_chain.get(opt_type, []):
+                        if int(c['strike']) == int(pos['strike']):
+                            ltp_val = c.get('ltp', 0)
+                            if ltp_val and ltp_val > 0:
+                                return float(ltp_val)
+                            break
+            except Exception:
+                pass
 
-        # v12.0 Source 1: Zerodha option LTP (primary — no MCX rate limits)
+        # v12.0 Source 1: Zerodha option LTP (secondary — no MCX rate limits)
         if hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
             try:
                 commodity_name = pos['commodity']
@@ -2469,31 +2566,6 @@ class CommodityPaperTrader:
             except Exception:
                 pass
 
-        if not option_token:
-            return None
-
-        # v10.5 Source 2: WebSocket real-time LTP (instant, no rate limit)
-        if self.ws_feed:
-            ws_ltp = self.ws_feed.get_ltp(str(option_token))
-            if ws_ltp and ws_ltp > 0:
-                return ws_ltp
-
-        # Source 3: REST API with 5s cache
-        cache_key = f"MCX_{option_token}"
-        cached = self._option_ltp_cache.get(cache_key)
-        if cached and (datetime.now() - cached['time']).total_seconds() < 5:
-            return cached['ltp']
-
-        try:
-            mkt_data = self.angel.get_market_data('MCX', option_token)
-            if mkt_data:
-                ltp = float(mkt_data.get('ltp', 0) or 0)
-                if ltp > 0:
-                    self._option_ltp_cache[cache_key] = {'ltp': ltp, 'time': datetime.now()}
-                    return ltp
-        except Exception as e:
-            logger.debug(f"  MCX Option LTP fetch failed for {cache_key}: {e}")
-
         return None
 
     def is_mcx_open(self):
@@ -2504,17 +2576,26 @@ class CommodityPaperTrader:
         return COMMODITY_TRADE_START <= now.time() <= MCX_CLOSE
 
     def _get_nearest_mcx_expiry(self, commodity):
-        """Get nearest MCX option expiry for a commodity."""
-        if self.angel.instruments is None:
+        """Get nearest MCX option expiry for a commodity.
+        v25: Uses cached instrument master — no Angel dependency.
+        """
+        # v25: Use self._instruments_df or self.angel.instruments (whichever is available)
+        instruments = getattr(self, '_instruments_df', None)
+        if instruments is None:
+            instruments = self.angel.instruments if self.angel else None
+        if instruments is None:
             cache = os.path.join(DATA_DIR, 'instrument_master.csv')
             if os.path.exists(cache):
-                self.angel.instruments = pd.read_csv(cache, low_memory=False)
+                instruments = pd.read_csv(cache, low_memory=False)
+                self._instruments_df = instruments
+                if self.angel:
+                    self.angel.instruments = instruments
             else:
                 return None
-        mask = (self.angel.instruments['name'] == commodity) & \
-               (self.angel.instruments['exch_seg'] == 'MCX') & \
-               (self.angel.instruments['instrumenttype'] == 'OPTFUT')
-        matches = self.angel.instruments[mask]
+        mask = (instruments['name'] == commodity) & \
+               (instruments['exch_seg'] == 'MCX') & \
+               (instruments['instrumenttype'] == 'OPTFUT')
+        matches = instruments[mask]
         if len(matches) == 0:
             return None
         today = datetime.now().date()
@@ -2550,19 +2631,20 @@ class CommodityPaperTrader:
         current_iv = None
 
         try:
-            # Method 1: get_market_data for OI
-            expiry = self._get_nearest_mcx_expiry(commodity)
-            if expiry:
-                option_info = self.angel.find_option_tokens(commodity, expiry, strike, opt_type)
-                if option_info:
-                    token = str(option_info.get('token', ''))
-                    mkt_data = self.angel.get_market_data('MCX', token)
-                    if mkt_data:
-                        current_oi = mkt_data.get('opnInterest', mkt_data.get('oi'))
-                        if current_oi is not None:
-                            current_oi = float(current_oi)
+            # v25 Method 1: Dhan option chain for OI (was Angel get_market_data)
+            if hasattr(self, 'dhan') and self.dhan and self.dhan.is_connected:
+                dh_chain = self.dhan.get_option_chain(commodity)
+                if dh_chain:
+                    for c in dh_chain.get(opt_type, []):
+                        if int(c['strike']) == int(strike):
+                            oi_val = c.get('oi', 0)
+                            if oi_val:
+                                current_oi = float(oi_val)
+                            break
 
             # Method 2: Local BS IV calculation (replaces Angel Greeks)
+            spot = self.get_spot(commodity) or 0
+            premium = pos.get('current_premium', pos.get('entry_premium', 0))
             if current_iv is None and spot > 0 and premium > 0:
                 try:
                     dte_days = max(pos.get('dte', 1), 1)
@@ -2946,14 +3028,15 @@ class CommodityPaperTrader:
                     choppy_blocked = True
                     logger.info(f"  CHOPPY_DAY_BLOCK: {commodity} eff={day_eff:.0f}% — blocking new entries")
 
-            # v7.1: Only 3 commodity strategies — PCR+VWAP needs equity OI data,
-            # Survivor halted (needs more capital)
+            # v26: 3 active strategies — Wave replaces Ghost Zone (v20 audit)
+            # Strategy priority: CPR(100) > Wave(95) > Gamma Blast(85)
             checks = [
                 ('CPR', self.engine.check_cpr_signals),
+                ('Wave', self.engine.check_wave_signals),
                 ('Gamma Blast', self.engine.check_gamma_blast_signals),
-                ('Ghost Zone', self.engine.check_ghost_zone_signals),
-                # ('PCR+VWAP', ...),  # Not applicable to commodities (needs equity OI chain)
-                # ('Survivor', ...),  # HALTED v7 — needs more capital
+                # ('Ghost Zone', ...),   # REMOVED v26 — not viable for commodities
+                # ('PCR+VWAP', ...),     # Not applicable to commodities (needs equity OI chain)
+                # ('Survivor', ...),     # HALTED v7 — needs more capital
             ]
 
             for strat_name, check_fn in checks:
@@ -3082,6 +3165,9 @@ class CommodityPaperTrader:
                 logger.warning(f"  MCX_SKIP_VIX_EXTREME_LOW: VIX={self.current_vix:.1f} < {MCX_VIX_BLOCK_LOW} — blocking {len(signals)} commodity entries")
                 return
 
+        # v26: Sort signals by strategy priority (CPR first, then Wave, then Gamma Blast)
+        signals.sort(key=lambda s: MCX_STRATEGY_PRIORITY.get(s.get('strategy', ''), 0), reverse=True)
+
         executed = 0
         skipped = 0
         for sig in signals:
@@ -3106,6 +3192,19 @@ class CommodityPaperTrader:
                 skipped += 1
                 continue
 
+            # v26: Strategy priority dedup — block if higher-priority strategy already holding same commodity+direction
+            sig_priority = MCX_STRATEGY_PRIORITY.get(sig.get('strategy', ''), 0)
+            higher_priority_held = [p for p in self.portfolio.positions
+                                    if p['commodity'] == sig['commodity']
+                                    and (('CE' if 'CE' in p['signal_type'] else 'PE') == sig_opt_type)
+                                    and MCX_STRATEGY_PRIORITY.get(p.get('strategy', ''), 0) > sig_priority]
+            if higher_priority_held:
+                hp = higher_priority_held[0]
+                logger.info(f"  SKIP_PRIORITY: {sig['strategy']}(p={sig_priority}) {sig['commodity']} {sig_opt_type} "
+                           f"— {hp['strategy']}(p={MCX_STRATEGY_PRIORITY.get(hp['strategy'], 0)}) already holding")
+                skipped += 1
+                continue
+
             # v9.5: Count prior same-strategy+direction trades today (for score escalation)
             today_str = datetime.now().strftime('%Y-%m-%d')
             same_strat_closed = [t for t in self.portfolio.closed_trades
@@ -3115,9 +3214,10 @@ class CommodityPaperTrader:
                 and ('CE' if 'CE' in t.get('signal_type', '') else 'PE') == sig_opt_type]
             reentry_count = len(same_strat_closed)
 
-            # v9.5: Escalating score threshold — each re-entry needs higher conviction
-            # 1st trade: MCX_MIN_SIGNAL_SCORE (50), 2nd: +15 (65), 3rd: +30 (80), 4th: +45 (95)
-            escalated_min_score = MCX_MIN_SIGNAL_SCORE + (reentry_count * MCX_SCORE_ESCALATION_PER_REENTRY)
+            # v26: Escalating score threshold with per-commodity base
+            # GOLDM base=80, SILVERM base=70, CRUDEOILM base=50, then +15 per re-entry
+            _base_score = MCX_MIN_SIGNAL_SCORE_PER_COMMODITY.get(sig['commodity'], MCX_MIN_SIGNAL_SCORE)
+            escalated_min_score = _base_score + (reentry_count * MCX_SCORE_ESCALATION_PER_REENTRY)
             sig['_escalated_min_score'] = escalated_min_score  # Pass to score check below
             if reentry_count > 0:
                 logger.info(f"  REENTRY #{reentry_count+1}: {sig['strategy']} {sig['commodity']} {sig_opt_type} "
@@ -3151,9 +3251,10 @@ class CommodityPaperTrader:
             # Check for CONFLICTING positions: no BUY_CE + SELL_CE on same commodity/strike
             opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
             is_buy_sig = 'BUY' in sig['type']
+            strike_interval = {'GOLDM': 500, 'SILVERM': 500, 'CRUDEOILM': 50}.get(sig['commodity'], 100)
             conflicting = [p for p in self.portfolio.positions
                            if p['commodity'] == sig['commodity']
-                           and abs(p['strike'] - sig['strike']) <= tol
+                           and abs(p['strike'] - sig['strike']) <= strike_interval
                            and (('CE' in p['signal_type']) == (opt_type == 'CE'))
                            and p['is_sell'] == is_buy_sig]
             if conflicting:
@@ -3358,7 +3459,9 @@ class CommodityPaperTrader:
                 continue
 
             # ---- v9.5: Signal quality score check (MANDATORY — no bypass) ----
-            min_score_required = sig.get('_escalated_min_score', MCX_MIN_SIGNAL_SCORE)
+            # v26: Per-commodity QS threshold (GOLDM=80, SILVERM=70, CRUDEOILM=50)
+            commodity_min_score = MCX_MIN_SIGNAL_SCORE_PER_COMMODITY.get(sig['commodity'], MCX_MIN_SIGNAL_SCORE)
+            min_score_required = max(sig.get('_escalated_min_score', MCX_MIN_SIGNAL_SCORE), commodity_min_score)
             indicators = self.engine.compute_indicators(sig['commodity'],
                          {'open': sig['spot'], 'high': sig['spot'], 'low': sig['spot'], 'close': sig['spot'], 'volume': 0})
             if indicators:
@@ -3445,29 +3548,43 @@ class CommodityPaperTrader:
                 continue
 
             # Fetch entry OI + real option LTP from market data
+            # v24: Source priority: Dhan (0) > Zerodha (1) > Angel (2)
             entry_oi = 0
             option_token = None
             mkt_data = None
             real_ltp = None
-            try:
-                opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
-                expiry = self._get_nearest_mcx_expiry(sig['commodity'])
-                if expiry:
-                    option_info = self.angel.find_option_tokens(
-                        sig['commodity'], expiry, sig['strike'], opt_type
-                    )
-                    if option_info:
-                        option_token = str(option_info.get('token', ''))
-                        mkt_data = self.angel.get_market_data('MCX', option_token)
-                        if mkt_data:
-                            entry_oi = float(mkt_data.get('opnInterest', mkt_data.get('oi', 0)) or 0)
-                            logger.info(f"  MCX_ENTRY_OI: {sig['commodity']} {sig['strike']}{opt_type} OI={entry_oi}")
-                            # Extract real option LTP from same API response (zero extra calls)
-                            fetched_ltp = float(mkt_data.get('ltp', 0) or 0)
-                            if fetched_ltp > 0:
-                                real_ltp = fetched_ltp
-            except Exception as e:
-                logger.info(f"  MCX OI/LTP fetch at entry failed for {sig['commodity']}: {e}")
+            opt_type = 'CE' if 'CE' in sig['type'] else 'PE'
+            expiry = self._get_nearest_mcx_expiry(sig['commodity'])  # v24: pre-compute for position details
+
+            # Source 0: Dhan — already has live LTP + OI from option chain
+            if hasattr(self, 'dhan') and self.dhan and self.dhan.is_connected:
+                try:
+                    dh_chain = self.dhan.get_option_chain(sig['commodity'])
+                    if dh_chain:
+                        for c in dh_chain.get(opt_type, []):
+                            if int(c['strike']) == int(sig['strike']):
+                                ltp_val = c.get('ltp', 0)
+                                if ltp_val and ltp_val > 0:
+                                    real_ltp = float(ltp_val)
+                                    entry_oi = float(c.get('oi', 0) or 0)
+                                    logger.info(f"  MCX_ENTRY_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
+                                               f"LTP={real_ltp:.2f} OI={entry_oi:.0f} [Dhan]")
+                                break
+                except Exception as e:
+                    logger.debug(f"  MCX_ENTRY_DHAN_ERR: {sig['commodity']} - {e}")
+
+            # Source 1: Zerodha option LTP
+            if not real_ltp and hasattr(self, 'zerodha') and self.zerodha and self.zerodha.is_connected:
+                try:
+                    zd_ltp = self.zerodha.get_option_ltp(sig['commodity'], sig['strike'], opt_type)
+                    if zd_ltp and zd_ltp > 0:
+                        real_ltp = float(zd_ltp)
+                        logger.info(f"  MCX_ENTRY_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
+                                   f"LTP={real_ltp:.2f} [Zerodha]")
+                except Exception as e:
+                    logger.debug(f"  MCX_ENTRY_ZD_ERR: {sig['commodity']} - {e}")
+
+            # v25: Angel Source 2 REMOVED — Dhan/Zerodha are sufficient
 
             # Replace BS premium with real market LTP + compute real Greeks
             bs_premium = sig['premium']
@@ -3477,7 +3594,7 @@ class CommodityPaperTrader:
             # Never enter trades at Black-76 derived pricing (causes phantom PnL)
             if not real_ltp or real_ltp <= 0:
                 logger.warning(f"  MCX_SKIP_NO_LTP: {sig['commodity']} {sig['strike']}{opt_type} "
-                              f"— no real LTP from Angel API. "
+                              f"— no real LTP from Dhan/Zerodha. "
                               f"Black-76 premium Rs {bs_premium:.2f} rejected. Trade skipped.")
                 skipped += 1
                 continue
@@ -3496,11 +3613,14 @@ class CommodityPaperTrader:
             if real_ltp and real_ltp > 0:
                 # Preserve target/SL ratios from strategy, apply to real premium
                 if bs_premium > 0:
-                    target_ratio = sig.get('target', bs_premium * 1.5) / bs_premium
-                    sl_ratio = sig.get('sl', bs_premium * 0.4) / bs_premium
+                    target_ratio = sig.get('target', bs_premium * 1.3) / bs_premium
+                    sl_ratio = sig.get('sl', bs_premium * 0.75) / bs_premium
                 else:
-                    target_ratio = 1.5
-                    sl_ratio = 0.4
+                    target_ratio = 1.3
+                    sl_ratio = 0.75
+                # v25: Cap target at 1.3x and SL floor at 0.75x for MCX options
+                target_ratio = min(target_ratio, 1.5)  # Max 50% target
+                sl_ratio = max(sl_ratio, 0.75)  # Min 25% loss (was 60%)
                 sig['premium'] = real_ltp
                 sig['target'] = round(real_ltp * target_ratio, 2)
                 sig['sl'] = round(real_ltp * sl_ratio, 2)
@@ -3645,6 +3765,20 @@ class CommodityPaperTrader:
             entry_time = datetime.fromisoformat(pos['timestamp'])
             elapsed_secs = (datetime.now() - entry_time).total_seconds()
             if elapsed_secs < MCX_GRACE_PERIOD_SECONDS:
+                # v22: EMERGENCY SL during grace
+                _grace_ltp = pos.get('current_premium', pos.get('entry_premium', 0))
+                if _grace_ltp is not None and _grace_ltp > 0:
+                    _entry_prem = pos['entry_premium']
+                    _loss_pct = (_entry_prem - _grace_ltp) / _entry_prem * 100 if _entry_prem > 0 else 0
+                    if elapsed_secs <= EMERGENCY_SL_TIER1_SECONDS:
+                        _esl_threshold = EMERGENCY_SL_TIER1_PCT
+                    else:
+                        _esl_threshold = EMERGENCY_SL_TIER2_PCT
+                    if _loss_pct >= _esl_threshold:
+                        logger.warning(f"  EMERGENCY_SL: {pos['id']} loss {_loss_pct:.1f}% >= {_esl_threshold}% at {int(elapsed_secs)}s")
+                        self.portfolio.close_position(pos['id'], _grace_ltp, 'EMERGENCY_SL')
+                        self._track_exit(pos, 'EMERGENCY_SL')
+                        continue
                 logger.info(f"  GRACE: {pos['id']} opened {int(elapsed_secs)}s ago (need {MCX_GRACE_PERIOD_SECONDS}s)")
                 continue
 
@@ -3710,6 +3844,30 @@ class CommodityPaperTrader:
                             logger.info(f"  MCX_THETA_SL_TIGHTEN: {pos['id']} theta_burden={_theta_burden_pct:.1f}%/day "
                                        f"> {MCX_THETA_BURDEN_TIGHTEN_PCT}% — SL→Rs {_new_tsl:.2f}")
                             pos['trailing_sl'] = _new_tsl
+
+            # ---- v25: OI HEATMAP EXIT — smart exit for profitable positions ----
+            if hasattr(self, 'oi_heatmap') and self.oi_heatmap and pos.get('unrealized_pnl', 0) > MCX_MIN_OI_EXIT_PNL:
+                try:
+                    _oi_opt_type = 'CE' if 'CE' in pos['signal_type'] else 'PE'
+                    oi_exit = self.oi_heatmap.get_exit_signal(
+                        symbol=commodity, spot=spot, opt_type=_oi_opt_type,
+                        strike=pos['strike'], entry_premium=pos['entry_premium'],
+                        current_premium=pos.get('current_premium', pos['entry_premium']),
+                        oi_velocity_tracker=None)
+                    if oi_exit and oi_exit.get('action') == 'FULL_EXIT':
+                        _curr = pos.get('current_premium', pos['entry_premium'])
+                        logger.info(f"  OI_EXIT: {pos['id']} conf={oi_exit['confidence']} "
+                                   f"reason={oi_exit['reason']}")
+                        self.portfolio.close_position(pos['id'], _curr, 'OI_HEATMAP_EXIT')
+                        self._track_exit(pos, 'OI_HEATMAP_EXIT')
+                        self._notify_commodity_exit(pos, commodity, _curr, 'OI_HEATMAP_EXIT')
+                        continue
+                    elif oi_exit and oi_exit.get('action') == 'TRAIL_50%':
+                        logger.info(f"  OI_TRAIL: {pos['id']} conf={oi_exit['confidence']} "
+                                   f"reason={oi_exit['reason']} — tightening SL to breakeven")
+                        pos['trailing_sl'] = pos['entry_premium']
+                except Exception as e:
+                    logger.debug(f"  OI_EXIT check failed: {e}")
 
             # ---- PREMIUM UPDATE: Real market LTP with fallback to delta+gamma+theta ----
             entry_spot = pos.get('entry_spot', 0)
@@ -3838,7 +3996,12 @@ class CommodityPaperTrader:
             details = pos.get('details', {}) if isinstance(pos.get('details'), dict) else {}
             # v10.1: Use dynamically updated target (from trailing target) if available
             target = pos.get('target', details.get('target', pos['entry_premium'] * 1.5))
-            sl = details.get('sl', pos['entry_premium'] * 0.5)
+            sl = details.get('sl', pos['entry_premium'] * 0.75)  # v25: was 0.5 (50% loss!) → 0.75 (25% loss)
+
+            # v22: Hard SL floor — never let SL drop below EMERGENCY_SL_MAX_PCT loss
+            _hard_sl_floor = pos['entry_premium'] * (1 - EMERGENCY_SL_MAX_PCT / 100)
+            if not pos['is_sell'] and sl < _hard_sl_floor:
+                sl = _hard_sl_floor
 
             # ---- v7.6: TSL based on PREMIUM GAIN % (not target distance %) ----
             entry_prem = pos['entry_premium']
@@ -4267,7 +4430,7 @@ class CommodityPaperTrader:
         """v15: Tick-by-tick scanning (was 5 min intervals)."""
         self._running = True
         logger.info(f"\n{'='*70}")
-        logger.info("COMMODITY PAPER TRADING STARTED (v15 — TICK-BY-TICK)")
+        logger.info("COMMODITY PAPER TRADING STARTED (v26 — CPR+Wave+GammaBlast, MC-optimal)")
         logger.info(f"MCX Hours: 9:00 AM - 11:30 PM | Scan every {interval_seconds}s")
         logger.info(f"Commodities: {', '.join(PAPER_TRADE_COMMODITIES)}")
         logger.info(f"Capital: Rs {self.portfolio.capital:,.0f}")
@@ -4293,8 +4456,13 @@ def main():
     print("=" * 70)
     print("  COMMODITY OPTIONS - PAPER TRADING SYSTEM")
     print("  MCX | Gold Mini, Silver Mini, Crude Oil Mini")
-    print("  Strategies: CPR, Gamma Blast, Ghost Zone")
+    print("  Strategies: CPR, Wave, Gamma Blast")
     print("=" * 70)
+
+    if COMMODITY_PAUSED:
+        print("\n  *** COMMODITY TRADING PAUSED (v21) ***")
+        print("  Set COMMODITY_PAUSED = False to resume.\n")
+        return
 
     import argparse
     parser = argparse.ArgumentParser()

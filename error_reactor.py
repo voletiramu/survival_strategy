@@ -365,17 +365,23 @@ class HeartbeatWriter:
         self._dir = heartbeat_dir or HEARTBEAT_DIR
         os.makedirs(self._dir, exist_ok=True)
 
-    def write(self, thread_name, scan_count=0, ws_feed=None):
+    def write(self, thread_name, scan_count=0, ws_feed=None, zerodha_feed=None):
         """Write heartbeat file atomically.
 
         Args:
             thread_name: 'equity', 'commodity', 'stock'
             scan_count: Current scan iteration number
             ws_feed: WebSocketFeed instance (for LTP age tracking)
+            zerodha_feed: ZerodhaFeed instance (primary data source)
         """
-        # Calculate max LTP age from ws_feed
+        # Calculate max LTP age — prefer Zerodha cache freshness over Angel WS
         ltp_age = 0.0
-        if ws_feed and hasattr(ws_feed, 'get_max_ltp_age'):
+        if zerodha_feed and hasattr(zerodha_feed, '_spot_cache') and zerodha_feed._spot_cache:
+            import time as _t
+            ages = [_t.time() - v.get('_time', 0) for v in zerodha_feed._spot_cache.values() if v.get('_time')]
+            if ages:
+                ltp_age = min(ages)  # Use freshest spot cache age
+        elif ws_feed and hasattr(ws_feed, 'get_max_ltp_age'):
             ltp_age = ws_feed.get_max_ltp_age()
 
         data = {

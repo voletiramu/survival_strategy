@@ -351,7 +351,7 @@ class DataRetention:
 class HealthDigest:
     """Generate daily health report."""
 
-    def generate(self):
+    def generate(self, signal_monitor=None):
         """Generate comprehensive health digest."""
         report = {
             'generated_at': datetime.now().isoformat(),
@@ -362,6 +362,13 @@ class HealthDigest:
 
         # Generate Telegram message
         report['telegram_message'] = self._format_telegram(report)
+
+        # Append signal health if monitor available
+        if signal_monitor:
+            sig_summary = signal_monitor.get_summary()
+            report['signal_health'] = sig_summary
+            report['telegram_message'] += '\n\n' + sig_summary
+
         return report
 
     def _check_system(self):
@@ -491,6 +498,217 @@ class HealthDigest:
         return '\n'.join(lines)
 
 
+# ── Signal Health Monitor ────────────────────────────────────────────────
+
+class SignalHealthMonitor:
+    """Monitors signal generation, entry blocks, exit quality, and dead strategies.
+
+    Designed to catch the problems from Mar 27:
+    - Ghost Zone v8 dead code (strategy silently returns [])
+    - CROSS_DEDUP blocking 1,154+ entries
+    - DIR_CAP blocking 18,315 entries
+    - TSL_MICRO killing trades at 5% gain (peak was 21%)
+    - Strategies disabled with fake "MC REJECTED" labels
+    """
+
+    # Thresholds
+    SIGNAL_DEAD_SCANS = 50        # If strategy returns [] for 50 consecutive scans → dead
+    BLOCK_RATE_WARN = 0.30        # Warn if >30% of signals blocked
+    BLOCK_RATE_CRITICAL = 0.50    # Critical if >50% blocked
+    MICRO_EXIT_DOMINANT = 0.60    # Alert if >60% of exits are TSL_MICRO
+    PEAK_CAPTURE_MIN = 0.25       # Alert if avg peak capture < 25%
+    CHECK_INTERVAL_MINUTES = 30   # Run signal health check every 30 min
+
+    def __init__(self):
+        self._signal_counts = defaultdict(int)       # {strategy: total_signals}
+        self._empty_streak = defaultdict(int)         # {strategy: consecutive_empty_scans}
+        self._block_counts = defaultdict(lambda: defaultdict(int))  # {reason: {symbol: count}}
+        self._exit_types = defaultdict(int)            # {exit_reason: count}
+        self._peak_captures = []                       # list of (peak_gain%, actual_exit_gain%)
+        self._last_check = datetime.now()
+        self._alerts = []
+
+    def record_signal(self, strategy, symbol, signal_count):
+        """Called after each strategy scan. Track signal generation rate."""
+        if signal_count > 0:
+            self._signal_counts[strategy] += signal_count
+            self._empty_streak[strategy] = 0
+        else:
+            self._empty_streak[strategy] += 1
+
+    def record_block(self, reason, symbol, strategy):
+        """Called when an entry is blocked. Track block rates."""
+        self._block_counts[reason][symbol] += 1
+
+    def record_exit(self, exit_reason, peak_gain_pct, actual_gain_pct):
+        """Called on position exit. Track exit quality."""
+        self._exit_types[exit_reason] += 1
+        if peak_gain_pct > 0:
+            self._peak_captures.append((peak_gain_pct, actual_gain_pct))
+
+    def check_health(self):
+        """Run all signal health checks. Returns list of alerts."""
+        alerts = []
+        now = datetime.now()
+
+        # 1. Dead strategy detection
+        for strat, streak in self._empty_streak.items():
+            if streak >= self.SIGNAL_DEAD_SCANS:
+                alerts.append({
+                    'type': 'DEAD_STRATEGY',
+                    'severity': 'CRITICAL',
+                    'strategy': strat,
+                    'empty_scans': streak,
+                    'message': '%s has returned 0 signals for %d consecutive scans — likely dead code or disabled' % (strat, streak),
+                    'action': 'Check if strategy code is commented out or returning early',
+                })
+
+        # 2. Entry block rate
+        total_signals = sum(self._signal_counts.values())
+        total_blocks = sum(sum(v.values()) for v in self._block_counts.values())
+        if total_signals > 0:
+            block_rate = total_blocks / (total_signals + total_blocks)
+            if block_rate >= self.BLOCK_RATE_CRITICAL:
+                # Find top blocking reason
+                top_reason = max(self._block_counts.items(),
+                                 key=lambda x: sum(x[1].values()), default=('NONE', {}))
+                alerts.append({
+                    'type': 'HIGH_BLOCK_RATE',
+                    'severity': 'CRITICAL',
+                    'block_rate': '%.0f%%' % (block_rate * 100),
+                    'total_signals': total_signals,
+                    'total_blocked': total_blocks,
+                    'top_blocker': top_reason[0],
+                    'top_blocker_count': sum(top_reason[1].values()),
+                    'message': '%.0f%% of signals blocked! Top blocker: %s (%d blocks)' % (
+                        block_rate * 100, top_reason[0], sum(top_reason[1].values())),
+                    'action': 'Review entry filters — too many valid signals being rejected',
+                })
+            elif block_rate >= self.BLOCK_RATE_WARN:
+                alerts.append({
+                    'type': 'ELEVATED_BLOCK_RATE',
+                    'severity': 'WARNING',
+                    'block_rate': '%.0f%%' % (block_rate * 100),
+                    'message': '%.0f%% of signals blocked — monitor for further increase' % (block_rate * 100),
+                })
+
+        # 3. Exit quality — TSL_MICRO dominance
+        total_exits = sum(self._exit_types.values())
+        if total_exits >= 5:
+            micro_exits = self._exit_types.get('TSL_MICRO', 0) + self._exit_types.get('TRAILING_SL_HIT', 0)
+            micro_rate = micro_exits / total_exits
+            if micro_rate >= self.MICRO_EXIT_DOMINANT:
+                alerts.append({
+                    'type': 'MICRO_EXIT_DOMINANT',
+                    'severity': 'WARNING',
+                    'micro_rate': '%.0f%%' % (micro_rate * 100),
+                    'micro_exits': micro_exits,
+                    'total_exits': total_exits,
+                    'message': '%.0f%% of exits are early micro-exits — trades not reaching targets' % (micro_rate * 100),
+                    'action': 'TSL phases may be too tight or targets unreachable',
+                })
+
+        # 4. Peak capture ratio
+        if len(self._peak_captures) >= 5:
+            captures = [actual / peak if peak > 0 else 0
+                        for peak, actual in self._peak_captures]
+            avg_capture = np.mean(captures)
+            if avg_capture < self.PEAK_CAPTURE_MIN:
+                avg_peak = np.mean([p for p, _ in self._peak_captures])
+                avg_exit = np.mean([a for _, a in self._peak_captures])
+                alerts.append({
+                    'type': 'LOW_PEAK_CAPTURE',
+                    'severity': 'WARNING',
+                    'avg_capture': '%.0f%%' % (avg_capture * 100),
+                    'avg_peak': '%.1f%%' % avg_peak,
+                    'avg_exit': '%.1f%%' % avg_exit,
+                    'message': 'Avg peak capture %.0f%% (peak %.1f%% → exit %.1f%%) — leaving money on table' % (
+                        avg_capture * 100, avg_peak, avg_exit),
+                    'action': 'Consider tighter trailing stops or partial booking',
+                })
+
+        # 5. Strategy signal imbalance (one strategy generating 90%+ of signals)
+        if total_signals >= 20 and len(self._signal_counts) >= 2:
+            max_strat = max(self._signal_counts.items(), key=lambda x: x[1])
+            if max_strat[1] / total_signals > 0.90:
+                alerts.append({
+                    'type': 'SIGNAL_IMBALANCE',
+                    'severity': 'INFO',
+                    'dominant_strategy': max_strat[0],
+                    'share': '%.0f%%' % (max_strat[1] / total_signals * 100),
+                    'message': '%s generating %.0f%% of all signals — other strategies may be inactive' % (
+                        max_strat[0], max_strat[1] / total_signals * 100),
+                })
+
+        self._alerts = alerts
+        self._last_check = now
+        return alerts
+
+    def get_summary(self):
+        """Get current signal health summary for logging/Telegram."""
+        total_signals = sum(self._signal_counts.values())
+        total_blocks = sum(sum(v.values()) for v in self._block_counts.values())
+        total_exits = sum(self._exit_types.values())
+
+        lines = ['<b>Signal Health Monitor</b>']
+
+        # Signal counts per strategy
+        lines.append('')
+        lines.append('Signals generated:')
+        for strat, count in sorted(self._signal_counts.items(), key=lambda x: -x[1]):
+            streak = self._empty_streak.get(strat, 0)
+            status = ' (DEAD? %d empty scans)' % streak if streak >= self.SIGNAL_DEAD_SCANS else ''
+            lines.append('  %s: %d%s' % (strat, count, status))
+
+        if not self._signal_counts:
+            lines.append('  No signals recorded yet')
+
+        # Block summary
+        if total_blocks > 0:
+            lines.append('')
+            lines.append('Entry blocks: %d (%.0f%% of attempts)' % (
+                total_blocks, total_blocks / max(total_signals + total_blocks, 1) * 100))
+            for reason, symbols in sorted(self._block_counts.items(),
+                                          key=lambda x: -sum(x[1].values())):
+                lines.append('  %s: %d' % (reason, sum(symbols.values())))
+
+        # Exit quality
+        if total_exits > 0:
+            lines.append('')
+            lines.append('Exit types:')
+            for reason, count in sorted(self._exit_types.items(), key=lambda x: -x[1]):
+                lines.append('  %s: %d (%.0f%%)' % (reason, count, count / total_exits * 100))
+
+        # Peak capture
+        if self._peak_captures:
+            captures = [actual / peak if peak > 0 else 0
+                        for peak, actual in self._peak_captures]
+            lines.append('')
+            lines.append('Peak capture: avg %.0f%% (best %.0f%%, worst %.0f%%)' % (
+                np.mean(captures) * 100,
+                max(captures) * 100,
+                min(captures) * 100))
+
+        # Alerts
+        if self._alerts:
+            lines.append('')
+            lines.append('ALERTS:')
+            for alert in self._alerts:
+                icon = {'CRITICAL': '🔴', 'WARNING': '🟡', 'INFO': '🔵'}.get(alert['severity'], '⚪')
+                lines.append('%s %s' % (icon, alert['message']))
+
+        return '\n'.join(lines)
+
+    def reset_daily(self):
+        """Reset counters at start of new trading day."""
+        self._signal_counts.clear()
+        self._empty_streak.clear()
+        self._block_counts.clear()
+        self._exit_types.clear()
+        self._peak_captures.clear()
+        self._alerts.clear()
+
+
 # ── Main Self-Healing Engine ─────────────────────────────────────────────
 
 class SelfHealingEngine:
@@ -501,6 +719,7 @@ class SelfHealingEngine:
         self.wf_validator = WalkForwardValidator()
         self.data_retention = DataRetention()
         self.health_digest = HealthDigest()
+        self.signal_monitor = SignalHealthMonitor()
         self._scheduler_thread = None
         self._stop_event = threading.Event()
         self._state = self._load_state()
@@ -567,7 +786,7 @@ class SelfHealingEngine:
     def run_health_digest(self):
         """Generate and send health digest."""
         logger.info("[SelfHealing] Generating health digest...")
-        report = self.health_digest.generate()
+        report = self.health_digest.generate(signal_monitor=self.signal_monitor)
         self._state['last_health_digest'] = datetime.now().isoformat()
         self._save_state()
 
@@ -583,6 +802,44 @@ class SelfHealingEngine:
             logger.warning("[SelfHealing] Telegram send failed: %s" % e)
 
         return report
+
+    def run_signal_health_check(self):
+        """Run signal health check and send alerts if critical issues found."""
+        logger.info("[SelfHealing] Running signal health check...")
+        alerts = self.signal_monitor.check_health()
+
+        if alerts:
+            critical = [a for a in alerts if a['severity'] == 'CRITICAL']
+            if critical:
+                # Send immediate Telegram alert for critical issues
+                msg = '<b>🔴 SIGNAL HEALTH ALERT</b>\n\n'
+                for a in critical:
+                    msg += '• %s\n' % a['message']
+                    if a.get('action'):
+                        msg += '  → %s\n' % a['action']
+                try:
+                    self._send_telegram(msg)
+                except Exception as e:
+                    logger.warning("[SelfHealing] Telegram alert failed: %s" % e)
+
+                # Log all critical alerts
+                for a in critical:
+                    logger.warning("[SelfHealing] CRITICAL: %s" % a['message'])
+                    self._take_action('SIGNAL_ALERT', a.get('strategy', 'SYSTEM'), a['message'])
+
+            # Save signal health report
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            report = {
+                'checked_at': datetime.now().isoformat(),
+                'alerts': alerts,
+                'summary': self.signal_monitor.get_summary(),
+            }
+            report_file = RESULTS_DIR / ('signal_health_%s.json' % datetime.now().strftime('%Y%m%d_%H%M'))
+            report_file.write_text(json.dumps(report, indent=2, default=str))
+
+        self._state['last_signal_check'] = datetime.now().isoformat()
+        self._save_state()
+        return alerts
 
     def _take_action(self, action, strategy, reason):
         """Record an action taken by the self-healing engine."""
@@ -621,8 +878,10 @@ class SelfHealingEngine:
             'last_backtest': self._state.get('last_backtest'),
             'last_retention': self._state.get('last_retention'),
             'last_health_digest': self._state.get('last_health_digest'),
+            'last_signal_check': self._state.get('last_signal_check'),
             'disabled_strategies': self._state.get('disabled_strategies', []),
             'recent_actions': self._state.get('actions_taken', [])[-10:],
+            'signal_alerts': self.signal_monitor._alerts if self.signal_monitor else [],
         }
 
     def start(self):
@@ -650,6 +909,10 @@ class SelfHealingEngine:
             minute = now.minute
 
             try:
+                # Every 30 min: signal health check (during market hours 9:15-15:30)
+                if 9 <= hour <= 15 and minute % 30 == 0:
+                    self.run_signal_health_check()
+
                 # Every 4 hours: backtest check (at :05 past the hour)
                 if hour % 4 == 0 and minute == 5:
                     self.run_backtest_check()
@@ -661,6 +924,11 @@ class SelfHealingEngine:
                 # Daily 06:00: health digest
                 if hour == 6 and minute == 0:
                     self.run_health_digest()
+
+                # Daily 09:14: reset signal monitor for new trading day
+                if hour == 9 and minute == 14:
+                    self.signal_monitor.reset_daily()
+                    logger.info("[SelfHealing] Signal monitor reset for new trading day")
 
             except Exception as e:
                 logger.error("[SelfHealing] Scheduler error: %s" % e)

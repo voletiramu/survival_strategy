@@ -239,24 +239,24 @@ def get_regime_params(regime):
             'tsl_tight_distance_pct': 25,      # Wide tight — still give room on big trends
             'breakout_fail_enabled': False,     # DISABLE breakout fail on trending days
             'breakout_fail_min_gain_pct': 0,   # N/A when disabled
-            'breakout_fail_check_minutes': 15,  # v10.4: 15 min if ever re-enabled
+            'breakout_fail_check_minutes': 9999,  # v16.2: DISABLED  # v10.4: 15 min if ever re-enabled
             'reentry_cooldown_seconds': 300,   # Shorter cooldown (5 min vs 10)
         }
     elif regime == MarketRegime.FLAT:
         return {
             'tsl_trail_distance_pct': 20,      # Tight trail — lock in small gains quickly
             'tsl_tight_distance_pct': 15,      # Very tight — no room for retracement on flat days
-            'breakout_fail_enabled': True,
+            'breakout_fail_enabled': False,  # v16.2: DISABLED everywhere
             'breakout_fail_min_gain_pct': 2.0,  # v10.4: lowered from 3% (realistic for flat)
-            'breakout_fail_check_minutes': 6,   # v10.4: 6 min — quick fail on dead trades
+            'breakout_fail_check_minutes': 9999,  # v16.2: DISABLED   # v10.4: 6 min — quick fail on dead trades
             'reentry_cooldown_seconds': 900,   # Longer cooldown (15 min)
         }
     else:  # SIDEWAYS — current defaults
         return {
             'tsl_trail_distance_pct': 30,
             'tsl_tight_distance_pct': 20,
-            'breakout_fail_enabled': True,
+            'breakout_fail_enabled': False,  # v16.2: DISABLED everywhere
             'breakout_fail_min_gain_pct': 1.0,  # v10.4: lowered from 2% (avg peak is 0.6% at 5min)
-            'breakout_fail_check_minutes': 10,  # v10.4: 10 min (was 5 — killed 15/21 trades)
+            'breakout_fail_check_minutes': 9999,  # v16.2: DISABLED  # v10.4: 10 min (was 5 — killed 15/21 trades)
             'reentry_cooldown_seconds': 600,
         }

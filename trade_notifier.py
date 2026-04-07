@@ -221,16 +221,17 @@ def notify_scanner_start(instance_id=None):
         warning_line = ""
 
     msg = (
-        f"<b>🚀 ALGO TRADING BOT STARTED (Threaded)</b>\n"
+        f"<b>🚀 ALGO TRADING BOT STARTED (v30)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Time:</b> {now}\n"
         f"{instance_line}"
         f"{warning_line}"
-        f"<b>Equity:</b> NIFTY, BANKNIFTY, SENSEX (9:15-15:30) | Every 45s\n"
-        f"<b>Commodity:</b> GOLDM, SILVERM, CRUDEOILM (9:15-23:30) | Every 30s\n"
-        f"<b>Crypto:</b> BTC, ETH, SOL (24/7) | Every 5min\n"
-        f"<b>Strategies:</b> CPR, Gamma Blast, Ghost Zone, PCR+VWAP, Survivor\n"
-        f"<b>Capital:</b> ₹3,00,000 Equity + ₹3,00,000 Commodity = ₹6,00,000\n"
+        f"<b>Equity:</b> NIFTY, BANKNIFTY, SENSEX (9:15-15:30)\n"
+        f"<b>Commodity:</b> GOLDM, SILVERM, CRUDEOILM (9:15-23:30)\n"
+        f"<b>Strategies:</b> Narrow CPR, CPR, Wave, Gamma Blast, Ghost Zone\n"
+        f"<b>Protections:</b> v30 (13 layers — Delta, IV, VIX, Swap, TSL)\n"
+        f"<b>Capital:</b> ₹3,00,000 Equity + ₹3,00,000 Commodity\n"
+        f"<b>Data:</b> Dhan (primary) + Zerodha (secondary)\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     return send_message(msg)
@@ -499,9 +500,69 @@ def notify_scan_failure(market, error_msg, thread_name=''):
     return send_message(msg)
 
 
-def notify_service_restart(instance_id='vultr', reason=''):
-    """v7.2: Notify when the service starts/restarts (including auto-restart)."""
+def notify_hourly_status(market_data=None):
+    """v30.1: Periodic status update so user knows bot is alive.
+    Sent every hour during market hours. Shows spots, CPR, signals, blocks."""
     if not _is_info_allowed():
+        return True
+    key = 'hourly_status'
+    if not _should_alert(key):
+        return True
+    # Override cooldown to 55 min for hourly
+    _alert_cooldowns[key] = datetime.now().timestamp()
+
+    now = datetime.now().strftime("%H:%M")
+    md = market_data or {}
+
+    lines = [f"<b>📡 HOURLY STATUS — {now}</b>", "━━━━━━━━━━━━━━━━━━━━"]
+
+    # Index spots and CPR
+    for sym in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+        info = md.get(sym, {})
+        spot = info.get('spot', 0)
+        cpr_w = info.get('cpr_width', 0)
+        cpr_tag = 'Narrow' if cpr_w < 0.20 else 'Wide'
+        if spot > 0:
+            lines.append(f"<b>{sym}:</b> ₹{spot:,.0f} | CPR {cpr_w:.3f}% ({cpr_tag})")
+
+    # VIX
+    vix = md.get('vix', 0)
+    if vix > 0:
+        vix_tag = '⚠️ HIGH' if vix > 25 else '✅ Normal'
+        lines.append(f"<b>VIX:</b> {vix:.1f} ({vix_tag})")
+
+    # Signals and positions
+    signals = md.get('signals_generated', 0)
+    blocked = md.get('signals_blocked', 0)
+    positions = md.get('open_positions', 0)
+    trades = md.get('trades_today', 0)
+    pnl = md.get('pnl_today', 0)
+
+    lines.append("")
+    lines.append(f"<b>Signals:</b> {signals} generated | {blocked} blocked")
+    lines.append(f"<b>Positions:</b> {positions} open | {trades} trades today")
+    if trades > 0:
+        pnl_emoji = '💰' if pnl >= 0 else '📉'
+        lines.append(f"<b>PnL:</b> {pnl_emoji} ₹{pnl:,.0f}")
+
+    # Block reasons summary
+    block_reasons = md.get('block_reasons', {})
+    if block_reasons:
+        top_reasons = sorted(block_reasons.items(), key=lambda x: -x[1])[:3]
+        reason_str = ', '.join(f"{r}({c})" for r, c in top_reasons)
+        lines.append(f"<b>Top blocks:</b> {reason_str}")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    return send_message('\n'.join(lines))
+
+
+def notify_service_restart(instance_id='vultr', reason=''):
+    """v7.2: Notify when the service starts/restarts (including auto-restart).
+    v30.1: Rate-limited to 1 per 10 min to avoid deploy spam."""
+    if not _is_info_allowed():
+        return True
+    # Rate limit restart notifications (10 min cooldown)
+    if not _should_alert('service_restart'):
         return True
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     label = '☁️ Vultr VPS' if instance_id == 'vultr' else '🖥️ Local'
@@ -513,6 +574,75 @@ def notify_service_restart(instance_id='vultr', reason=''):
     if reason:
         msg += f"<b>Reason:</b> {reason}\n"
     msg += f"Paper trading system restarting..."
+    return send_message(msg)
+
+
+# v30.2: Accumulate blocks, send summary every 30 min instead of individual messages
+_blocked_buffer = {}  # key -> list of (symbol, signal_type, reason, details)
+_blocked_last_sent = {}  # market -> timestamp
+_BLOCKED_SUMMARY_INTERVAL = 1800  # 30 minutes
+
+
+def notify_signal_blocked(market, symbol, signal_type, block_reason, details=''):
+    """v30.2: Accumulate blocked signals and send summary every 30 min per bot.
+    Prevents Telegram spam from repeated blocks on every scan cycle."""
+    global _blocked_buffer, _blocked_last_sent
+    buf_key = market
+    if buf_key not in _blocked_buffer:
+        _blocked_buffer[buf_key] = []
+
+    # Accumulate (deduplicate by symbol+reason)
+    entry = f"{symbol}|{signal_type}|{block_reason}"
+    existing = [b for b in _blocked_buffer[buf_key] if b.startswith(entry)]
+    if not existing:
+        _blocked_buffer[buf_key].append(f"{entry}|{details}")
+
+    # Check if it's time to send summary
+    now_ts = datetime.now().timestamp()
+    last = _blocked_last_sent.get(buf_key, 0)
+    if now_ts - last < _BLOCKED_SUMMARY_INTERVAL:
+        return True  # Not time yet, just buffered
+
+    # Time to send — flush buffer
+    _blocked_last_sent[buf_key] = now_ts
+    blocks = _blocked_buffer.pop(buf_key, [])
+    if not blocks:
+        return True
+
+    now = datetime.now().strftime("%H:%M:%S")
+    lines = []
+    for b in blocks[:15]:  # Max 15 entries
+        parts = b.split('|', 3)
+        sym, sig, reason = parts[0], parts[1], parts[2]
+        det = parts[3] if len(parts) > 3 else ''
+        lines.append(f"  • {sym} {sig} → {reason}" + (f" ({det})" if det else ""))
+
+    msg = (
+        f"🚧 <b>SIGNALS BLOCKED ({len(blocks)})</b>\n"
+        f"<b>Bot:</b> {market}\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Period:</b> Last 30 min\n"
+        + "\n".join(lines)
+    )
+    if len(blocks) > 15:
+        msg += f"\n  ... and {len(blocks) - 15} more"
+    return send_message(msg)
+
+
+def notify_broker_reject(market, symbol, signal_type, strike, error_code, error_msg):
+    """v30.1: Alert when broker (Angel/Dhan) rejects an order."""
+    key = f"broker_reject_{market}_{symbol}"
+    if not _should_alert(key):
+        return True
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"🚫 <b>BROKER ORDER REJECTED</b>\n"
+        f"<b>Bot:</b> {market}\n"
+        f"<b>Time:</b> {now}\n"
+        f"<b>Symbol:</b> {symbol} | {signal_type}\n"
+        f"<b>Strike:</b> {strike}\n"
+        f"<b>Error:</b> [{error_code}] {error_msg}\n"
+    )
     return send_message(msg)
 
 

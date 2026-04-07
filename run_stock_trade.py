@@ -258,7 +258,7 @@ def stock_loop(interval_sec=1, stop_event=None):
                 if _stk_tracker:
                     _stk_tracker.reset('stock')
                 if _stk_heartbeat:
-                    _stk_heartbeat.write('stock', scan_count)
+                    _stk_heartbeat.write('stock', scan_count, zerodha_feed=getattr(trader, 'zerodha', None))
             except Exception as e:
                 # v16: EMERGENCY — try to protect open trades even though run_once() failed
                 try:
