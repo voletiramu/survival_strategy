@@ -1,0 +1,91 @@
+{
+  "capital": 299313.68140754517,
+  "positions": [
+    {
+      "id": "SuperTrend_BTCUSDT_104544",
+      "symbol": "BTCUSDT",
+      "strategy": "SuperTrend",
+      "direction": -1,
+      "entry_price": 67909.1,
+      "current_price": 65389.06,
+      "quantity": 1.4710841404171162,
+      "allocation": 100000.0,
+      "entry_time": "2026-02-18T10:45:44.507194",
+      "unrealized_pnl": 3710.9,
+      "status": "OPEN",
+      "reason": "SuperTrend direction=-1, ST=75679.36"
+    },
+    {
+      "id": "SuperTrend_ETHUSDT_104546",
+      "symbol": "ETHUSDT",
+      "strategy": "SuperTrend",
+      "direction": -1,
+      "entry_price": 2000.45,
+      "current_price": 1885.21,
+      "quantity": 49.93876377814991,
+      "allocation": 100000.0,
+      "entry_time": "2026-02-18T10:45:46.344807",
+      "unrealized_pnl": 5760.7,
+      "status": "OPEN",
+      "reason": "SuperTrend direction=-1, ST=2312.87"
+    },
+    {
+      "id": "SuperTrend_SOLUSDT_104548",
+      "symbol": "SOLUSDT",
+      "strategy": "SuperTrend",
+      "direction": -1,
+      "entry_price": 85.16,
+      "current_price": 78.88,
+      "quantity": 1173.085955847816,
+      "allocation": 100000.0,
+      "entry_time": "2026-02-18T10:45:48.193459",
+      "unrealized_pnl": 7374.35,
+      "status": "OPEN",
+      "reason": "SuperTrend direction=-1, ST=100.73"
+    }
+  ],
+  "closed_trades": [
+    {
+      "id": "EMA Momentum_SOLUSDT_122054",
+      "symbol": "SOLUSDT",
+      "strategy": "EMA Momentum",
+      "direction": 1,
+      "entry_price": 83.64,
+      "current_price": 83.46,
+      "quantity": 1194.4045911047347,
+      "allocation": 100000.0,
+      "entry_time": "2026-02-20T12:20:54.039174",
+      "unrealized_pnl": -215.21,
+      "status": "CLOSED",
+      "reason": "Close 83.64 > EMA5 83.61",
+      "exit_price": 83.46,
+      "exit_time": "2026-02-22T22:20:09.495241",
+      "pnl": -315.21,
+      "pnl_pct": -0.22,
+      "exit_reason": "Signal change to CASH"
+    },
+    {
+      "id": "EMA Momentum_BTCUSDT_114721",
+      "symbol": "BTCUSDT",
+      "strategy": "EMA Momentum",
+      "direction": 1,
+      "entry_price": 67821.04,
+      "current_price": 67637.17,
+      "quantity": 1.4729942212623104,
+      "allocation": 100000.0,
+      "entry_time": "2026-02-20T11:47:21.702707",
+      "unrealized_pnl": -271.11,
+      "status": "CLOSED",
+      "reason": "Close 67819.78 > EMA5 67610.55",
+      "exit_price": 67637.17,
+      "exit_time": "2026-02-22T22:25:17.222660",
+      "pnl": -371.11,
+      "pnl_pct": -0.27,
+      "exit_reason": "Signal change to CASH"
+    }
+  ],
+  "daily_pnl": {
+    "2026-02-22": -686.3185924548093
+  },
+  "last_updated": "2026-02-23T21:34:36.577841"
+}

@@ -49,12 +49,12 @@ class TestPaperTraderConstants:
         assert LAST_ENTRY_TIME.minute == 30
 
     def test_trailing_stop_params(self):
-        from paper_trader import (TSL_BREAKEVEN_TRIGGER_PCT,
-                                   TSL_TRAIL_TRIGGER_PCT,
+        from paper_trader import (TSL_BREAKEVEN_GAIN_PCT,
+                                   TSL_TRAIL_GAIN_PCT,
                                    TSL_TRAIL_DISTANCE_PCT)
-        assert TSL_BREAKEVEN_TRIGGER_PCT == 30
-        assert TSL_TRAIL_TRIGGER_PCT == 50
-        assert TSL_TRAIL_DISTANCE_PCT == 25
+        assert TSL_BREAKEVEN_GAIN_PCT == 15     # v7.5: Premium gain % (was 30% of target)
+        assert TSL_TRAIL_GAIN_PCT == 25          # v7.5: Premium gain % (was 50% of target)
+        assert TSL_TRAIL_DISTANCE_PCT == 30      # v7.5: 30% below peak profit
 
     def test_strategy_weights_sum(self):
         from paper_trader import STRATEGY_WEIGHTS
@@ -208,7 +208,7 @@ class TestTimeBasedThresholds:
 class TestCooldowns:
     def test_grace_period(self):
         from paper_trader import GRACE_PERIOD_SECONDS
-        assert GRACE_PERIOD_SECONDS == 600
+        assert GRACE_PERIOD_SECONDS == 180  # v7.5: Reduced from 600s to 180s
 
     def test_ghost_zone_cooldown(self):
         from paper_trader import GHOST_ZONE_COOLDOWN_SECONDS

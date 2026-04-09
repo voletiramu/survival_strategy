@@ -15,7 +15,7 @@ Backtested on daily OHLC by simulating intraday breakouts from prev day levels.
 
 import pandas as pd
 import numpy as np
-from backtest_engine import BacktestEngine, Trade, TradeType, BacktestResult
+from backtest_engine import BacktestEngine, Trade, TradeType, BacktestResult, estimate_iv_from_atr
 
 
 class SurvivorStrategy:
@@ -55,16 +55,29 @@ class SurvivorStrategy:
         ce_ref = None  # CE reference value
         open_pe_positions = 0
         open_ce_positions = 0
-        pe_trades_today = []
-        ce_trades_today = []
 
-        for i in range(2, len(df)):
+        # Compute ATR for IV estimation
+        df['TR'] = np.maximum(
+            df['High'] - df['Low'],
+            np.maximum(
+                abs(df['High'] - df['Close'].shift(1)),
+                abs(df['Low'] - df['Close'].shift(1))
+            )
+        )
+        df['ATR'] = df['TR'].rolling(14).mean()
+
+        for i in range(15, len(df)):
             row = df.iloc[i]
             prev = df.iloc[i - 1]
             date = df.index[i]
+            atr = df['ATR'].iloc[i]
 
             # Only trade Mon-Wed (0=Mon, 2=Wed)
             if date.weekday() > 2:
+                engine.record_equity(date)
+                continue
+
+            if pd.isna(atr) or atr == 0:
                 engine.record_equity(date)
                 continue
 
@@ -73,6 +86,7 @@ class SurvivorStrategy:
             current_high = row['High']
             current_low = row['Low']
             current_close = row['Close']
+            iv = estimate_iv_from_atr(atr, current_close)
 
             # Initialize references
             if pe_ref is None:
@@ -87,14 +101,13 @@ class SurvivorStrategy:
 
                 for _ in range(trades_to_take):
                     pe_ref += self.pe_gap
-                    # Simulate PE sell: premium decays as market goes up
-                    # Entry when market breaks up, exit at close
                     spot_at_entry = pe_ref
                     spot_at_exit = current_close
 
-                    pnl = engine.simulate_option_pnl_from_spot(
+                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
                         spot_at_entry, spot_at_exit,
-                        TradeType.SELL_PE, lots=1
+                        TradeType.SELL_PE, symbol,
+                        lots=1, iv=iv, atr=atr, trade_date=date
                     )
 
                     trade = Trade(
@@ -102,6 +115,9 @@ class SurvivorStrategy:
                         trade_type=TradeType.SELL_PE,
                         entry_price=spot_at_entry,
                         exit_price=spot_at_exit,
+                        option_entry_premium=entry_prem,
+                        option_exit_premium=exit_prem,
+                        strike=strike,
                         quantity=engine.lot_size,
                         pnl=pnl, status="CLOSED"
                     )
@@ -123,9 +139,10 @@ class SurvivorStrategy:
                     spot_at_entry = ce_ref
                     spot_at_exit = current_close
 
-                    pnl = engine.simulate_option_pnl_from_spot(
+                    pnl, entry_prem, exit_prem, strike = engine.compute_premium_pnl(
                         spot_at_entry, spot_at_exit,
-                        TradeType.SELL_CE, lots=1
+                        TradeType.SELL_CE, symbol,
+                        lots=1, iv=iv, atr=atr, trade_date=date
                     )
 
                     trade = Trade(
@@ -133,6 +150,9 @@ class SurvivorStrategy:
                         trade_type=TradeType.SELL_CE,
                         entry_price=spot_at_entry,
                         exit_price=spot_at_exit,
+                        option_entry_premium=entry_prem,
+                        option_exit_premium=exit_prem,
+                        strike=strike,
                         quantity=engine.lot_size,
                         pnl=pnl, status="CLOSED"
                     )

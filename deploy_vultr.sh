@@ -12,15 +12,26 @@
 #   4. Then from your local machine: ./deploy_vultr.sh
 #
 # Usage:
-#   ./deploy_vultr.sh              # Deploy/update code + restart service
-#   ./deploy_vultr.sh logs         # Stream live logs
-#   ./deploy_vultr.sh status       # Check service status
+#   ./deploy_vultr.sh              # Deploy/update code + restart ALL services
+#   ./deploy_vultr.sh logs         # Stream live equity/commodity logs
+#   ./deploy_vultr.sh status       # Check equity/commodity service status
 #   ./deploy_vultr.sh ssh          # SSH into VPS
-#   ./deploy_vultr.sh stop         # Stop trading service
-#   ./deploy_vultr.sh start        # Start trading service
-#   ./deploy_vultr.sh restart      # Restart trading service
+#   ./deploy_vultr.sh stop         # Stop equity/commodity service
+#   ./deploy_vultr.sh start        # Start equity/commodity service
+#   ./deploy_vultr.sh restart      # Restart equity/commodity service
 #   ./deploy_vultr.sh creds        # Upload Angel API credentials
 #   ./deploy_vultr.sh dashboard    # Check dashboard status
+#   ./deploy_vultr.sh stock-logs   # Stream live stock bot logs
+#   ./deploy_vultr.sh stock-status # Check stock bot status
+#   ./deploy_vultr.sh stock-stop   # Stop stock bot
+#   ./deploy_vultr.sh stock-start  # Start stock bot
+#   ./deploy_vultr.sh stock-restart # Restart stock bot
+#   ./deploy_vultr.sh oi-logs      # Stream live OI bot logs
+#   ./deploy_vultr.sh oi-status    # Check OI bot status
+#   ./deploy_vultr.sh oi-stop      # Stop OI bot
+#   ./deploy_vultr.sh oi-start     # Start OI bot
+#   ./deploy_vultr.sh oi-restart   # Restart OI bot
+#   ./deploy_vultr.sh all-status   # Check ALL services
 # =====================================================
 
 set -e
@@ -110,6 +121,98 @@ if [ "$1" = "dashboard" ]; then
     exit 0
 fi
 
+# --- STOCK BOT MODES ---
+STOCK_SERVICE="algo-stock-trading"
+
+if [ "$1" = "stock-logs" ]; then
+    echo "Streaming stock bot logs..."
+    $SSH "journalctl -u $STOCK_SERVICE -f --no-pager"
+    exit 0
+fi
+
+if [ "$1" = "stock-status" ]; then
+    echo ""
+    $SSH "systemctl status $STOCK_SERVICE --no-pager && echo '' && echo '--- Last 20 log lines ---' && journalctl -u $STOCK_SERVICE -n 20 --no-pager"
+    exit 0
+fi
+
+if [ "$1" = "stock-stop" ]; then
+    echo "Stopping stock trading service..."
+    $SSH "systemctl stop $STOCK_SERVICE"
+    echo "Stock service stopped."
+    exit 0
+fi
+
+if [ "$1" = "stock-start" ]; then
+    echo "Starting stock trading service..."
+    $SSH "systemctl start $STOCK_SERVICE"
+    sleep 2
+    $SSH "systemctl status $STOCK_SERVICE --no-pager"
+    exit 0
+fi
+
+if [ "$1" = "stock-restart" ]; then
+    echo "Restarting stock trading service..."
+    $SSH "systemctl restart $STOCK_SERVICE"
+    sleep 2
+    $SSH "systemctl status $STOCK_SERVICE --no-pager"
+    exit 0
+fi
+
+# --- OI BOT MODES ---
+OI_SERVICE="algo-oi-trading"
+
+if [ "$1" = "oi-logs" ]; then
+    echo "Streaming OI bot logs..."
+    $SSH "journalctl -u $OI_SERVICE -f --no-pager"
+    exit 0
+fi
+
+if [ "$1" = "oi-status" ]; then
+    echo ""
+    $SSH "systemctl status $OI_SERVICE --no-pager && echo '' && echo '--- Last 20 log lines ---' && journalctl -u $OI_SERVICE -n 20 --no-pager"
+    exit 0
+fi
+
+if [ "$1" = "oi-stop" ]; then
+    echo "Stopping OI trading service..."
+    $SSH "systemctl stop $OI_SERVICE"
+    echo "OI service stopped."
+    exit 0
+fi
+
+if [ "$1" = "oi-start" ]; then
+    echo "Starting OI trading service..."
+    $SSH "systemctl start $OI_SERVICE"
+    sleep 2
+    $SSH "systemctl status $OI_SERVICE --no-pager"
+    exit 0
+fi
+
+if [ "$1" = "oi-restart" ]; then
+    echo "Restarting OI trading service..."
+    $SSH "systemctl restart $OI_SERVICE"
+    sleep 2
+    $SSH "systemctl status $OI_SERVICE --no-pager"
+    exit 0
+fi
+
+if [ "$1" = "all-status" ]; then
+    echo ""
+    echo "=== Equity + Commodity Bot ==="
+    $SSH "systemctl status $SERVICE_NAME --no-pager" 2>/dev/null || true
+    echo ""
+    echo "=== Stock Options Bot ==="
+    $SSH "systemctl status $STOCK_SERVICE --no-pager" 2>/dev/null || true
+    echo ""
+    echo "=== OI Strategies Bot ==="
+    $SSH "systemctl status $OI_SERVICE --no-pager" 2>/dev/null || true
+    echo ""
+    echo "=== Dashboard ==="
+    $SSH "systemctl status algo-dashboard --no-pager" 2>/dev/null || true
+    exit 0
+fi
+
 # --- DEFAULT: DEPLOY/UPDATE ---
 echo ""
 echo "Step 1: Syncing code to VPS..."
@@ -125,6 +228,8 @@ if command -v rsync &> /dev/null; then
         --exclude='paper_trades/' \
         --exclude='paper_trades_commodity/' \
         --exclude='paper_trades_crypto/' \
+        --exclude='paper_trades_oi/' \
+        --exclude='stock_paper_trades/' \
         --exclude='reports/' \
         --exclude='historical_data/' \
         --exclude='node_modules/' \
@@ -149,24 +254,49 @@ else
 fi
 
 echo ""
-echo "Step 4: Restarting trading service..."
-$SSH "systemctl restart $SERVICE_NAME"
+echo "Step 4: Creating data directories..."
+$SSH "mkdir -p $REMOTE_DIR/paper_trades_oi $REMOTE_DIR/data/oi_history $REMOTE_DIR/locks"
+
+echo ""
+echo "Step 5: Restarting ALL trading services..."
+$SSH "systemctl restart $SERVICE_NAME && systemctl restart algo-stock-trading && systemctl restart algo-oi-trading 2>/dev/null; systemctl restart algo-dashboard"
 sleep 3
 
 echo ""
-echo "Step 5: Verifying..."
-$SSH "systemctl status $SERVICE_NAME --no-pager"
+echo "Step 6: Verifying..."
+echo "--- Equity + Commodity ---"
+$SSH "systemctl status $SERVICE_NAME --no-pager" 2>/dev/null || true
+echo ""
+echo "--- Stock Options ---"
+$SSH "systemctl status algo-stock-trading --no-pager" 2>/dev/null || true
+echo ""
+echo "--- OI Strategies ---"
+$SSH "systemctl status algo-oi-trading --no-pager" 2>/dev/null || true
+echo ""
+echo "--- Dashboard ---"
+$SSH "systemctl status algo-dashboard --no-pager" 2>/dev/null || true
 
 echo ""
 echo "============================================"
 echo "  DEPLOYMENT COMPLETE!"
 echo "============================================"
 echo ""
-echo "  Commands:"
+echo "  Equity/Commodity:"
 echo "    Logs:    ./deploy_vultr.sh logs"
 echo "    Status:  ./deploy_vultr.sh status"
-echo "    SSH:     ./deploy_vultr.sh ssh"
 echo "    Stop:    ./deploy_vultr.sh stop"
-echo "    Start:   ./deploy_vultr.sh start"
-echo "    Restart: ./deploy_vultr.sh restart"
+echo ""
+echo "  Stock Options:"
+echo "    Logs:    ./deploy_vultr.sh stock-logs"
+echo "    Status:  ./deploy_vultr.sh stock-status"
+echo "    Stop:    ./deploy_vultr.sh stock-stop"
+echo ""
+echo "  OI Strategies:"
+echo "    Logs:    ./deploy_vultr.sh oi-logs"
+echo "    Status:  ./deploy_vultr.sh oi-status"
+echo "    Stop:    ./deploy_vultr.sh oi-stop"
+echo ""
+echo "  All:"
+echo "    SSH:     ./deploy_vultr.sh ssh"
+echo "    Status:  ./deploy_vultr.sh all-status"
 echo "============================================"

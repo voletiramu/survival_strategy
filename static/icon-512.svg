@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="80" fill="#0f1923"/>
+  <rect x="40" y="40" width="432" height="432" rx="60" fill="#1a2332" stroke="#2a3a4a" stroke-width="4"/>
+  <!-- Chart bars -->
+  <rect x="90" y="320" width="48" height="80" rx="6" fill="#ff1744" opacity="0.9"/>
+  <rect x="160" y="240" width="48" height="160" rx="6" fill="#00c853" opacity="0.9"/>
+  <rect x="230" y="190" width="48" height="210" rx="6" fill="#00c853" opacity="0.9"/>
+  <rect x="300" y="270" width="48" height="130" rx="6" fill="#ff1744" opacity="0.9"/>
+  <rect x="370" y="150" width="48" height="250" rx="6" fill="#00c853" opacity="0.9"/>
+  <!-- Trend line -->
+  <polyline points="114,310 184,230 254,180 324,260 394,140" fill="none" stroke="#448aff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Rupee symbol -->
+  <text x="256" y="115" text-anchor="middle" font-family="sans-serif" font-size="64" font-weight="700" fill="#ffd740">&#x20B9;</text>
+</svg>

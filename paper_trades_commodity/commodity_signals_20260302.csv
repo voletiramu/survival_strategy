@@ -1,0 +1,4 @@
+timestamp,strategy,commodity,type,strike,premium,spot,reason
+2026-03-02T11:01:21.399091,CPR,GOLDM,BUY_CE_CPR,166900,6421.0,166900.0,Narrow CPR (0.058%) bullish breakout
+2026-03-02T11:01:21.399091,CPR,SILVERM,BUY_CE_CPR,295000,23045.0,294800.0,Narrow CPR (0.038%) bullish breakout
+2026-03-02T11:01:21.399091,CPR,CRUDEOILM,BUY_CE_CPR,6000,680.85,5975.0,Narrow CPR (0.111%) bullish breakout

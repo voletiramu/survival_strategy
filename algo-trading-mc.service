@@ -1,0 +1,26 @@
+[Unit]
+Description=Algo Trading MC-Optimal Paper Trader (Choppy=20% DCI>=48 WaveFLAT=ON)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/algo_trading
+ExecStart=/usr/bin/python3 -u run_paper_trade_mc.py --equity-interval 0.0167 --commodity-interval 0.0167
+Restart=on-failure
+RestartSec=3
+Environment=TZ=Asia/Kolkata
+Environment=TELEGRAM_NOTIFY_LEVEL=ALL
+Environment=ANGEL_CRED_FILE=/root/angel_creds.txt
+Environment=TRADING_INSTANCE=vultr
+Environment=PARAM_SET=mc_optimal
+Environment=PORTFOLIO_SUFFIX=_mc
+StandardOutput=journal
+StandardError=journal
+MemoryMax=800M
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

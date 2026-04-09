@@ -58,6 +58,10 @@ class WebSocketFeed:
         self._subscribed_tokens = []  # Track what we subscribed for logging
         self._tick_count = 0
         self._last_tick_time = 0
+        # v15: Tick callback hooks for event-driven exit checking
+        self._tick_callbacks = []   # List of callable(token, ltp) — called on every tick
+        # v16: Per-token tick timestamps for LTP freshness tracking (watchdog)
+        self._last_tick_times = {}  # {token_str: epoch_float}
 
     def start(self, auth_token, api_key, client_code, feed_token):
         """Start WebSocket connection in a daemon thread.
@@ -94,6 +98,18 @@ class WebSocketFeed:
             retry_multiplier=2,        # Double each retry
             retry_duration=480,        # Keep trying for 8 hours (full trading day)
         )
+
+        # v23: Monkey-patch SmartWebSocketV2._on_close to accept extra args
+        # websocket-client passes (wsapp, close_status_code, close_msg) but
+        # SmartAPI 1.5.5 _on_close(self, wsapp) only accepts 2 args → crash loop
+        original_internal_close = self.sws._on_close.__func__ if hasattr(self.sws._on_close, '__func__') else None
+        def _patched_on_close(wsapp, *args):
+            try:
+                self.sws.on_close(wsapp, *args)
+            except Exception as e:
+                logger.debug(f'[WS_FEED] _on_close callback error (safe): {e}')
+        import types
+        self.sws._on_close = types.MethodType(lambda self_sws, wsapp, *args: _patched_on_close(wsapp, *args), self.sws)
 
         # Set callbacks
         self.sws.on_open = self._on_open
@@ -183,11 +199,94 @@ class WebSocketFeed:
         if self._connected and self.sws:
             self._subscribe_mcx()
 
+    def subscribe_mcx_options(self, option_tokens):
+        """v10.5: Subscribe to MCX option tokens for real-time LTP.
+
+        Called dynamically when a commodity option trade is entered, so we get
+        real-time exit price updates via WebSocket instead of REST API polling.
+
+        Args:
+            option_tokens: list of token strings (e.g., ['234567', '234568'])
+        """
+        if not option_tokens:
+            return
+        if not self.sws or not self._connected:
+            logger.warning(f"[WS_FEED] Cannot subscribe MCX options — not connected")
+            return
+        try:
+            # Filter out tokens already subscribed
+            new_tokens = [t for t in option_tokens if str(t) not in self._subscribed_tokens]
+            if not new_tokens:
+                return
+
+            token_list = [{"exchangeType": MCX_FO, "tokens": [str(t) for t in new_tokens]}]
+            self.sws.subscribe("mcx_opt_stream", 1, token_list)  # mode=1 (LTP)
+            self._subscribed_tokens.extend([str(t) for t in new_tokens])
+            logger.info(f"[WS_FEED] MCX options subscribed: {len(new_tokens)} tokens ({new_tokens})")
+        except Exception as e:
+            logger.error(f"[WS_FEED] MCX option subscribe failed: {e}")
+
+    def subscribe_equity_options(self, option_tokens):
+        """v15: Subscribe to equity option tokens (NSE_FO) for real-time premium ticks.
+
+        Called by PaperTrader when a position is opened, so we get
+        real-time exit price updates via WebSocket instead of REST API polling.
+
+        Args:
+            option_tokens: list of token strings (e.g., ['45678', '45679'])
+        """
+        if not option_tokens:
+            return
+        if not self.sws or not self._connected:
+            logger.warning(f"[WS_FEED] Cannot subscribe equity options — not connected")
+            return
+        try:
+            new_tokens = [str(t) for t in option_tokens if str(t) not in self._subscribed_tokens]
+            if not new_tokens:
+                return
+
+            token_list = [{"exchangeType": NSE_FO, "tokens": new_tokens}]
+            self.sws.subscribe("nfo_opt_stream", 1, token_list)  # mode=1 (LTP)
+            self._subscribed_tokens.extend(new_tokens)
+            logger.info(f"[WS_FEED] Equity options subscribed: {len(new_tokens)} tokens ({new_tokens[:5]}...)")
+        except Exception as e:
+            logger.error(f"[WS_FEED] Equity option subscribe failed: {e}")
+
+    def subscribe_bse_options(self, option_tokens):
+        """v15: Subscribe to BSE option tokens (SENSEX options) for real-time ticks."""
+        if not option_tokens:
+            return
+        if not self.sws or not self._connected:
+            return
+        try:
+            new_tokens = [str(t) for t in option_tokens if str(t) not in self._subscribed_tokens]
+            if not new_tokens:
+                return
+            token_list = [{"exchangeType": BSE_CM, "tokens": new_tokens}]
+            self.sws.subscribe("bfo_opt_stream", 1, token_list)
+            self._subscribed_tokens.extend(new_tokens)
+            logger.info(f"[WS_FEED] BSE options subscribed: {len(new_tokens)} tokens")
+        except Exception as e:
+            logger.error(f"[WS_FEED] BSE option subscribe failed: {e}")
+
+    def register_tick_callback(self, callback_fn):
+        """v15: Register a callback to be called on every price tick.
+
+        The callback receives (token: str, ltp: float) and should be fast
+        (no heavy computation or I/O). Used for event-driven exit checking.
+
+        Args:
+            callback_fn: callable(token, ltp)
+        """
+        self._tick_callbacks.append(callback_fn)
+        logger.info(f"[WS_FEED] Tick callback registered (total: {len(self._tick_callbacks)})")
+
     def _on_data(self, wsapp, data):
-        """Called on each price tick — update shared cache.
+        """Called on each price tick — update shared cache + fire callbacks.
 
         Angel WebSocket sends prices in paisa (1/100 rupees) for NSE/BSE.
-        MCX prices are already in the correct unit.
+        MCX prices are also in paisa in the binary feed.
+        v15: Added tick callback invocation for event-driven exits.
         """
         try:
             token = str(data.get('token', '')).strip()
@@ -206,11 +305,20 @@ class WebSocketFeed:
 
             with self._lock:
                 self._prices[token] = ltp
+                self._last_tick_times[token] = time.time()  # v16: Track per-token freshness
 
             self._tick_count += 1
+            self._last_tick_time = time.time()  # Update global tick time
 
-            # Log every 100th tick to avoid spam
-            if self._tick_count % 100 == 1:
+            # v15: Fire tick callbacks for event-driven exit checking
+            for cb in self._tick_callbacks:
+                try:
+                    cb(token, ltp)
+                except Exception as cb_err:
+                    logger.debug(f"[WS_FEED] Tick callback error: {cb_err}")
+
+            # Log every 500th tick (was 100 — reduced for 1s scan loop)
+            if self._tick_count % 500 == 1:
                 logger.info(f"[WS_FEED] Tick #{self._tick_count}: token={token} LTP={ltp:.2f} (exchange={exchange_type})")
 
         except Exception as e:
@@ -220,11 +328,25 @@ class WebSocketFeed:
         """Called on WebSocket error."""
         self._connected = False
         logger.error(f"[WS_FEED] WebSocket ERROR: {error}")
+        try:
+            from trade_notifier import notify_websocket_issue
+            notify_websocket_issue('error', str(error)[:200])
+        except Exception:
+            pass
 
-    def _on_close(self, wsapp):
-        """Called when WebSocket disconnects."""
+    def _on_close(self, wsapp, *args):
+        """Called when WebSocket disconnects.
+        v7.7: Accept *args to handle SmartAPI library signature change
+        (passes close_status_code, close_msg as extra args).
+        """
         self._connected = False
-        logger.warning("[WS_FEED] WebSocket DISCONNECTED")
+        close_code = args[0] if args else None
+        logger.warning(f"[WS_FEED] WebSocket DISCONNECTED (code={close_code})")
+        try:
+            from trade_notifier import notify_websocket_issue
+            notify_websocket_issue('disconnected', f"code={close_code}")
+        except Exception:
+            pass
 
     def get_ltp(self, token):
         """Get cached LTP for a token. Thread-safe, instant (no API call).
@@ -261,6 +383,38 @@ class WebSocketFeed:
             'subscribed_tokens': len(self._subscribed_tokens),
             'prices': prices_copy,
         }
+
+    def get_ltp_age(self, token):
+        """v16: Get seconds since last tick for a specific token.
+
+        Args:
+            token: Token string (e.g., '99926000')
+
+        Returns:
+            float: Seconds since last tick, or 999.0 if no tick ever received
+        """
+        with self._lock:
+            last = self._last_tick_times.get(str(token))
+        if last is None:
+            return 999.0
+        return time.time() - last
+
+    def get_max_ltp_age(self):
+        """v16: Get maximum LTP age across all subscribed tokens.
+
+        Used by watchdog heartbeat to report worst-case LTP staleness.
+
+        Returns:
+            float: Max seconds since last tick across all tokens, or 0.0 if no tokens
+        """
+        if not self._last_tick_times:
+            return 0.0
+        now = time.time()
+        with self._lock:
+            if not self._last_tick_times:
+                return 0.0
+            ages = [now - t for t in self._last_tick_times.values()]
+        return max(ages) if ages else 0.0
 
     def stop(self):
         """Gracefully shut down WebSocket connection."""

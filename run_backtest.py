@@ -24,7 +24,7 @@ import seaborn as sns
 from tabulate import tabulate
 from datetime import datetime
 
-from data_fetcher import load_or_fetch, LOT_SIZES
+from data_fetcher import load_or_fetch, LOT_SIZES, DATA_SOURCE
 from backtest_engine import BacktestEngine, BacktestResult
 from strategies.survivor_strategy import SurvivorStrategy
 from strategies.wave_strategy import WaveStrategy
@@ -32,6 +32,9 @@ from strategies.pcr_vwap_strategy import PCRVWAPStrategy
 from strategies.ghost_zone_strategy import GhostZoneStrategy
 from strategies.cpr_strategy import CPRStrategy
 from strategies.gamma_blast_strategy import GammaBlastStrategy
+from strategies.orb_strategy import ORBStrategy
+from strategies.supertrend_strategy import SupertrendStrategy
+from strategies.macd_adx_strategy import MACDMomentumStrategy
 
 # Commodity imports
 from commodity_backtest import (
@@ -44,9 +47,9 @@ from commodity_backtest import (
 EQUITY_CAPITAL = 300000     # Rs 3 Lakhs TOTAL for all equity strategies
 COMMODITY_CAPITAL = 300000  # Rs 3 Lakhs TOTAL for all commodity strategies
 
-# Equity: 6 strategies share Rs 3L → Rs 50K per strategy
-NUM_EQUITY_STRATEGIES = 6
-EQUITY_PER_STRATEGY = EQUITY_CAPITAL // NUM_EQUITY_STRATEGIES  # Rs 50,000
+# Equity: 9 strategies share Rs 3L → ~Rs 33K per strategy
+NUM_EQUITY_STRATEGIES = 9
+EQUITY_PER_STRATEGY = EQUITY_CAPITAL // NUM_EQUITY_STRATEGIES  # Rs 33,333
 
 # Commodity: 3 strategies share Rs 3L → Rs 1L per strategy
 NUM_COMMODITY_STRATEGIES = 3
@@ -58,18 +61,23 @@ COMMODITY_SYMBOLS = ['GOLD', 'GOLDM', 'SILVER', 'SILVERM', 'CRUDEOIL', 'NATURALG
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
 
-def run_all_backtests():
-    """Run all strategies on all symbols."""
+def run_all_backtests(data_source=None):
+    """Run all strategies on all symbols.
+
+    Args:
+        data_source: 'angel' for Angel One data, 'csv' for legacy Yahoo CSV
+    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     all_results = []
+    source = data_source or DATA_SOURCE
 
     for symbol in SYMBOLS:
         print(f"\n{'='*60}")
-        print(f"BACKTESTING ON {symbol}")
+        print(f"BACKTESTING ON {symbol} [Data: {source.upper()}]")
         print(f"{'='*60}")
 
         try:
-            df = load_or_fetch(symbol, period="5y")
+            df = load_or_fetch(symbol, period="5y", source=source)
         except Exception as e:
             print(f"Error loading {symbol}: {e}")
             continue
@@ -84,9 +92,12 @@ def run_all_backtests():
             SurvivorStrategy(pe_gap=30, ce_gap=30, reset_gap=90, max_positions=3),
             WaveStrategy(base_gap=25, max_trades_per_day=6),
             PCRVWAPStrategy(pcr_lookback=5, vwap_tolerance_pct=0.3),
-            GhostZoneStrategy(zone_lookback=20, volume_threshold=1.2, min_impulse_atr_mult=0.8, target_rr=2.0),
+            GhostZoneStrategy(volume_spike_mult=1.2, max_zone_age=80, max_zones=8, min_target_rr=2.5),
             CPRStrategy(risk_per_trade_pct=1.0, max_trades_per_day=2),
             GammaBlastStrategy(),
+            ORBStrategy(),
+            SupertrendStrategy(),
+            MACDMomentumStrategy(),
         ]
 
         for strat in strategies:
@@ -324,7 +335,13 @@ def plot_monthly_heatmap(results: list):
 
 
 def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
-    """Compute capital allocation based on risk-adjusted returns."""
+    """Compute capital allocation based on risk-adjusted returns.
+
+    v3.1: Rebalanced scoring to properly weight absolute PnL and annual return.
+    - Caps Calmar/Sortino to prevent distortion from tiny-drawdown strategies
+    - Adds absolute PnL contribution to scoring
+    - Raises max allocation to 50% for dominant strategies like Survivor
+    """
     print("\n" + "="*60)
     print("CAPITAL ALLOCATION RECOMMENDATION")
     print(f"Total Capital: ₹{total_capital:,.0f}")
@@ -339,22 +356,31 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
         pf = float(row['Avg Profit Factor'])
         dd = abs(float(row['Avg Max DD %']))
         annual_ret = float(row['Avg Annual Return %'])
+        avg_pnl = float(str(row['Avg PnL/Symbol']).replace(',', ''))
 
-        # Composite score (higher is better)
-        # Weighted: Sharpe 25%, Sortino 20%, Calmar 15%, PF 15%, Return 15%, Low DD 10%
+        # v3.1: Cap extreme ratios to prevent distortion
+        # Gamma Blast Calmar=113 vs Survivor=17 was dominating allocation unfairly
+        sharpe_capped = min(sharpe, 5.0)
+        sortino_capped = min(sortino, 10.0)
+        calmar_capped = min(calmar, 25.0)
+
+        # v3.1: Composite score — rebalanced weights
+        # Sharpe 20%, Annual Return 25%, PnL 20%, Sortino 10%, Calmar 10%, PF 10%, DD 5%
         score = (
-            sharpe * 0.25 +
-            sortino * 0.20 +
-            calmar * 0.15 +
-            min(pf, 5) * 0.15 +  # Cap PF at 5 to avoid inf distortion
-            (annual_ret / 10) * 0.15 +
-            max(0, (20 - dd) / 20) * 0.10  # Lower DD = higher score
+            sharpe_capped * 0.20 +
+            (annual_ret / 100) * 0.25 +         # Annual return as direct percentage
+            (avg_pnl / 1_000_000) * 0.20 +       # Absolute PnL in millions
+            sortino_capped * 0.10 +
+            calmar_capped * 0.10 +
+            min(pf, 5) * 0.10 +
+            max(0, (25 - dd) / 25) * 0.05        # Lower DD = higher score, gentler
         )
 
         strategies.append({
             'name': row['Strategy'],
             'score': max(score, 0),
             'annual_ret': annual_ret,
+            'avg_pnl': avg_pnl,
             'max_dd': dd,
             'sharpe': sharpe,
         })
@@ -362,16 +388,15 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
     # Normalize scores
     total_score = sum(s['score'] for s in strategies)
     if total_score <= 0:
-        # Equal allocation if all scores negative
         for s in strategies:
             s['allocation_pct'] = 100 / len(strategies)
     else:
         for s in strategies:
             s['allocation_pct'] = (s['score'] / total_score) * 100
 
-    # Apply constraints: min 5%, max 40%
+    # v3.1: Apply constraints: min 5%, max 50% (raised from 40% for dominant strategies)
     for s in strategies:
-        s['allocation_pct'] = max(5, min(40, s['allocation_pct']))
+        s['allocation_pct'] = max(5, min(50, s['allocation_pct']))
 
     # Renormalize
     total_alloc = sum(s['allocation_pct'] for s in strategies)
@@ -391,6 +416,7 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
             'Score': f"{s['score']:.2f}",
             'Allocation %': f"{s['allocation_pct']:.1f}%",
             'Amount (₹)': f"{s['allocation_amount']:,.0f}",
+            'Avg PnL (₹)': f"{s.get('avg_pnl', 0):,.0f}",
             'Annual Return %': f"{s['annual_ret']:.1f}%",
             'Max DD %': f"{s['max_dd']:.1f}%",
             'Sharpe': f"{s['sharpe']:.2f}",
@@ -409,8 +435,18 @@ def compute_allocation(summary_df: pd.DataFrame, total_capital: float = 300000):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Run backtests')
+    parser.add_argument('--source', choices=['angel', 'csv'], default=None,
+                        help='Data source: angel (Angel One) or csv (legacy Yahoo). Default: angel')
+    args = parser.parse_args()
+
+    data_source = args.source or DATA_SOURCE
+    source_label = "Angel One SmartAPI" if data_source == 'angel' else "Legacy Yahoo CSV"
+
     print("="*60)
     print("UNIFIED ALGORITHMIC TRADING STRATEGY BACKTEST")
+    print(f"Data Source: {source_label}")
     print(f"Equity Capital: Rs {EQUITY_CAPITAL:,.0f} | Commodity Capital: Rs {COMMODITY_CAPITAL:,.0f}")
     print(f"Total Capital: Rs {EQUITY_CAPITAL + COMMODITY_CAPITAL:,.0f}")
     print("Equity: Nifty50, BankNifty, Sensex | Commodities: 7 MCX instruments")
@@ -424,11 +460,12 @@ def main():
     # ============================================================
     print("\n" + "="*60)
     print("PART 1: EQUITY INDEX STRATEGIES")
+    print(f"Data Source: {source_label}")
     print(f"Total Equity Pool: Rs {EQUITY_CAPITAL:,.0f} | {NUM_EQUITY_STRATEGIES} strategies | Rs {EQUITY_PER_STRATEGY:,.0f} per strategy")
     print(f"Indices: NIFTY50, BANKNIFTY, SENSEX")
     print("="*60)
 
-    results = run_all_backtests()
+    results = run_all_backtests(data_source=data_source)
 
     if results:
         print("\n" + "="*60)
@@ -564,12 +601,14 @@ def main():
 
     print(f"\nAll results saved to: {RESULTS_DIR}")
     print("\nFinal Notes:")
-    print("- Equity strategies simulate option P&L from spot price movements (delta=0.5)")
+    print("- v5: Equity strategies use Black-Scholes premium pricing (entry + exit premiums)")
+    print("- Strike: ATM rounded to nearest interval (NIFTY=50, BANKNIFTY=100)")
+    print("- IV: derived from 14-day ATR x 1.2 (IV premium over historical vol)")
+    print("- DTE: computed from weekly expiry cycle (Thu=NIFTY, Wed=BANKNIFTY, Fri=SENSEX)")
+    print("- Premium PnL naturally captures gamma, theta, IV crush effects")
     print("- Commodity strategies use Black-76 model with real MCX costs")
-    print("- Real options have Greeks (gamma, theta, vega) that affect P&L")
-    print("- Slippage and liquidity in real markets may differ")
+    print("- Paper trader uses live Angel option chain for strike selection (best OI)")
     print("- Paper trade for 1-2 weeks before deploying real capital")
-    print("- Weekly or monthly rebalancing of allocation is recommended")
 
 
 if __name__ == "__main__":
